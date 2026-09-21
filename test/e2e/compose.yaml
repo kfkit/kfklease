@@ -1,0 +1,115 @@
+# End-to-end stand: one Kafka broker as the arbiter and two independent
+# single-node Kubernetes clusters (k3s) competing for a lease.
+#
+# Kafka deliberately lives outside both clusters, so that killing, pausing or
+# partitioning a cluster never takes the arbiter down with it.
+#
+# Partitions are simulated with ./partition.sh, which drops packets to Kafka
+# inside the node's network namespace. Do not use `docker network disconnect`
+# for that: bridge networks are not reliably isolated from each other on every
+# Docker engine, and flannel's vxlan backend panics when an interface vanishes.
+name: kfklease-e2e
+
+x-k3s: &k3s
+  image: rancher/k3s:v1.35.8-k3s1
+  privileged: true
+  tmpfs:
+    - /run
+    - /var/run
+  ulimits:
+    nproc: 65535
+    nofile:
+      soft: 65535
+      hard: 65535
+  restart: "no"
+  healthcheck:
+    test: ["CMD", "kubectl", "get", "--raw", "/readyz"]
+    interval: 5s
+    timeout: 5s
+    retries: 60
+
+services:
+  kafka:
+    image: apache/kafka:4.3.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,HOST://:19092
+      # Pods inside k3s cannot resolve compose service names, so the broker
+      # advertises its static address on the kfk network.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://172.30.0.10:9092,HOST://localhost:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    ports:
+      - "127.0.0.1:19092:19092"
+    networks:
+      kfk:
+        ipv4_address: 172.30.0.10
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  k3s-a:
+    <<: *k3s
+    hostname: k3s-a
+    command:
+      - server
+      - --node-name=k3s-a
+      - --flannel-backend=host-gw
+      - --disable=traefik,servicelb,metrics-server,local-storage
+    environment:
+      K3S_KUBECONFIG_OUTPUT: /output/kubeconfig.yaml
+      K3S_KUBECONFIG_MODE: "644"
+    volumes:
+      - k3s-a:/var/lib/rancher/k3s
+      - ./.out/k3s-a:/output
+      - ./images:/var/lib/rancher/k3s/agent/images
+      - ./manifests/keda.yaml:/var/lib/rancher/k3s/server/manifests/keda.yaml:ro
+    ports:
+      - "127.0.0.1:6443:6443"
+    networks:
+      kfk:
+        ipv4_address: 172.30.0.11
+
+  k3s-b:
+    <<: *k3s
+    hostname: k3s-b
+    command:
+      - server
+      - --node-name=k3s-b
+      - --https-listen-port=6444
+      - --flannel-backend=host-gw
+      - --disable=traefik,servicelb,metrics-server,local-storage
+    environment:
+      K3S_KUBECONFIG_OUTPUT: /output/kubeconfig.yaml
+      K3S_KUBECONFIG_MODE: "644"
+    volumes:
+      - k3s-b:/var/lib/rancher/k3s
+      - ./.out/k3s-b:/output
+      - ./images:/var/lib/rancher/k3s/agent/images
+      - ./manifests/keda.yaml:/var/lib/rancher/k3s/server/manifests/keda.yaml:ro
+    ports:
+      - "127.0.0.1:6444:6444"
+    networks:
+      kfk:
+        ipv4_address: 172.30.0.12
+
+networks:
+  kfk:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  k3s-a: {}
+  k3s-b: {}

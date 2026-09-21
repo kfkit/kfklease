@@ -1,0 +1,12 @@
+# Installed by the k3s helm-controller on cluster start.
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: keda
+  namespace: kube-system
+spec:
+  repo: https://kedacore.github.io/charts
+  chart: keda
+  version: 2.20.2
+  targetNamespace: keda
+  createNamespace: true

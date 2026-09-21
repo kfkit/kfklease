@@ -13,3 +13,8 @@ coverage.*
 # local env and secrets
 .env
 .env.*
+
+# e2e stand
+/test/e2e/.out/
+/test/e2e/images/*
+!/test/e2e/images/.gitkeep
