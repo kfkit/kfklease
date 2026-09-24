@@ -68,14 +68,20 @@ jobs:
     runs-on: ubuntu-latest
     needs: [image, chart]
     steps:
+      - id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           body: |
-            Image: `${{ env.IMAGE }}:${{ github.ref_name }}` (linux/amd64, linux/arm64), digest `${{ needs.image.outputs.digest }}`, signed with cosign:
+            Image: `${{ env.IMAGE }}:${{ steps.version.outputs.version }}` (linux/amd64, linux/arm64), digest `${{ needs.image.outputs.digest }}`, signed with cosign:
 
                 cosign verify ${{ env.IMAGE }}@${{ needs.image.outputs.digest }} \
                   --certificate-identity-regexp '^https://github.com/${{ github.repository }}/' \
                   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
-            Chart: `helm install kfklease ${{ env.CHARTS }}/kfklease --version ${{ github.ref_name }}` (strip the `v`).
+            Chart:
+
+                helm install kfklease ${{ env.CHARTS }}/kfklease --version ${{ steps.version.outputs.version }}
