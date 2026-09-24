@@ -29,12 +29,50 @@ The lease is a deterministic fold over a Kafka log: writing a record decides
 nothing, and every reader reaches the same verdict on it. The rules, and why
 they hold up under delays, freezes and a compacted log, are in
 [docs/protocol.md](docs/protocol.md). The state machine lives in
-[`lease/`](lease) and has no dependencies; the Kafka client around it is next.
+[`lease/`](lease) and has no dependencies; `lease.Candidate` wraps it in a
+Kafka client built on [franz-go](https://github.com/twmb/franz-go).
+
+## Usage
+
+```go
+c, err := lease.NewCandidate(lease.Config{
+	Brokers:     []string{"kafka:9092"},
+	Topic:       "kfklease-demo",
+	CreateTopic: true,
+	TTL:         10 * time.Second,
+})
+if err != nil {
+	log.Fatal(err)
+}
+go c.Run(ctx) // blocks until ctx is done; releases the lease on the way out
+
+for range c.Changed() {
+	if s := c.Status(); s.Holding {
+		// Act as the holder. s.Epoch is the fencing token: pass it downstream
+		// and let downstream reject anything with a smaller epoch.
+	}
+}
+```
+
+`Status().Holding` is a belief with a deadline, not a fact: a holder that
+cannot reach Kafka stops believing after one TTL minus a margin, and the next
+holder is elected only after the term runs out in the log, so the two never
+overlap as long as the margin covers clock skew.
+
+## Development
+
+```bash
+make test          # unit tests, no broker needed
+make integration   # starts the Kafka container from test/e2e and runs the client tests
+```
+
+The end-to-end stand with two Kubernetes clusters is described in
+[test/e2e](test/e2e).
 
 ## Roadmap
 
-- [ ] Lease protocol on a compacted topic: acquire, renew, release, fencing
-- [ ] Go library
+- [x] Lease protocol on a compacted topic: acquire, renew, release, fencing
+- [x] Go library
 - [ ] KEDA external scaler / metrics endpoint
 - [ ] Helm chart and container image
 - [ ] Failure-mode tests (partitions, clock skew, broker loss)
