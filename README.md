@@ -164,7 +164,7 @@ The end-to-end stand with two Kubernetes clusters is described in
 - [x] Container image
 - [x] Helm chart
 - [x] Failure-mode tests: crash, partition, freeze, broker restart
-- [ ] Failure-mode tests: clock skew
+- [x] Failure-mode tests: clock skew and drift, in the simulation
 - [x] Image and chart on GHCR, cosign-signed
 
 ## License
