@@ -23,6 +23,14 @@ coordination layer:
 Failover through KEDA is the first use case, not the only one: the lease is a
 general building block for leader election between Kafka clients.
 
+## Design
+
+The lease is a deterministic fold over a Kafka log: writing a record decides
+nothing, and every reader reaches the same verdict on it. The rules, and why
+they hold up under delays, freezes and a compacted log, are in
+[docs/protocol.md](docs/protocol.md). The state machine lives in
+[`lease/`](lease) and has no dependencies; the Kafka client around it is next.
+
 ## Roadmap
 
 - [ ] Lease protocol on a compacted topic: acquire, renew, release, fencing
