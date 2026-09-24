@@ -9,16 +9,20 @@ source ./lib.sh
 
 cluster=${1:?usage: deploy.sh <k3s-a|k3s-b>}
 
+ROOT=$(cd ../.. && pwd)
+
+# helm_template <values...> renders the chart from the repository root,
+# whatever the working directory.
 helm_template() {
   if command -v helm >/dev/null; then
-    helm template "$@"
+    helm template "$RELEASE" "$ROOT/charts/kfklease" "$@"
   else
-    docker run --rm -v "$(cd ../.. && pwd):/src" -w /src alpine/helm:3.19.0 template "$@"
+    docker run --rm -v "$ROOT:/src" alpine/helm:3.19.0 template "$RELEASE" /src/charts/kfklease "$@"
   fi
 }
 
 kc "$cluster" create namespace "$NS" --dry-run=client -o yaml | kc "$cluster" apply -f - >/dev/null
-helm_template "$RELEASE" charts/kfklease --namespace "$NS" \
+helm_template --namespace "$NS" \
   --set image.repository=kfklease-scaler --set image.tag=dev --set image.pullPolicy=Never \
   --set brokers="$KAFKA_ADDR:$KAFKA_PORT" --set topic=kfklease-e2e --set ttl="${TTL}s" \
   --set holderPrefix="$cluster" --set scaledObject.target=singleton --set logLevel=debug \
