@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: make lint
+      - run: go test -race -count=1 ./...
+      - name: generated code is up to date
+        run: |
+          go generate ./...
+          git diff --exit-code -- internal/
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: make integration
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: docker build -t kfklease-scaler:dev .
+
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: helm lint charts/kfklease --set brokers=k:9092 --set topic=t --set scaledObject.target=w
+      - run: helm template t charts/kfklease --set brokers=k:9092 --set topic=t --set scaledObject.target=w > /dev/null
+
+  # The two-cluster stand: k3s + KEDA twice and a Kafka broker, then the
+  # failover scenarios. Slow, so it runs after the fast jobs pass.
+  e2e:
+    runs-on: ubuntu-latest
+    needs: [unit, integration, image, chart]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - run: test/e2e/build-image.sh
+      - run: test/e2e/smoke.sh
+      - run: test/e2e/deploy.sh k3s-a && test/e2e/deploy.sh k3s-b
+      - run: test/e2e/scenarios.sh
+      - if: failure()
+        run: |
+          docker compose -f test/e2e/compose.yaml ps -a
+          for c in k3s-a k3s-b; do
+            kubectl --kubeconfig test/e2e/.out/$c/kubeconfig.yaml -n kfklease get pods,scaledobject || true
+            kubectl --kubeconfig test/e2e/.out/$c/kubeconfig.yaml -n kfklease logs deploy/kfklease --tail=50 || true
+          done
+      - if: always()
+        run: docker compose -f test/e2e/compose.yaml down -v

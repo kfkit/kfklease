@@ -7,9 +7,6 @@ cd "$(dirname "$0")"
 # shellcheck source=lib.sh
 source ./lib.sh
 
-KAFKA_ADDR=172.30.0.10
-KAFKA_PORT=9092
-
 wait_for() {
   local what=$1 tries=$2
   shift 2

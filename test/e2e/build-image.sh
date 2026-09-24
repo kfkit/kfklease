@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 # shellcheck source=lib.sh
 source ./lib.sh
 
-IMAGE=kfklease-scaler:dev
+IMAGE=kfklease-scaler:dev  # what deploy.sh sets image.repository and image.tag to
 
 docker build -q -t "$IMAGE" ../.. >/dev/null
 mkdir -p images

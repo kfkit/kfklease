@@ -1,0 +1,11 @@
+{{ include "kfklease.name" . }} takes part in the lease on topic {{ .Values.topic }}
+as "{{ .Values.holderPrefix | default .Release.Name }}/<pod>".
+
+Watch it:
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "kfklease.name" . }} -f
+{{- if .Values.scaledObject.enabled }}
+
+Deployment {{ .Values.scaledObject.target }} runs one replica while this cluster
+holds the lease and none otherwise:
+  kubectl -n {{ .Release.Namespace }} get scaledobject {{ .Values.scaledObject.target }}
+{{- end }}

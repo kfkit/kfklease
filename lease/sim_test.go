@@ -4,155 +4,196 @@
 package lease
 
 import (
+	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
+	"slices"
 	"testing"
 	"time"
 )
 
-// The simulation runs a few participants that follow the writer rules from
-// docs/protocol.md against one shared log, with everything that hurts leases
-// in real life: slow consumers, produce requests that land seconds late, and
-// processes frozen in the middle of a decision. Time is in milliseconds and
-// all clocks are perfect, so the safety margin is zero and any overlap is a
-// protocol bug rather than a tuning problem.
+// The simulation drives real agents, the same code the Kafka client runs,
+// against one shared fake log with everything that hurts leases in real
+// life: slow consumers, produce requests that land seconds late,
+// acknowledgements that arrive after the record was already read back,
+// processes frozen in the middle of a decision, and participants that join
+// late and see only the tail of the log. Time is virtual and all clocks are
+// perfect, so the safety margin is zero and any overlap is a protocol bug
+// rather than a tuning problem.
 //
 // Two properties are checked:
 //
-//   - safety: at no instant do two participants believe they hold the lease;
+//   - safety: at no instant do two agents believe they hold the lease;
 //   - agreement: a reader that starts from any point of the log, once it is
 //     certain, has exactly the state of a reader that saw the whole log.
 
 const (
-	simTTL      = 1000 // ms
-	simRenew    = simTTL / 3
+	simTTL      = 1000 * time.Millisecond
 	simDuration = 120_000
-	simStep     = 10
+	simStep     = 10 * time.Millisecond
 )
 
+// simMsg is a produce request on its way to the log.
 type simMsg struct {
-	landAt int64
-	sentAt int64
+	from   *simNode
+	landAt time.Time
 	rec    Record
 }
 
+// simAck is the broker's answer on its way back, or the client giving up
+// on a record after the delivery timeout.
+type simAck struct {
+	at     time.Time
+	offset int64
+	err    error
+}
+
+var errSimTimeout = errors.New("sim: delivery timeout")
+
 type simNode struct {
-	id   string
-	view *View
-	pos  int // next log index to consume
-
-	// Belief: the node considers itself holder of epoch until deadline.
-	epoch    int64
-	deadline int64
-
-	// At most one produce request in flight; its send time is the basis of
-	// the deadline once the node's own fold accepts the record.
-	inflight *simMsg
-	lastSend int64
-
-	pausedUntil int64
+	a           *agent
+	pos         int // next log index to consume
+	acks        []simAck
+	pausedUntil time.Time
+	joinAt      time.Time // zero for founders; late joiners start uncertain
+	// compacted marks records a late joiner never sees: compaction removed
+	// them before it started, leaving holes in the offsets.
+	compacted map[int]bool
 }
 
 func simTime(ms int64) time.Time { return t0.Add(time.Duration(ms) * time.Millisecond) }
 
+func simConfig(holder string) Config {
+	cfg, err := Config{
+		Brokers: []string{"fake"}, Topic: "fake", Holder: holder,
+		TTL: simTTL, Margin: time.Nanosecond, RenewEvery: simTTL / 3,
+	}.withDefaults()
+	if err != nil {
+		panic(err)
+	}
+	return cfg
+}
+
 func runSim(t *testing.T, seed uint64) []Record {
 	t.Helper()
 	rng := rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
+	log := slog.New(slog.DiscardHandler)
 
-	nodes := make([]*simNode, 3)
-	for i := range nodes {
-		nodes[i] = &simNode{id: fmt.Sprintf("n%d", i), view: NewViewFromStart(simTTL * time.Millisecond), epoch: -1}
+	var nodes []*simNode
+	for i := range 3 {
+		nodes = append(nodes, &simNode{a: newAgent(simConfig(fmt.Sprintf("n%d", i)), log, 0, 0, simTime(0))})
 	}
-	var log []Record
+	// Two more join later, at a point where history is already gone.
+	for i := 3; i < 5; i++ {
+		nodes = append(nodes, &simNode{joinAt: simTime(rng.Int64N(simDuration / 2))})
+	}
+
+	var records []Record
 	var wire []*simMsg
 
-	for now := int64(0); now < simDuration; now += simStep {
-		// Land produce requests. LogAppendTime is the landing time.
+	for now := simTime(0); now.Before(simTime(simDuration)); now = now.Add(simStep) {
+		// Land produce requests. LogAppendTime is the landing time. The
+		// acknowledgement takes its own time to get back, and may lose the
+		// race against the record being read back.
 		rest := wire[:0]
 		for _, m := range wire {
-			if m.landAt > now {
+			if m.landAt.After(now) {
 				rest = append(rest, m)
 				continue
 			}
-			m.rec.Offset = int64(len(log))
-			m.rec.Timestamp = simTime(now)
-			log = append(log, m.rec)
+			m.rec.Offset = int64(len(records))
+			m.rec.Timestamp = now
+			records = append(records, m.rec)
+			m.from.acks = append(m.from.acks, simAck{at: now.Add(time.Duration(rng.IntN(60)) * time.Millisecond), offset: m.rec.Offset})
+			slices.SortStableFunc(m.from.acks, func(x, y simAck) int { return x.at.Compare(y.at) })
 		}
 		wire = rest
 
 		holders := 0
 		for _, n := range nodes {
-			if now < n.deadline {
+			if n.a != nil && n.a.believing(now) {
 				holders++
 			}
 		}
 		if holders > 1 {
-			t.Fatalf("seed %d, t=%dms: %d participants believe they hold the lease", seed, now, holders)
+			t.Fatalf("seed %d, t=%v: %d agents believe they hold the lease", seed, now.Sub(t0), holders)
 		}
 
-		for _, n := range nodes {
-			if now < n.pausedUntil {
+		for i, n := range nodes {
+			if n.a == nil {
+				if now.Before(n.joinAt) {
+					continue
+				}
+				// The tail is all it will ever see, and part of that with
+				// holes.
+				start := max(0, len(records)-rng.IntN(30))
+				n.a = newAgent(simConfig(fmt.Sprintf("n%d", i)), log, int64(start), int64(len(records)), now)
+				n.pos = start
+				n.compacted = make(map[int]bool)
+				for j := start; j < len(records); j++ {
+					if rng.IntN(3) == 0 {
+						n.compacted[j] = true
+					}
+				}
+			}
+			if now.Before(n.pausedUntil) {
 				continue
 			}
 			if rng.Float64() < 0.002 {
-				n.pausedUntil = now + rng.Int64N(3*simTTL)
+				n.pausedUntil = now.Add(time.Duration(rng.Int64N(int64(3 * simTTL))))
 				continue
 			}
 
+			// Acknowledgements that have arrived.
+			for len(n.acks) > 0 && !n.acks[0].at.After(now) {
+				n.a.acked(now, n.acks[0].offset, n.acks[0].err)
+				n.acks = n.acks[1:]
+			}
 			// Consume, sometimes lagging behind.
-			for n.pos < len(log) && rng.Float64() < 0.9 {
-				r := log[n.pos]
+			for n.pos < len(records) && rng.Float64() < 0.9 {
+				r := records[n.pos]
 				n.pos++
-				out, err := n.view.Apply(r)
-				if err != nil {
-					t.Fatalf("seed %d: %v", seed, err)
-				}
-				if n.inflight == nil || r.Holder != n.id {
+				if n.compacted[int(r.Offset)] {
 					continue
 				}
-				// Own record read back: only now may the belief change.
-				if out == Accepted {
-					switch r.Kind {
-					case Claim:
-						n.epoch = r.Offset
-						n.deadline = n.inflight.sentAt + simTTL
-					case Renew:
-						n.deadline = n.inflight.sentAt + simTTL
-					case Release:
-						n.deadline = 0
-					}
+				value, err := EncodeValue(r)
+				if err != nil {
+					t.Fatal(err)
 				}
-				n.inflight = nil
+				if err := n.a.record(now, r.Offset, r.Timestamp, value); err != nil {
+					t.Fatalf("seed %d: %v", seed, err)
+				}
 			}
+			n.a.fetched(now, int64(len(records)))
 
-			if n.inflight != nil {
-				continue
-			}
 			var rec Record
-			switch {
-			case now < n.deadline && rng.Float64() < 0.001:
-				// Giving up the lease starts with no longer believing in it.
-				n.deadline = 0
-				rec = Record{Kind: Release, Holder: n.id, Epoch: n.epoch}
-			case now < n.deadline && now-n.lastSend >= simRenew:
-				rec = Record{Kind: Renew, Holder: n.id, Epoch: n.epoch, TTL: simTTL * time.Millisecond}
-			case now >= n.deadline && rng.Float64() < 0.02:
-				// Claims are fired blindly, held or not: the fold sorts it out.
-				rec = Record{Kind: Claim, Holder: n.id, TTL: simTTL * time.Millisecond}
-			default:
+			var ok bool
+			if n.a.believing(now) && rng.Float64() < 0.001 {
+				rec, ok = n.a.release(now)
+			} else {
+				rec, ok = n.a.tick(now)
+			}
+			if !ok {
 				continue
 			}
-			delay := rng.Int64N(50)
+			delay := time.Duration(rng.Int64N(50)) * time.Millisecond
 			if rng.Float64() < 0.03 {
 				// A stalled broker, or a freeze between decision and send.
-				delay = rng.Int64N(2 * simTTL)
+				delay = time.Duration(rng.Int64N(int64(2 * simTTL)))
 			}
-			m := &simMsg{landAt: now + 1 + delay, sentAt: now, rec: rec}
-			n.inflight, n.lastSend = m, now
-			wire = append(wire, m)
+			if delay >= simTTL {
+				// The client gives up after the delivery timeout. Half the
+				// time the broker got the record anyway and it lands late.
+				n.acks = append(n.acks, simAck{at: now.Add(simTTL), err: errSimTimeout})
+				if rng.IntN(2) == 0 {
+					continue
+				}
+			}
+			wire = append(wire, &simMsg{from: n, landAt: now.Add(simStep + delay), rec: rec})
 		}
 	}
-	return log
+	return records
 }
 
 func TestSimulationSafetyAndAgreement(t *testing.T) {
@@ -162,12 +203,12 @@ func TestSimulationSafetyAndAgreement(t *testing.T) {
 	}
 	var terms, rejected, settled, lateReaders int
 	for seed := uint64(1); seed <= uint64(seeds); seed++ {
-		log := runSim(t, seed)
+		records := runSim(t, seed)
 
 		// The reference reader saw everything.
-		ref := NewViewFromStart(simTTL * time.Millisecond)
-		refStates := make([]State, len(log))
-		for i, r := range log {
+		ref := NewViewFromStart(simTTL)
+		refStates := make([]State, len(records))
+		for i, r := range records {
 			out, err := ref.Apply(r)
 			if err != nil {
 				t.Fatalf("seed %d: %v", seed, err)
@@ -182,12 +223,12 @@ func TestSimulationSafetyAndAgreement(t *testing.T) {
 		}
 
 		rng := rand.New(rand.NewPCG(seed, 7))
-		for k := 0; k < 25; k++ {
-			start := rng.IntN(len(log))
-			late := NewView(simTTL * time.Millisecond)
+		for range 25 {
+			start := rng.IntN(len(records))
+			late := NewView(simTTL)
 			lateReaders++
-			for i := start; i < len(log); i++ {
-				if _, err := late.Apply(log[i]); err != nil {
+			for i := start; i < len(records); i++ {
+				if _, err := late.Apply(records[i]); err != nil {
 					t.Fatalf("seed %d: %v", seed, err)
 				}
 				if !late.Certain() {
@@ -207,5 +248,10 @@ func TestSimulationSafetyAndAgreement(t *testing.T) {
 	t.Logf("%d runs: %d terms, %d rejected records, %d/%d late readers settled", seeds, terms, rejected, settled, lateReaders)
 	if terms < seeds*10 || rejected < seeds*10 {
 		t.Fatalf("simulation is too tame to mean anything: %d terms, %d rejected records", terms, rejected)
+	}
+	// Rejections come from races and late records, not from candidates
+	// claiming a lease they can see is held.
+	if rejected > 2*terms {
+		t.Fatalf("candidates spam the log: %d rejected records for %d terms", rejected, terms)
 	}
 }

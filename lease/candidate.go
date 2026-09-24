@@ -245,47 +245,15 @@ type produceResult struct {
 	err    error
 }
 
-type inflight struct {
-	kind   Kind
-	sentAt time.Time
-	// offset is -1 until the broker acknowledged the record.
-	offset int64
-}
-
-// run is the state of one Run call.
+// run is the Kafka side of one Run call: it feeds the agent and produces
+// what the agent decides.
 type run struct {
 	c       *Candidate
 	cfg     Config
 	log     *slog.Logger
 	cl      *kgo.Client
 	results chan produceResult
-
-	view *View
-	// nextOffset is the offset the next record must have; anything higher
-	// is a hole.
-	nextOffset int64
-	// highWater is the broker's end offset as last reported.
-	highWater int64
-	// ownOutcomes remembers verdicts on this participant's records read
-	// back before the broker's acknowledgement told us their offset.
-	ownOutcomes map[int64]Outcome
-
-	// Belief: this participant holds epoch until deadline (monotonic).
-	epoch    int64
-	deadline time.Time
-
-	inflight    *inflight
-	lastSend    time.Time
-	nextClaimAt time.Time
-
-	// Silence bookkeeping, all on the monotonic clock.
-	connected    bool
-	fetchedOnce  bool
-	caughtUpAt   time.Time
-	lastRecordAt time.Time
-	// lastRecordAt is paired with the broker time of that record, to
-	// estimate the broker's clock between records.
-	lastRecordBroker time.Time
+	a       *agent
 }
 
 func (r *run) bootstrap(ctx context.Context) error {
@@ -293,21 +261,9 @@ func (r *run) bootstrap(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-
-	r.view = NewView(r.cfg.TTL)
-	if start.Offset == 0 {
-		// Nothing was ever deleted, so the reader sees everything. Holes
-		// left by compaction are caught record by record.
-		r.view = NewViewFromStart(r.cfg.TTL)
-	}
-	r.nextOffset = start.Offset
-	r.highWater = end.Offset
-	r.ownOutcomes = make(map[int64]Outcome)
-	r.epoch = -1
 	now := time.Now()
-	r.connected = true
-	r.caughtUpAt = now
-	r.log.Info("joined", "start_offset", start.Offset, "end_offset", end.Offset, "certain", r.view.Certain())
+	r.a = newAgent(r.cfg, r.log, start.Offset, end.Offset, now)
+	r.log.Info("joined", "start_offset", start.Offset, "end_offset", end.Offset, "certain", r.a.view.Certain())
 	r.publish(now)
 	return nil
 }
@@ -370,7 +326,7 @@ func (r *run) loop(ctx context.Context) error {
 		for {
 			select {
 			case res := <-r.results:
-				r.acked(res)
+				r.a.acked(time.Now(), res.offset, res.err)
 			default:
 				break drain
 			}
@@ -384,25 +340,21 @@ func (r *run) loop(ctx context.Context) error {
 		default:
 		}
 
-		r.step(ctx)
+		now := time.Now()
+		if rec, ok := r.a.tick(now); ok {
+			r.produce(ctx, rec)
+		}
+		r.publish(now)
 	}
 }
 
 func (r *run) consume(fetches kgo.Fetches) error {
+	now := time.Now()
 	fetches.EachError(func(_ string, _ int32, err error) {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			return
 		}
-		if r.connected {
-			// A topic created a moment ago has no leader yet, which is
-			// not worth a warning.
-			level := slog.LevelWarn
-			if !r.fetchedOnce {
-				level = slog.LevelDebug
-			}
-			r.log.Log(context.Background(), level, "fetch failed", "err", err)
-		}
-		r.connected = false
+		r.a.fetchFailed(err)
 	})
 
 	var err error
@@ -410,204 +362,30 @@ func (r *run) consume(fetches kgo.Fetches) error {
 		if fp.Err != nil || fp.Topic != r.cfg.Topic || fp.Partition != r.cfg.Partition {
 			return
 		}
-		if !r.connected {
-			r.connected = true
-			r.caughtUpAt = time.Now()
-			if r.fetchedOnce {
-				r.log.Info("fetching again")
+		r.a.fetched(now, fp.HighWatermark)
+		for _, kr := range fp.Records {
+			if err != nil {
+				return
 			}
-		}
-		r.fetchedOnce = true
-		if fp.HighWatermark > r.highWater {
-			r.highWater = fp.HighWatermark
-		}
-		for _, rec := range fp.Records {
-			if err == nil {
-				err = r.consumeRecord(rec)
+			if kr.Attrs.TimestampType() != 1 {
+				err = fmt.Errorf("lease: topic %q does not use LogAppendTime", r.cfg.Topic)
+				return
 			}
+			err = r.a.record(now, kr.Offset, kr.Timestamp, kr.Value)
 		}
 	})
+	if err == nil {
+		r.publish(now)
+	}
 	return err
 }
 
-func (r *run) consumeRecord(kr *kgo.Record) error {
-	if kr.Offset < r.nextOffset {
-		return nil
-	}
-	if kr.Attrs.TimestampType() != 1 {
-		return fmt.Errorf("lease: topic %q does not use LogAppendTime", r.cfg.Topic)
-	}
-	now := time.Now()
-	if kr.Offset > r.nextOffset {
-		r.log.Warn("hole in the log", "expected", r.nextOffset, "got", kr.Offset)
-		r.view.Gap()
-		r.caughtUpAt = now
-	}
-	r.nextOffset = kr.Offset + 1
-	r.lastRecordAt = now
-	r.lastRecordBroker = kr.Timestamp
-
-	rec, err := DecodeValue(kr.Value)
-	if err != nil {
-		r.log.Warn("skipping record", "offset", kr.Offset, "err", err)
-		return nil
-	}
-	rec.Offset = kr.Offset
-	rec.Timestamp = kr.Timestamp
-	out, err := r.view.Apply(rec)
-	if err != nil {
-		return err
-	}
-	r.log.Debug("record", "offset", rec.Offset, "kind", rec.Kind, "by", rec.Holder, "epoch", rec.Epoch, "outcome", out)
-
-	if rec.Holder == r.cfg.Holder {
-		r.ownRecord(rec.Offset, rec.Kind, out)
-	}
-	if r.believing(now) && r.view.Certain() {
-		s := r.view.State()
-		if s.Holder != r.cfg.Holder || s.Epoch != r.epoch || !s.HeldAt(r.view.Clock()) {
-			r.log.Warn("term ended in the log", "epoch", r.epoch, "log_holder", s.Holder, "log_epoch", s.Epoch)
-			r.dropBelief()
-		}
-	}
-	r.publish(now)
-	return nil
-}
-
-// ownRecord handles a record written by this participant. Only the record
-// in flight can change the belief, and only once its offset is known from
-// the broker's acknowledgement; anything else is a record we gave up on.
-func (r *run) ownRecord(offset int64, kind Kind, out Outcome) {
-	in := r.inflight
-	if in == nil || in.kind != kind {
-		return
-	}
-	if in.offset == -1 {
-		r.ownOutcomes[offset] = out
-		return
-	}
-	if in.offset == offset {
-		r.settle(out)
-	}
-}
-
-func (r *run) acked(res produceResult) {
-	in := r.inflight
-	if in == nil {
-		return
-	}
-	if res.err != nil {
-		r.log.Warn("produce failed", "kind", in.kind, "err", res.err)
-		r.inflight = nil
-		if in.kind == Claim {
-			r.nextClaimAt = time.Now().Add(r.cfg.RenewEvery)
-		}
-		return
-	}
-	in.offset = res.offset
-	if out, ok := r.ownOutcomes[res.offset]; ok {
-		r.settle(out)
-	}
-}
-
-// settle applies the fold's verdict on the record in flight to the belief.
-func (r *run) settle(out Outcome) {
-	in := r.inflight
-	r.inflight = nil
-	clear(r.ownOutcomes)
-	now := time.Now()
-	switch {
-	case out == Pending:
-		// The view lost certainty while the record was in flight. The
-		// record may well be valid, but the belief needs proof.
-		r.log.Warn("own record unjudged", "kind", in.kind, "offset", in.offset)
-	case in.kind == Claim && out == Accepted:
-		r.epoch = in.offset
-		r.extendBelief(in.sentAt)
-		r.log.Info("acquired", "epoch", r.epoch)
-	case in.kind == Claim:
-		s := r.view.State()
-		wait := min(max(s.Expires.Sub(r.brokerNow(now)), r.cfg.pollEvery()), r.cfg.TTL)
-		r.nextClaimAt = now.Add(wait)
-		r.log.Debug("claim rejected", "log_holder", s.Holder, "log_epoch", s.Epoch, "retry_in", wait)
-	case in.kind == Renew && out == Accepted:
-		if r.believing(now) {
-			r.extendBelief(in.sentAt)
-		}
-	case in.kind == Renew:
-		r.log.Warn("renew rejected", "epoch", r.epoch)
-		r.dropBelief()
-	}
-	r.publish(now)
-}
-
-func (r *run) believing(now time.Time) bool { return now.Before(r.deadline) }
-
-// extendBelief sets the deadline from the send time of an accepted record:
-// the record landed after it was sent, so the term in the log outlives the
-// belief by at least the margin.
-func (r *run) extendBelief(sentAt time.Time) {
-	r.deadline = sentAt.Add(r.cfg.TTL - r.cfg.Margin)
-}
-
-func (r *run) dropBelief() {
-	if r.deadline.IsZero() {
-		return
-	}
-	r.deadline = time.Time{}
-	r.log.Info("no longer holder", "epoch", r.epoch)
-}
-
-// brokerNow estimates the broker's clock from the last record seen.
-func (r *run) brokerNow(now time.Time) time.Time {
-	if r.lastRecordAt.IsZero() {
-		return r.view.Clock()
-	}
-	return r.lastRecordBroker.Add(now.Sub(r.lastRecordAt))
-}
-
-// step measures silence and decides whether to write something.
-func (r *run) step(ctx context.Context) {
-	now := time.Now()
-	if !r.believing(now) && !r.deadline.IsZero() {
-		r.log.Warn("deadline passed without renewal", "epoch", r.epoch)
-		r.dropBelief()
-		r.publish(now)
-	}
-
-	if r.connected && r.nextOffset >= r.highWater && !r.view.Certain() {
-		since := r.caughtUpAt
-		if r.lastRecordAt.After(since) {
-			since = r.lastRecordAt
-		}
-		if now.Sub(since) >= r.cfg.TTL+r.cfg.Margin && r.view.Quiet(r.cfg.TTL) {
-			r.log.Info("lease is free: nothing written for a ttl")
-			r.publish(now)
-		}
-	}
-
-	if r.inflight != nil || !r.view.Certain() {
-		return
-	}
-	switch {
-	case r.believing(now):
-		if now.Sub(r.lastSend) >= r.cfg.RenewEvery {
-			r.send(ctx, Renew)
-		}
-	case now.After(r.nextClaimAt) && !r.view.State().HeldAt(r.brokerNow(now)):
-		r.send(ctx, Claim)
-	}
-}
-
-func (r *run) send(ctx context.Context, kind Kind) {
-	kr, err := r.record(kind, r.epoch)
+func (r *run) produce(ctx context.Context, rec Record) {
+	kr, err := r.kafkaRecord(rec)
 	if err != nil {
 		r.log.Error("encode record", "err", err)
 		return
 	}
-	now := time.Now()
-	r.inflight = &inflight{kind: kind, sentAt: now, offset: -1}
-	r.lastSend = now
 	r.cl.Produce(ctx, kr, func(kr *kgo.Record, err error) {
 		r.results <- produceResult{offset: kr.Offset, err: err}
 	})
@@ -617,12 +395,7 @@ func (r *run) send(ctx context.Context, kind Kind) {
 // compaction keeps the latest record.
 const recordKey = "lease"
 
-// record builds the Kafka record for a lease record by this participant.
-func (r *run) record(kind Kind, epoch int64) (*kgo.Record, error) {
-	rec := Record{Kind: kind, Holder: r.cfg.Holder, TTL: r.cfg.TTL}
-	if kind != Claim {
-		rec.Epoch = epoch
-	}
+func (r *run) kafkaRecord(rec Record) (*kgo.Record, error) {
 	value, err := EncodeValue(rec)
 	if err != nil {
 		return nil, err
@@ -630,20 +403,15 @@ func (r *run) record(kind Kind, epoch int64) (*kgo.Record, error) {
 	return &kgo.Record{Topic: r.cfg.Topic, Partition: r.cfg.Partition, Key: []byte(recordKey), Value: value}, nil
 }
 
-// shutdown gives the lease up if the participant believes it holds it. The
-// belief goes first, the record second: a release that never lands only
-// costs the others a wait of one TTL.
+// shutdown gives the lease up if the participant believes it holds it.
 func (r *run) shutdown() {
 	now := time.Now()
-	if !r.believing(now) {
-		r.publish(now)
+	rec, ok := r.a.release(now)
+	r.publish(now)
+	if !ok {
 		return
 	}
-	epoch := r.epoch
-	r.dropBelief()
-	r.publish(now)
-
-	kr, err := r.record(Release, epoch)
+	kr, err := r.kafkaRecord(rec)
 	if err != nil {
 		r.log.Error("encode record", "err", err)
 		return
@@ -651,20 +419,12 @@ func (r *run) shutdown() {
 	ctx, cancel := context.WithTimeout(context.Background(), r.cfg.TTL)
 	defer cancel()
 	if err := r.cl.ProduceSync(ctx, kr).FirstErr(); err != nil {
-		r.log.Warn("release not written", "epoch", epoch, "err", err)
+		r.log.Warn("release not written", "epoch", rec.Epoch, "err", err)
 		return
 	}
-	r.log.Info("released", "epoch", epoch)
+	r.log.Info("released", "epoch", rec.Epoch)
 }
 
 func (r *run) publish(now time.Time) {
-	s := Status{Certain: r.view.Certain(), AsOf: r.view.Clock()}
-	if s.Certain {
-		s.Lease = r.view.State()
-	}
-	deadline := r.deadline
-	if !r.believing(now) {
-		deadline = time.Time{}
-	}
-	r.c.setStatus(s, deadline, r.epoch)
+	r.c.setStatus(r.a.status(now))
 }

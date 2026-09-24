@@ -1,0 +1,45 @@
+# Default values for kfklease.
+
+image:
+  repository: ghcr.io/kfkit/kfklease-scaler
+  tag: ""            # defaults to the chart's appVersion
+  pullPolicy: IfNotPresent
+
+# The lease. brokers and topic are required.
+brokers: ""          # comma-separated bootstrap addresses
+topic: ""            # one lease per topic
+ttl: 10s             # the same for every participant of the lease
+margin: ""           # empty for ttl/5
+createTopic: true    # create the topic with the settings the protocol needs
+
+# Holder ids are "<holderPrefix>/<pod name>". Empty means the release name.
+# Use something that names the cluster, so that logs and the lease topic
+# say where the workload runs.
+holderPrefix: ""
+
+logLevel: info
+
+# A ScaledObject that keeps a workload at one replica while this cluster
+# holds the lease and at zero otherwise. Disable it to write your own.
+scaledObject:
+  enabled: true
+  # The Deployment to scale, in the release namespace.
+  target: ""
+  pollingInterval: 5
+  # Every second of cooldown is a second the old and the new holder may
+  # overlap.
+  cooldownPeriod: 0
+
+service:
+  port: 9090
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 32Mi
+  limits:
+    memory: 128Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

@@ -3,7 +3,7 @@
 # took and fails if two clusters ever run the workload at the same time.
 #
 #   ./scenarios.sh            # all
-#   ./scenarios.sh crash      # one: coldstart, crash, partition, pause
+#   ./scenarios.sh crash      # one: coldstart, crash, partition, pause, broker
 #
 # Expects the stand to be up (./smoke.sh), the image built (./build-image.sh)
 # and the manifests deployed to both clusters (./deploy.sh k3s-a; ./deploy.sh k3s-b).
@@ -13,11 +13,9 @@ cd "$(dirname "$0")"
 # shellcheck source=lib.sh
 source ./lib.sh
 
-TTL=10
-
 # running <cluster> prints the number of Running, not terminating, singleton pods.
 running() {
-  kc "$1" -n kfklease get pods -l app=singleton -o json 2>/dev/null \
+  kc "$1" -n "$NS" get pods -l app=singleton -o json 2>/dev/null \
     | python3 -c 'import sys,json; print(sum(1 for p in json.load(sys.stdin)["items"] if p["status"]["phase"]=="Running" and not p["metadata"].get("deletionTimestamp")))' \
     || echo "?"
 }
@@ -117,7 +115,7 @@ scenario_crash() {
   docker compose up -d --wait "$h" >/dev/null 2>&1
   # The revived cluster restarts its scaler with a new holder id and must
   # not take the lease back.
-  kc "$h" -n kfklease rollout status deploy/kfklease-scaler --timeout=120s >/dev/null
+  kc "$h" -n "$NS" rollout status "deploy/$RELEASE" --timeout=120s >/dev/null
   wait_running "$h" 0 $(( 2 * TTL )) >/dev/null
   watch_exclusive $(( 2 * TTL ))
   [[ $(holder) == "$o" ]] || { echo "FAILED: lease moved back to the revived cluster" >&2; return 1; }
@@ -155,8 +153,27 @@ scenario_pause() {
   echo "   ok"
 }
 
+scenario_broker() {
+  echo "== broker: restart Kafka, the arbiter"
+  local h t0 lost back
+  h=$(settle)
+  t0=$(date +%s)
+  docker compose restart kafka >/dev/null 2>&1
+  # Without Kafka nobody can renew: the holder stops within a ttl.
+  wait_running "$h" 0 $(( 3 * TTL )) >/dev/null
+  lost=$(( $(date +%s) - t0 ))
+  until [[ -n $(holder) ]]; do
+    (( $(date +%s) - t0 < 6 * TTL )) || { echo "FAILED: nobody took the lease after the broker came back" >&2; return 1; }
+    sleep 1
+  done
+  back=$(( $(date +%s) - t0 ))
+  echo "   ${h} stopped ${lost}s after the restart, $(holder) holds ${back}s after it (ttl ${TTL}s)"
+  watch_exclusive $(( 2 * TTL ))
+  echo "   ok"
+}
+
 if (( $# == 0 )); then
-  set -- coldstart crash partition pause
+  set -- coldstart crash partition pause broker
 fi
 for s in "$@"; do
   "scenario_$s"

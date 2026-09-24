@@ -68,9 +68,21 @@ triggers:
       scalerAddress: kfklease-scaler.kfklease.svc:9090
 ```
 
-Configuration is by flags or environment: `KFKLEASE_BROKERS`, `KFKLEASE_TOPIC`,
-`KFKLEASE_TTL`, `KFKLEASE_HOLDER` (unique per process; in Kubernetes use the
-pod name). A full example, with the two-cluster stand it runs on, is in
+The chart in [charts/kfklease](charts/kfklease) installs the scaler, its
+service and that ScaledObject; one release per cluster:
+
+```bash
+helm install kfklease charts/kfklease -n kfklease --create-namespace \
+  --set brokers=kafka:9092 --set topic=my-lease --set holderPrefix=eu-west \
+  --set scaledObject.target=my-singleton
+```
+
+No image is published yet: build it with `make image` and push it to your
+registry, then set `image.repository` and `image.tag`.
+
+The binary is configured by flags or environment: `KFKLEASE_BROKERS`,
+`KFKLEASE_TOPIC`, `KFKLEASE_TTL`, `KFKLEASE_HOLDER` (unique per process; the
+chart uses the pod name). The two-cluster stand the chart is tested on is in
 [test/e2e](test/e2e).
 
 KEDA gives failover, not mutual exclusion: the old pod is still terminating
@@ -100,9 +112,10 @@ The end-to-end stand with two Kubernetes clusters is described in
 - [x] Go library
 - [x] KEDA external scaler
 - [x] Container image
-- [ ] Helm chart
-- [x] Failure-mode tests: crash, partition, freeze
-- [ ] Failure-mode tests: clock skew, broker loss
+- [x] Helm chart
+- [x] Failure-mode tests: crash, partition, freeze, broker restart
+- [ ] Failure-mode tests: clock skew
+- [ ] Published image and chart
 
 ## License
 

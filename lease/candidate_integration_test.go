@@ -7,10 +7,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"log/slog"
 	"os"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -213,37 +213,19 @@ func TestIntegrationLateReaderAgrees(t *testing.T) {
 
 func TestIntegrationEpochsFence(t *testing.T) {
 	topic := randomTopic(t)
-	var mu sync.Mutex
+	// Three terms in a row, each holder stopping cleanly: every epoch must
+	// be larger than the one before, so that a stale holder's epoch can be
+	// told apart from the current holder's downstream.
 	var epochs []int64
-	seen := map[string]bool{}
-	note := func(p *participant) {
-		s := p.Status()
-		if !s.Holding {
-			return
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		if k := p.Holder() + "/" + string(rune('0'+len(epochs))); !seen[k] {
-			if len(epochs) == 0 || epochs[len(epochs)-1] != s.Epoch {
-				epochs = append(epochs, s.Epoch)
-			}
-			seen[k] = true
-		}
-	}
-
-	// Three terms in a row, each holder stopping cleanly.
-	for i := 0; i < 3; i++ {
-		p := start(t, topic, "p"+string(rune('0'+i)))
+	for i := range 3 {
+		p := start(t, topic, fmt.Sprintf("p%d", i))
 		waitFor(t, 2*itTTL, "holder", func() bool { return p.Status().Holding })
-		note(p)
+		epochs = append(epochs, p.Status().Epoch)
 		p.stop(t)
 	}
 	for i := 1; i < len(epochs); i++ {
 		if epochs[i] <= epochs[i-1] {
-			t.Fatalf("epochs not increasing: %v", epochs)
+			t.Fatalf("epochs not strictly increasing: %v", epochs)
 		}
-	}
-	if len(epochs) != 3 {
-		t.Fatalf("got %d epochs, want 3: %v", len(epochs), epochs)
 	}
 }
