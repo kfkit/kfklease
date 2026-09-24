@@ -9,6 +9,7 @@
   NS=kfklease       # namespace of the scaler and the workload
   RELEASE=kfklease  # chart release: deployment and service name
   TTL=10            # lease ttl in seconds
+  COMPOSE_PROJECT=kfklease-e2e  # the name: in compose.yaml
 }
 
 # kc <cluster> <kubectl args...> runs kubectl against one cluster.

@@ -139,6 +139,16 @@ cluster coming back from a crash restarts its stale pod until its own KEDA
 is up again and scales it down. Workloads that must not overlap check the
 epoch downstream.
 
+### Fencing by epoch
+
+[examples/heartbeat](examples/heartbeat) is a workload that does it: before
+every write it asks the scaler's `/status` and writes only while `holding`
+is true, tagging the record with the epoch; its `report` mode is the
+consumer side, which rejects a record whose epoch is below one it has
+already seen. The e2e stand runs it as the workload and, after every
+scenario, checks by the broker's clock that no two epochs ever wrote at
+once and that nothing stale got through.
+
 `Status().Holding` is a belief with a deadline, not a fact: a holder that
 cannot reach Kafka stops believing after one TTL minus a margin, and the next
 holder is elected only after the term runs out in the log, so the two never
@@ -165,6 +175,7 @@ The end-to-end stand with two Kubernetes clusters is described in
 - [x] Helm chart
 - [x] Failure-mode tests: crash, partition, freeze, broker restart
 - [ ] Failure-mode tests: clock skew
+- [x] Example workload fencing by epoch; workload-level exclusion check on the stand
 - [x] Image and chart on GHCR, cosign-signed
 
 ## License
