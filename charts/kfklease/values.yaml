@@ -60,6 +60,17 @@ scaledObject:
 
 service:
   port: 9090
+  # /metrics, /status and /healthz.
+  httpPort: 9091
+
+metrics:
+  # prometheus.io/* annotations on the pod, for scrapers that use them.
+  podAnnotations: true
+  # A ServiceMonitor for the Prometheus Operator.
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
 
 resources:
   requests:

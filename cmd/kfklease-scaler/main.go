@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -65,6 +66,7 @@ func run() error {
 		margin      = flag.Duration("margin", envDuration("KFKLEASE_MARGIN", 0), "safety margin subtracted from the holder's deadline; 0 for ttl/5 (KFKLEASE_MARGIN)")
 		createTopic = flag.Bool("create-topic", env("KFKLEASE_CREATE_TOPIC", "true") == "true", "create the topic if missing (KFKLEASE_CREATE_TOPIC)")
 		listen      = flag.String("listen", env("KFKLEASE_LISTEN", ":9090"), "gRPC listen address (KFKLEASE_LISTEN)")
+		httpListen  = flag.String("http-listen", env("KFKLEASE_HTTP_LISTEN", ":9091"), "HTTP listen address for /metrics, /status and /healthz; empty to disable (KFKLEASE_HTTP_LISTEN)")
 		logLevel    = flag.String("log-level", env("KFKLEASE_LOG_LEVEL", "info"), "debug, info, warn or error (KFKLEASE_LOG_LEVEL)")
 
 		tlsEnabled  = flag.Bool("tls", env("KFKLEASE_TLS", "false") == "true", "connect with TLS (KFKLEASE_TLS)")
@@ -136,6 +138,24 @@ func run() error {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- gs.Serve(lis) }()
 	log.Info("serving", "addr", lis.Addr().String(), "topic", *topic, "holder", cand.Holder(), "ttl", *ttl)
+
+	var hs2 *http.Server
+	if *httpListen != "" {
+		h := scaler.NewHTTP(cand, cand.Holder())
+		go h.Watch(ctx)
+		hs2 = &http.Server{Addr: *httpListen, Handler: h.Handler(), ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			if err := hs2.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+				serveErr <- fmt.Errorf("http: %w", err)
+			}
+		}()
+		log.Info("serving http", "addr", *httpListen)
+	}
+	defer func() {
+		if hs2 != nil {
+			_ = hs2.Close()
+		}
+	}()
 
 	runErr := make(chan error, 1)
 	go func() { runErr <- cand.Run(ctx) }()

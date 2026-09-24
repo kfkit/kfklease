@@ -114,6 +114,20 @@ variables on the binary, and `lease.Config.Auth` in the library; anything
 else franz-go supports (AWS MSK IAM, custom mechanisms) goes through
 `lease.Config.ClientOpts`.
 
+### Metrics and status
+
+The scaler serves HTTP on `:9091` (`service.httpPort`):
+
+- `/metrics`, Prometheus: `kfklease_holding`, `kfklease_epoch`,
+  `kfklease_belief_remaining_seconds`, `kfklease_certain`,
+  `kfklease_lease_held`, `kfklease_lease_as_of_seconds` and
+  `kfklease_transitions_total{to="holding"|"standby"}`. The pod carries
+  `prometheus.io/*` annotations; `metrics.serviceMonitor.enabled` adds a
+  ServiceMonitor for the Prometheus Operator.
+- `/status`, JSON: the same, plus the log's view of the lease. A workload
+  that fences by epoch reads its epoch here.
+- `/healthz`.
+
 The binary is configured by flags or environment: `KFKLEASE_BROKERS`,
 `KFKLEASE_TOPIC`, `KFKLEASE_TTL`, `KFKLEASE_HOLDER` (unique per process; the
 chart uses the pod name). The two-cluster stand the chart is tested on is in

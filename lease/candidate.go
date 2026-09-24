@@ -114,6 +114,9 @@ type Status struct {
 	Holding bool
 	// Epoch is the fencing token of the held term, valid while Holding.
 	Epoch int64
+	// Deadline is when the belief expires unless renewed, on the local
+	// monotonic clock; zero unless Holding.
+	Deadline time.Time
 
 	// Certain is whether Lease can be trusted; see View.
 	Certain bool
@@ -173,6 +176,7 @@ func (c *Candidate) Status() Status {
 	if !c.deadline.IsZero() && time.Now().Before(c.deadline) {
 		s.Holding = true
 		s.Epoch = c.epoch
+		s.Deadline = c.deadline
 	}
 	return s
 }
