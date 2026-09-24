@@ -77,8 +77,11 @@ helm install kfklease charts/kfklease -n kfklease --create-namespace \
   --set scaledObject.target=my-singleton
 ```
 
-No image is published yet: build it with `make image` and push it to your
-registry, then set `image.repository` and `image.tag`.
+Releases publish `ghcr.io/kfkit/kfklease-scaler` (linux/amd64 and
+linux/arm64, signed with cosign) and the chart as
+`oci://ghcr.io/kfkit/charts/kfklease`; both are tagged with the release
+version. Until the first release, build the image with `make image` and set
+`image.repository` and `image.tag`.
 
 The binary is configured by flags or environment: `KFKLEASE_BROKERS`,
 `KFKLEASE_TOPIC`, `KFKLEASE_TTL`, `KFKLEASE_HOLDER` (unique per process; the
@@ -115,7 +118,7 @@ The end-to-end stand with two Kubernetes clusters is described in
 - [x] Helm chart
 - [x] Failure-mode tests: crash, partition, freeze, broker restart
 - [ ] Failure-mode tests: clock skew
-- [ ] Published image and chart
+- [x] Release workflow: image and chart to GHCR, cosign signature
 
 ## License
 
