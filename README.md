@@ -36,6 +36,9 @@ Kafka client built on [franz-go](https://github.com/twmb/franz-go).
 
 ## Usage
 
+The operator's guide, from a Kafka cluster to a workload that fails over,
+is [docs/install.md](docs/install.md). In short:
+
 ```go
 c, err := lease.NewCandidate(lease.Config{
 	Brokers:     []string{"kafka:9092"},
