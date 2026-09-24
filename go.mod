@@ -2,6 +2,8 @@ module github.com/kfkit/kfklease
 
 go 1.26.0
 
+toolchain go1.27.1
+
 require (
 	github.com/twmb/franz-go v1.22.0
 	github.com/twmb/franz-go/pkg/kadm v1.19.0
