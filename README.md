@@ -3,7 +3,8 @@
 Distributed leases and leader election on top of Apache Kafka®, with a
 [KEDA](https://keda.sh) metric for lease-driven failover.
 
-> Status: early design. Nothing here is ready for production yet.
+> Status: v0.1: the protocol, the client and the KEDA scaler work and are
+> tested on a two-cluster stand, but nothing has run in production yet.
 
 ## Why
 
@@ -68,20 +69,23 @@ triggers:
       scalerAddress: kfklease-scaler.kfklease.svc:9090
 ```
 
-The chart in [charts/kfklease](charts/kfklease) installs the scaler, its
-service and that ScaledObject; one release per cluster:
+The chart installs the scaler, its service and that ScaledObject; one
+release per cluster. The scaler address in the ScaledObject follows the
+release name and namespace, so the same command works in every cluster with
+a different `holderPrefix`:
 
 ```bash
-helm install kfklease charts/kfklease -n kfklease --create-namespace \
+helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.1.0 \
+  -n kfklease --create-namespace \
   --set brokers=kafka:9092 --set topic=my-lease --set holderPrefix=eu-west \
   --set scaledObject.target=my-singleton
 ```
 
-Releases publish `ghcr.io/kfkit/kfklease-scaler` (linux/amd64 and
-linux/arm64, signed with cosign) and the chart as
-`oci://ghcr.io/kfkit/charts/kfklease`; both are tagged with the release
-version. Until the first release, build the image with `make image` and set
-`image.repository` and `image.tag`.
+The chart pulls `ghcr.io/kfkit/kfklease-scaler` at the same version:
+linux/amd64 and linux/arm64, signed with cosign. The digest and the verify
+command are in the [release notes](https://github.com/kfkit/kfklease/releases).
+The chart's values are documented in
+[charts/kfklease/values.yaml](charts/kfklease/values.yaml).
 
 The binary is configured by flags or environment: `KFKLEASE_BROKERS`,
 `KFKLEASE_TOPIC`, `KFKLEASE_TTL`, `KFKLEASE_HOLDER` (unique per process; the
@@ -120,7 +124,7 @@ The end-to-end stand with two Kubernetes clusters is described in
 - [x] Helm chart
 - [x] Failure-mode tests: crash, partition, freeze, broker restart
 - [ ] Failure-mode tests: clock skew
-- [x] Release workflow: image and chart to GHCR, cosign signature
+- [x] Image and chart on GHCR, cosign-signed
 
 ## License
 
