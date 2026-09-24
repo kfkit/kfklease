@@ -43,6 +43,49 @@ spec:
               value: {{ printf ":%d" (int .Values.service.port) | quote }}
             - name: KFKLEASE_LOG_LEVEL
               value: {{ .Values.logLevel | quote }}
+            {{- with .Values.auth.tls }}
+            {{- if .enabled }}
+            - name: KFKLEASE_TLS
+              value: "true"
+            {{- if .secretName }}
+            - name: KFKLEASE_TLS_CA_FILE
+              value: /etc/kfklease/tls/{{ .caKey }}
+            {{- if and .certKey .keyKey }}
+            - name: KFKLEASE_TLS_CERT_FILE
+              value: /etc/kfklease/tls/{{ .certKey }}
+            - name: KFKLEASE_TLS_KEY_FILE
+              value: /etc/kfklease/tls/{{ .keyKey }}
+            {{- end }}
+            {{- end }}
+            {{- with .serverName }}
+            - name: KFKLEASE_TLS_SERVER_NAME
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .insecureSkipVerify }}
+            - name: KFKLEASE_TLS_INSECURE_SKIP_VERIFY
+              value: "true"
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.auth.sasl }}
+            {{- if .mechanism }}
+            - name: KFKLEASE_SASL_MECHANISM
+              value: {{ .mechanism | quote }}
+            {{- with .username }}
+            - name: KFKLEASE_SASL_USERNAME
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .secretName }}
+            {{- if eq .mechanism "oauthbearer" }}
+            - name: KFKLEASE_SASL_TOKEN_FILE
+              value: /etc/kfklease/sasl/{{ .tokenKey }}
+            {{- else }}
+            - name: KFKLEASE_SASL_PASSWORD_FILE
+              value: /etc/kfklease/sasl/{{ .passwordKey }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
             - name: POD_NAME
               valueFrom:
                 fieldRef:
@@ -64,6 +107,32 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          {{- if or (and .Values.auth.tls.enabled .Values.auth.tls.secretName) .Values.auth.sasl.secretName }}
+          volumeMounts:
+            {{- if and .Values.auth.tls.enabled .Values.auth.tls.secretName }}
+            - name: tls
+              mountPath: /etc/kfklease/tls
+              readOnly: true
+            {{- end }}
+            {{- if .Values.auth.sasl.secretName }}
+            - name: sasl
+              mountPath: /etc/kfklease/sasl
+              readOnly: true
+            {{- end }}
+          {{- end }}
+      {{- if or (and .Values.auth.tls.enabled .Values.auth.tls.secretName) .Values.auth.sasl.secretName }}
+      volumes:
+        {{- if and .Values.auth.tls.enabled .Values.auth.tls.secretName }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.auth.tls.secretName }}
+        {{- end }}
+        {{- if .Values.auth.sasl.secretName }}
+        - name: sasl
+          secret:
+            secretName: {{ .Values.auth.sasl.secretName }}
+        {{- end }}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

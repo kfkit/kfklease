@@ -4,10 +4,20 @@ Two independent single-node Kubernetes clusters and one Kafka broker, all from
 a single compose file. The clusters compete for a lease; Kafka is the arbiter.
 
 ```
-kafka   apache/kafka, KRaft, 172.30.0.10:9092   (host: localhost:19092)
+kafka   apache/kafka, KRaft, 172.30.0.10        (host: localhost)
+          :9092  plaintext                       (host :19092)
+          :9094  SASL_PLAINTEXT, PLAIN + SCRAM   (host :19094)
+          :9095  mTLS, client certificate required (host :19095)
 k3s-a   k3s + KEDA,          172.30.0.11        (API: https://127.0.0.1:6443)
 k3s-b   k3s + KEDA,          172.30.0.12        (API: https://127.0.0.1:6444)
 ```
+
+The `certs` service writes a CA, the broker certificate, a client
+certificate and the broker's `jaas.conf` (PLAIN user `kfklease`) to
+`.out/certs` on every start. The integration tests use all three listeners;
+on the stand, `deploy.sh` connects k3s-a over mTLS and k3s-b over SASL
+PLAIN, each from a Kubernetes Secret through the chart's `auth` values, so
+the two clusters share the lease across two kinds of authentication.
 
 Kafka runs as a plain container outside both clusters on purpose: killing,
 pausing or partitioning a cluster must never take the arbiter down with it.
