@@ -161,20 +161,25 @@ scenario_pause() {
 }
 
 scenario_broker() {
-  echo "== broker: restart Kafka, the arbiter"
+  echo "== broker: Kafka, the arbiter, is down for 2 x ttl"
   local h t0 lost back
   h=$(settle)
   t0=$(date +%s)
-  docker compose restart kafka >/dev/null 2>&1
+  # A restart would be over before the holder's deadline on a fast machine
+  # and the holder would rightly keep the lease; a stop of a known length
+  # makes the outcome deterministic.
+  docker compose stop kafka >/dev/null 2>&1
   # Without Kafka nobody can renew: the holder stops within a ttl.
   wait_running "$h" 0 $(( 3 * TTL )) >/dev/null
   lost=$(( $(date +%s) - t0 ))
+  sleep $(( 2 * TTL - lost > 0 ? 2 * TTL - lost : 0 ))
+  docker compose start kafka >/dev/null 2>&1
   until [[ -n $(holder) ]]; do
     (( $(date +%s) - t0 < 6 * TTL )) || { echo "FAILED: nobody took the lease after the broker came back" >&2; return 1; }
     sleep 1
   done
   back=$(( $(date +%s) - t0 ))
-  echo "   ${h} stopped ${lost}s after the restart, $(holder) holds ${back}s after it (ttl ${TTL}s)"
+  echo "   ${h} stopped ${lost}s into the outage, $(holder) holds ${back}s after it began (ttl ${TTL}s)"
   watch_exclusive $(( 2 * TTL ))
   echo "   ok"
 }

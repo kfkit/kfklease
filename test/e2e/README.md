@@ -44,7 +44,7 @@ runs in both clusters at once. Results with TTL 10 s, `pollingInterval: 5`,
 | `crash`     | `docker compose kill` the holder's cluster     | takeover after 9–12 s; the revived cluster restarts its stale pod for ~30 s until its KEDA is back, then stays idle |
 | `partition` | holder's cluster cut off from Kafka            | holder's pod down at ~10–12 s, standby's up ~1 s later, no overlap |
 | `pause`     | holder's cluster frozen for 2 × TTL            | takeover ~10 s into the freeze; on wake-up the frozen pod goes within 1 s |
-| `broker`    | `docker compose restart kafka`                 | holder's pod down within a TTL; a holder again ~10 s after the broker is back |
+| `broker`    | Kafka stopped for 2 × TTL                      | holder's pod down within a TTL; a holder again ~10 s after the broker is back |
 
 Takeover timing is TTL plus KEDA's reaction and pod start; the standby
 never claims before the term in the log runs out, and the old holder stops
@@ -59,7 +59,7 @@ checked to the millisecond by the simulation and the integration tests.
 | Cluster dies               | `docker compose kill k3s-a`               |
 | Cluster freezes            | `docker compose pause k3s-a` / `unpause`  |
 | Cluster loses Kafka        | `./partition.sh cut k3s-a` / `heal k3s-a` |
-| Arbiter restarts           | `docker compose restart kafka`            |
+| Arbiter is down            | `docker compose stop kafka` / `start kafka` |
 
 `partition.sh` drops packets to Kafka inside the node's network namespace, so
 connections hang and time out the way they do in a real partition. Do not use
