@@ -3,9 +3,9 @@
 Distributed leases and leader election on top of Apache Kafka®, with a
 [KEDA](https://keda.sh) metric for lease-driven failover.
 
-> Status: v0.2: the protocol, the client, the KEDA scaler and broker
-> authentication work and are tested on a two-cluster stand, but nothing has
-> run in production yet.
+> Status: v0.3: the protocol, the client, the KEDA scaler, broker
+> authentication and metrics work and are tested on a two-cluster stand
+> down to the workload's own writes, but nothing has run in production yet.
 
 ## Why
 
@@ -76,7 +76,7 @@ release name and namespace, so the same command works in every cluster with
 a different `holderPrefix`:
 
 ```bash
-helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.2.1 \
+helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.3.0 \
   -n kfklease --create-namespace \
   --set brokers=kafka:9092 --set topic=my-lease --set holderPrefix=eu-west \
   --set scaledObject.target=my-singleton
