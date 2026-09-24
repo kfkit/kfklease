@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kfklease</title>
+<meta name="description" content="Distributed leases and leader election on top of Apache Kafka, with a KEDA scaler for cross-cluster failover.">
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1c1d1f; --muted: #5c6166;
+    --rule: #e3e5e8; --accent: #1f6feb; --code-bg: #f4f5f7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115; --fg: #e6e8eb; --muted: #9aa1a9;
+      --rule: #23262d; --accent: #6ea8fe; --code-bg: #171a20;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 4rem 1rem 5rem;
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 41rem; margin: 0 auto; }
+  h1 { font-size: 2rem; letter-spacing: -0.02em; margin: 0 0 .25rem; }
+  .tagline { color: var(--muted); margin: 0 0 2.5rem; font-size: 1.05rem; }
+  h2 { font-size: 1rem; text-transform: uppercase; letter-spacing: .08em;
+       color: var(--muted); font-weight: 600; margin: 2.5rem 0 .75rem; }
+  p { margin: 0 0 1rem; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  ul { padding-left: 1.2rem; margin: 0 0 1rem; }
+  li { margin-bottom: .4rem; }
+  code { background: var(--code-bg); padding: .15em .4em; border-radius: 4px; font-size: .9em; }
+  .notice {
+    border-left: 3px solid var(--rule); padding: .1rem 0 .1rem 1rem;
+    color: var(--muted); margin: 0 0 1rem;
+  }
+  footer {
+    margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--rule);
+    color: var(--muted); font-size: .875rem;
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>kfklease</h1>
+  <p class="tagline">Distributed leases and leader election on top of Apache Kafka&reg;.</p>
+
+  <p>
+    A single-writer lease derived from a compacted Kafka topic, plus a
+    <a href="https://keda.sh/">KEDA</a> external scaler that runs a workload in exactly one
+    cluster at a time and fails it over when that cluster goes away. No extra coordination
+    service: if your services already share a Kafka cluster, they already have an arbiter.
+  </p>
+
+  <h2>Status</h2>
+  <p class="notice">
+    Early development. The protocol, the Go API and the chart are still moving, and nothing is
+    tagged for release yet. Useful to read and to try on a test cluster &mdash; not yet something
+    to put in front of production traffic.
+  </p>
+
+  <h2>What is here</h2>
+  <ul>
+    <li><code>lease/</code> &mdash; the protocol as a dependency-free state machine, and a Kafka-backed candidate.</li>
+    <li><code>scaler/</code>, <code>cmd/kfklease-scaler</code> &mdash; a KEDA external-push scaler over that lease.</li>
+    <li><code>charts/kfklease</code> &mdash; a Helm chart to deploy the scaler per cluster.</li>
+    <li><code>test/e2e/</code> &mdash; a two-cluster stand exercising cold start, crash, partition and pause.</li>
+  </ul>
+
+  <h2>Read next</h2>
+  <ul>
+    <li><a href="https://github.com/kfkit/kfklease">Source and README on GitHub</a></li>
+    <li><a href="https://github.com/kfkit/kfklease/blob/main/docs/protocol.md">The lease protocol</a> &mdash; how the log is folded into a lease, and why it is safe</li>
+    <li><a href="https://github.com/kfkit/kfklease/issues">Issues and discussion</a></li>
+  </ul>
+
+  <h2>A caveat worth stating up front</h2>
+  <p>
+    This gives you failover, not strict mutual exclusion. KEDA scales a workload down, but it
+    cannot promise the old instance has stopped before the new one starts. Where correctness
+    depends on a single writer, fence at the resource using the lease epoch.
+  </p>
+
+  <footer>
+    Apache Kafka&reg; is a registered trademark of The Apache Software Foundation.
+    This project is not affiliated with or endorsed by the ASF.
+    Licensed under Apache-2.0.
+  </footer>
+</main>
+</body>
+</html>
