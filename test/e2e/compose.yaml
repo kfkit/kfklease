@@ -29,16 +29,30 @@ x-k3s: &k3s
     retries: 60
 
 services:
+  # Self-signed CA, a broker certificate and a client certificate for the
+  # mTLS listener, written to .out/certs for the integration tests.
+  certs:
+    image: alpine/openssl:3.5.4
+    entrypoint: ["/bin/sh", "/gen-certs.sh"]
+    volumes:
+      - ./gen-certs.sh:/gen-certs.sh:ro
+      - ./.out/certs:/certs
+
   kafka:
     image: apache/kafka:4.3.1
+    depends_on:
+      certs:
+        condition: service_completed_successfully
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,HOST://:19092
+      # Three flavours of the same broker: plaintext, SASL and mTLS, each
+      # on the kfk network for pods and on localhost for the host.
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,HOST://:19092,SASL://:9094,HOSTSASL://:19094,MTLS://:9095,HOSTMTLS://:19095
       # Pods inside k3s cannot resolve compose service names, so the broker
       # advertises its static address on the kfk network.
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://172.30.0.10:9092,HOST://localhost:19092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://172.30.0.10:9092,HOST://localhost:19092,SASL://172.30.0.10:9094,HOSTSASL://localhost:19094,MTLS://172.30.0.10:9095,HOSTMTLS://localhost:19095
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,HOST:PLAINTEXT,SASL:SASL_PLAINTEXT,HOSTSASL:SASL_PLAINTEXT,MTLS:SSL,HOSTMTLS:SSL
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
@@ -46,8 +60,22 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # SASL: PLAIN with a static user from jaas.conf, SCRAM with
+      # credentials the integration tests create through the admin API.
+      KAFKA_SASL_ENABLED_MECHANISMS: PLAIN,SCRAM-SHA-256,SCRAM-SHA-512
+      KAFKA_OPTS: -Djava.security.auth.login.config=/certs/jaas.conf
+      # mTLS from PEM files, client certificate required.
+      KAFKA_SSL_KEYSTORE_TYPE: PEM
+      KAFKA_SSL_KEYSTORE_LOCATION: /certs/broker.pem
+      KAFKA_SSL_TRUSTSTORE_TYPE: PEM
+      KAFKA_SSL_TRUSTSTORE_LOCATION: /certs/ca.crt
+      KAFKA_SSL_CLIENT_AUTH: required
+    volumes:
+      - ./.out/certs:/certs:ro
     ports:
       - "127.0.0.1:19092:19092"
+      - "127.0.0.1:19094:19094"
+      - "127.0.0.1:19095:19095"
     networks:
       kfk:
         ipv4_address: 172.30.0.10

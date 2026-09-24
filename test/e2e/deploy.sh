@@ -22,10 +22,31 @@ helm_template() {
 }
 
 kc "$cluster" create namespace "$NS" --dry-run=client -o yaml | kc "$cluster" apply -f - >/dev/null
+
+# Each cluster authenticates differently, so that the chart's auth values
+# and both kinds of listener are exercised on every run.
+auth=()
+case "$cluster" in
+  k3s-a)
+    kc "$cluster" -n "$NS" create secret generic kafka-mtls --dry-run=client -o yaml \
+      --from-file=ca.crt=.out/certs/ca.crt --from-file=tls.crt=.out/certs/client.crt --from-file=tls.key=.out/certs/client.key \
+      | kc "$cluster" apply -f - >/dev/null
+    auth=(--set brokers="$KAFKA_ADDR:9095" --set auth.tls.enabled=true --set auth.tls.secretName=kafka-mtls
+          --set auth.tls.certKey=tls.crt --set auth.tls.keyKey=tls.key)
+    ;;
+  k3s-b)
+    kc "$cluster" -n "$NS" create secret generic kfklease-sasl --dry-run=client -o yaml \
+      --from-literal=password=kfklease-secret | kc "$cluster" apply -f - >/dev/null
+    auth=(--set brokers="$KAFKA_ADDR:9094" --set auth.sasl.mechanism=plain --set auth.sasl.username=kfklease
+          --set auth.sasl.secretName=kfklease-sasl)
+    ;;
+esac
+
 helm_template --namespace "$NS" \
   --set image.repository=kfklease-scaler --set image.tag=dev --set image.pullPolicy=Never \
-  --set brokers="$KAFKA_ADDR:$KAFKA_PORT" --set topic=kfklease-e2e --set ttl="${TTL}s" \
+  --set topic=kfklease-e2e --set ttl="${TTL}s" \
   --set holderPrefix="$cluster" --set scaledObject.target=singleton --set logLevel=debug \
+  "${auth[@]}" \
   | kc "$cluster" -n "$NS" apply -f - >/dev/null
 # shellcheck disable=SC2016 # the literal is the variable name for envsubst
 CLUSTER="$cluster" envsubst '$CLUSTER' < manifests/singleton.yaml | kc "$cluster" -n "$NS" apply -f - >/dev/null

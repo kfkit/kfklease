@@ -19,6 +19,27 @@ holderPrefix: ""
 
 logLevel: info
 
+# Authentication to the brokers. Secrets are mounted from Kubernetes
+# Secrets and read by the scaler from files, so a rotated Secret takes
+# effect on the next reconnect.
+auth:
+  tls:
+    enabled: false
+    # Secret with the CA (and the client certificate for mTLS). Keys below.
+    secretName: ""
+    caKey: ca.crt
+    certKey: ""        # e.g. tls.crt; with keyKey, enables mTLS
+    keyKey: ""         # e.g. tls.key
+    serverName: ""
+    insecureSkipVerify: false
+  sasl:
+    mechanism: ""      # plain, scram-sha-256, scram-sha-512, oauthbearer
+    username: ""
+    # Secret with the password (plain, scram) or the token (oauthbearer).
+    secretName: ""
+    passwordKey: password
+    tokenKey: token
+
 # A ScaledObject that keeps a workload at one replica while this cluster
 # holds the lease and at zero otherwise. Disable it to write your own.
 scaledObject:

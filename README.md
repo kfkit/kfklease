@@ -87,6 +87,23 @@ command are in the [release notes](https://github.com/kfkit/kfklease/releases).
 The chart's values are documented in
 [charts/kfklease/values.yaml](charts/kfklease/values.yaml).
 
+Brokers that need authentication are configured under `auth`: TLS with a
+private CA or mTLS from a Secret holding the certificates, SASL PLAIN,
+SCRAM-SHA-256/512 or OAUTHBEARER with the password or token in a Secret.
+The scaler reads secrets from the mounted files on every authentication, so
+a rotated Secret takes effect on the next reconnect:
+
+```bash
+  --set auth.tls.enabled=true --set auth.tls.secretName=kafka-ca \
+  --set auth.sasl.mechanism=scram-sha-512 --set auth.sasl.username=kfklease \
+  --set auth.sasl.secretName=kfklease-sasl
+```
+
+The same settings are flags and `KFKLEASE_TLS_*` / `KFKLEASE_SASL_*`
+variables on the binary, and `lease.Config.Auth` in the library; anything
+else franz-go supports (AWS MSK IAM, custom mechanisms) goes through
+`lease.Config.ClientOpts`.
+
 The binary is configured by flags or environment: `KFKLEASE_BROKERS`,
 `KFKLEASE_TOPIC`, `KFKLEASE_TTL`, `KFKLEASE_HOLDER` (unique per process; the
 chart uses the pod name). The two-cluster stand the chart is tested on is in

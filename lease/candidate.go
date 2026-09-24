@@ -46,10 +46,15 @@ type Config struct {
 	// RenewEvery is how often a holder renews. Zero means TTL / 3.
 	RenewEvery time.Duration
 
+	// Auth is how the client authenticates to the brokers: TLS, mTLS, SASL.
+	// The zero value is plaintext.
+	Auth Auth
+
 	// Logger receives protocol events. Nil means slog.Default.
 	Logger *slog.Logger
 	// ClientOpts are passed to the Kafka client after the options the
-	// protocol sets itself: TLS, SASL, dial timeouts and the like.
+	// protocol and Auth set: dial timeouts, other SASL mechanisms and the
+	// like.
 	ClientOpts []kgo.Opt
 }
 
@@ -213,6 +218,11 @@ func (c *Candidate) Run(ctx context.Context) error {
 		// long stale and a renew would be a late renew.
 		kgo.RecordDeliveryTimeout(cfg.TTL),
 	}
+	authOpts, err := cfg.Auth.clientOpts()
+	if err != nil {
+		return err
+	}
+	opts = append(opts, authOpts...)
 	opts = append(opts, cfg.ClientOpts...)
 	cl, err := kgo.NewClient(opts...)
 	if err != nil {
