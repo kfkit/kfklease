@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Failover scenarios on the stand. Each one reports how long the takeover
 # took and fails if two clusters ever run the workload at the same time.
+# The workload is the heartbeat example: after each scenario its records
+# say, by the broker's clock and to 200 ms, whether two epochs ever wrote
+# at once and how long nobody wrote.
 #
 #   ./scenarios.sh            # all
 #   ./scenarios.sh crash      # one: coldstart, crash, partition, pause, broker
@@ -90,9 +93,32 @@ settle() {
   echo "$h"
 }
 
+# now_rfc3339 prints the current time for the heartbeat report's --since.
+now_rfc3339() {
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+# heartbeats <since> reads the heartbeat topic from <since>, prints what
+# the workload actually did, and fails on any fenced (stale) record or any
+# overlap between epochs: the workload-level mutual exclusion check.
+heartbeats() {
+  local since=$1 out
+  out=$(docker run --rm --network "${COMPOSE_PROJECT}_kfk" kfklease-heartbeat:dev report \
+    --brokers "$KAFKA_ADDR:$KAFKA_PORT" --since "$since" --json)
+  python3 - "$out" <<'PY'
+import sys, json
+r = json.loads(sys.argv[1])
+ms = lambda ns: f"{ns/1e6:.0f}ms"
+spans = ", ".join(f"epoch {e['epoch']}@{e['cluster']} x{e['count']}" for e in r["epochs"])
+print(f"   heartbeats: {r['records']} records, {spans}; stale {r['stale']}, overlap {ms(r['overlap'])}, gap {ms(r['gap'])}")
+sys.exit(0 if r["stale"] == 0 and r["overlap"] == 0 else 1)
+PY
+}
+
 scenario_coldstart() {
   echo "== coldstart: exactly one cluster runs the workload"
-  local t0 h
+  local t0 h since
+  since=$(now_rfc3339)
   t0=$(date +%s)
   until [[ -n $(holder) ]]; do
     (( $(date +%s) - t0 < 3 * TTL )) || { echo "FAILED: nobody took the lease" >&2; return 1; }
@@ -102,13 +128,14 @@ scenario_coldstart() {
   echo "   holder: ${h} after $(( $(date +%s) - t0 ))s"
   watch_exclusive $(( 2 * TTL ))
   [[ $(running "$(other "$h")") == 0 ]] || { echo "FAILED: standby is running the workload" >&2; return 1; }
+  heartbeats "$since"
   echo "   ok: standby idle for $(( 2 * TTL ))s"
 }
 
 scenario_crash() {
   echo "== crash: kill the holder's cluster"
-  local h o t
-  h=$(settle); o=$(other "$h")
+  local h o t since
+  h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
   docker compose kill "$h" >/dev/null 2>&1
   t=$(wait_running "$o" 1 $(( 3 * TTL )))
   echo "   ${o} took over ${t}s after ${h} died (ttl ${TTL}s)"
@@ -126,25 +153,27 @@ scenario_crash() {
   # The revived scaler has a new holder id and must not take the lease back.
   watch_exclusive $(( 2 * TTL ))
   [[ $(holder) == "$o" ]] || { echo "FAILED: lease moved back to the revived cluster" >&2; return 1; }
+  heartbeats "$since"
   echo "   ok: ${h} stayed idle"
 }
 
 scenario_partition() {
   echo "== partition: cut the holder's cluster off from Kafka"
-  local h o
-  h=$(settle); o=$(other "$h")
+  local h o since
+  h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
   ./partition.sh cut "$h"
   echo "   ${h} -> ${o}: $(transition "$h" "$o" $(( 3 * TTL ))) (ttl ${TTL}s)"
   ./partition.sh heal "$h"
   watch_exclusive $(( 2 * TTL ))
   [[ $(holder) == "$o" ]] || { echo "FAILED: lease moved back after the heal" >&2; return 1; }
+  heartbeats "$since"
   echo "   ok: ${h} healed and stayed idle"
 }
 
 scenario_pause() {
   echo "== pause: freeze the holder's cluster for 2 x ttl"
-  local h o t
-  h=$(settle); o=$(other "$h")
+  local h o t since
+  h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
   docker compose pause "$h" >/dev/null 2>&1
   t=$(wait_running "$o" 1 $(( 3 * TTL )))
   echo "   ${o} took over ${t}s into the freeze"
@@ -157,13 +186,14 @@ scenario_pause() {
   echo "   ${h} stopped its pod ${t}s after waking up"
   watch_exclusive $(( 2 * TTL ))
   [[ $(holder) == "$o" ]] || { echo "FAILED: lease moved back after the pause" >&2; return 1; }
+  heartbeats "$since"
   echo "   ok"
 }
 
 scenario_broker() {
   echo "== broker: Kafka, the arbiter, is down for 2 x ttl"
-  local h t0 lost back
-  h=$(settle)
+  local h t0 lost back since
+  h=$(settle); since=$(now_rfc3339)
   t0=$(date +%s)
   # A restart would be over before the holder's deadline on a fast machine
   # and the holder would rightly keep the lease; a stop of a known length
@@ -181,6 +211,7 @@ scenario_broker() {
   back=$(( $(date +%s) - t0 ))
   echo "   ${h} stopped ${lost}s into the outage, $(holder) holds ${back}s after it began (ttl ${TTL}s)"
   watch_exclusive $(( 2 * TTL ))
+  heartbeats "$since"
   echo "   ok"
 }
 

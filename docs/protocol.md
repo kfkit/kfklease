@@ -79,6 +79,27 @@ and may even be accepted, but the writer no longer acts on that term.
 A candidate may claim whenever it likes. A premature claim is simply rejected
 by the fold; it costs a record, not safety.
 
+## The margin
+
+Two clocks can disagree with the broker's and stretch the belief past the
+term:
+
+- a new partition leader whose clock runs ahead of the old one's by δ
+  lets a takeover happen δ early;
+- a client clock running slow by a factor of 1−d makes a deadline of
+  `ttl − margin` last `(ttl − margin) / (1 − d)` of real time.
+
+So the margin has to cover both, and the produce and consume latency of a
+renewal on top:
+
+	margin ≥ 2 × broker clock skew + ttl × client clock drift + latency
+
+The default of `ttl / 5` (2 s for a 10 s lease) covers brokers within a
+second of each other and a client clock off by a few percent. The holder
+also drops its belief the moment it reads another holder's accepted claim,
+which closes the window whenever it can still read the log; the margin is
+for when it cannot.
+
 ## Reading a truncated log
 
 Compaction removes history, so a reader usually starts in the middle. It
@@ -118,15 +139,20 @@ acknowledgements, and the tests feed it the same things from a fake log.
 `lease/sim_test.go` runs real agents against a shared log with lagging
 consumers, produce requests that land up to two TTLs late, delivery timeouts
 after which the record lands anyway, acknowledgements that arrive after the
-record was read back, processes frozen for up to three TTLs, and
-participants that join late and see only a tail of the log with holes in it.
-Clocks are perfect and the margin is zero, so any overlap is a protocol bug.
-It checks that
+record was read back, processes frozen for up to three TTLs, nodes cut off
+from the log for up to two TTLs, and participants that join late and see
+only a tail of the log with holes in it. Clocks are perfect and the margin
+is zero, so any overlap is a protocol bug. It checks that
 
 - no two agents ever believe they hold the lease at the same instant;
 - a reader started at any offset, once certain, has exactly the state of a
   reader that saw the whole log;
 - candidates do not spam the log with claims they can see are hopeless.
+
+A second run of the same simulation gives the partition leaders clocks off
+by up to a fifth of a TTL and the clients clocks off by up to ten percent,
+and checks both halves of the margin rule above: with a zero margin some
+runs overlap, with the margin from the formula none do.
 
 `lease/agent_test.go` pins down the rules one at a time: the deadline counts
 from the send time whatever the landing and read-back times; the belief needs
@@ -171,8 +197,6 @@ check that the workload never runs in both clusters at once.
 
 ## Not covered yet
 
-- Clock drift between a client's monotonic clock and the broker's, and clock
-  skew between brokers: both go into the margin, which is not modelled.
 - System suspend: on Linux the monotonic clock does not advance during
   suspend, so a suspended holder can wake up still believing. Container
   pauses are covered by the freeze scenario on the stand.
