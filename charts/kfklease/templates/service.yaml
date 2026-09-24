@@ -11,3 +11,6 @@ spec:
     - name: grpc
       port: {{ .Values.service.port }}
       targetPort: grpc
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: http
