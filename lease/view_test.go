@@ -31,7 +31,7 @@ type step struct {
 	want Outcome
 }
 
-func run(t *testing.T, v *View, steps []step) {
+func apply(t *testing.T, v *View, steps []step) {
 	t.Helper()
 	for i, s := range steps {
 		got, err := v.Apply(s.rec)
@@ -149,7 +149,7 @@ func TestFoldFromStart(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			v := NewViewFromStart(testTTL)
-			run(t, v, tt.steps)
+			apply(t, v, tt.steps)
 			wantState(t, v, tt.holder, tt.epoch, tt.expires)
 		})
 	}
@@ -157,7 +157,7 @@ func TestFoldFromStart(t *testing.T) {
 
 func TestApplyContract(t *testing.T) {
 	v := NewViewFromStart(testTTL)
-	run(t, v, []step{{claim(5, 0, "a"), Accepted}})
+	apply(t, v, []step{{claim(5, 0, "a"), Accepted}})
 	if _, err := v.Apply(renew(5, 1, "a", 5)); err == nil {
 		t.Fatalf("repeated offset: want error")
 	}
@@ -169,7 +169,7 @@ func TestApplyContract(t *testing.T) {
 
 func TestUncertainAnchorsOnRenewPair(t *testing.T) {
 	v := NewView(testTTL)
-	run(t, v, []step{
+	apply(t, v, []step{
 		// History before offset 40 is gone. Nothing here can be judged yet:
 		// the claim by b may well have been rejected.
 		{claim(40, 100, "b"), Pending},
@@ -182,7 +182,7 @@ func TestUncertainAnchorsOnRenewPair(t *testing.T) {
 
 func TestUncertainAnchorsOnClaim(t *testing.T) {
 	v := NewView(testTTL)
-	run(t, v, []step{
+	apply(t, v, []step{
 		{claim(40, 100, "a"), Pending},
 		{claim(41, 100.5, "b"), Pending},
 		{renew(42, 103, "a", 40), Accepted},
@@ -192,7 +192,7 @@ func TestUncertainAnchorsOnClaim(t *testing.T) {
 
 func TestUncertainReplaysRecordsAfterAnchor(t *testing.T) {
 	v := NewView(testTTL)
-	run(t, v, []step{
+	apply(t, v, []step{
 		{renew(40, 100, "a", 17), Pending},
 		// c claims too early. Without it the silence between 100 and 111
 		// would settle the view on its own.
@@ -208,7 +208,7 @@ func TestUncertainReplaysRecordsAfterAnchor(t *testing.T) {
 
 func TestUncertainSilenceBetweenRecords(t *testing.T) {
 	v := NewView(testTTL)
-	run(t, v, []step{
+	apply(t, v, []step{
 		{renew(40, 100, "a", 17), Pending},
 		{claim(41, 110, "b"), Accepted},
 	})
@@ -217,7 +217,7 @@ func TestUncertainSilenceBetweenRecords(t *testing.T) {
 
 func TestUncertainSingleRecordsDoNotSettle(t *testing.T) {
 	v := NewView(testTTL)
-	run(t, v, []step{
+	apply(t, v, []step{
 		{claim(40, 100, "a"), Pending},
 		{claim(41, 105, "b"), Pending},
 		{claim(42, 112, "c"), Pending},
@@ -230,7 +230,7 @@ func TestUncertainSingleRecordsDoNotSettle(t *testing.T) {
 
 func TestReleaseIsNotAnAnchor(t *testing.T) {
 	v := NewView(testTTL)
-	run(t, v, []step{
+	apply(t, v, []step{
 		{release(40, 100, "a", 17), Pending},
 		{renew(41, 101, "a", 17), Pending},
 	})
@@ -241,7 +241,7 @@ func TestReleaseIsNotAnAnchor(t *testing.T) {
 
 func TestQuiet(t *testing.T) {
 	v := NewView(testTTL)
-	run(t, v, []step{{renew(40, 100, "a", 17), Pending}})
+	apply(t, v, []step{{renew(40, 100, "a", 17), Pending}})
 	if v.Quiet(testTTL - 1) {
 		t.Fatalf("quiet shorter than ttl settled the view")
 	}
@@ -251,7 +251,7 @@ func TestQuiet(t *testing.T) {
 	if !v.Certain() || v.State().Holder != "" {
 		t.Fatalf("after quiet: certain=%v holder=%q", v.Certain(), v.State().Holder)
 	}
-	run(t, v, []step{{claim(41, 100.5, "b"), Accepted}})
+	apply(t, v, []step{{claim(41, 100.5, "b"), Accepted}})
 	wantState(t, v, "b", 41, 110.5)
 
 	// A certain view keeps its epoch through a quiet period.
@@ -263,12 +263,12 @@ func TestQuiet(t *testing.T) {
 
 func TestGapResetsView(t *testing.T) {
 	v := NewViewFromStart(testTTL)
-	run(t, v, []step{{claim(0, 0, "a"), Accepted}})
+	apply(t, v, []step{{claim(0, 0, "a"), Accepted}})
 	v.Gap()
 	if v.Certain() {
 		t.Fatalf("view is certain after a gap")
 	}
-	run(t, v, []step{
+	apply(t, v, []step{
 		// Silence must not be measured across the gap: records were skipped.
 		{claim(90, 50, "b"), Pending},
 		{renew(91, 53, "b", 90), Accepted},

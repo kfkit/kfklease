@@ -1,7 +1,7 @@
 # Lease protocol
 
-Status: draft. The state machine described here is implemented and tested in
-[`lease/`](../lease); the Kafka client around it is not written yet.
+Status: draft. The state machine and the Kafka client described here are
+implemented and tested in [`lease/`](../lease).
 
 ## The problem with Kafka
 
@@ -17,7 +17,8 @@ partition's total order does the job of the missing compare-and-swap.
 
 ## Topic
 
-- All records of one lease live in one partition (message key = lease name).
+- One lease per partition, all its records under one constant key, so that
+  compaction keeps the latest record and nothing else is needed.
 - `message.timestamp.type=LogAppendTime`. The only clock in the protocol is
   the broker's. Client wall clocks are never compared with anything.
 - `cleanup.policy=compact`, with `min.compaction.lag.ms` well above the TTL so
@@ -124,10 +125,35 @@ term, halving the silence period, basing the deadline on read-back time,
 granting claims on a held lease, skipping the replay after an anchor) makes
 the simulation fail.
 
+## The client
+
+`lease.Candidate` runs the rules above against a real partition:
+
+- it consumes from the log start offset; a start offset of 0 means the
+  history is complete and the view starts certain, otherwise it starts
+  uncertain. A hole in the offsets (compaction, a lagging consumer) sends
+  the view back to uncertain;
+- it rejects a topic without `LogAppendTime` on the first record it sees;
+- it measures silence at the end of the log only while fetches succeed, from
+  the later of the last record and the moment it caught up; a fetch error
+  restarts the measurement;
+- it matches its own records by the offset the broker acknowledges, so a
+  record it gave up on (delivery timeout) can never be mistaken for the one
+  in flight;
+- a stop releases the lease: the belief is dropped first, the record is
+  written second.
+
+`lease/candidate_integration_test.go` runs it against a broker: one holder
+among two candidates, handover after a release (tens of milliseconds) and
+after a crash (about one TTL, never before the crashed holder's deadline),
+a late reader agreeing with the holder, epochs growing across terms.
+
 ## Not covered yet
 
 - Clock drift between a client's monotonic clock and the broker's, and clock
   skew between brokers: both go into the margin, which is not modelled.
-- The Kafka client: consuming, detecting offset holes, producing with a
-  bounded delivery timeout, measuring silence at the end of the log.
+- A process frozen for longer than a TTL: the deadline rule handles it, but
+  it is not exercised against a broker. On Linux the monotonic clock does not
+  advance during system suspend, so a suspended holder can wake up still
+  believing; container pauses are fine.
 - Several leases sharing a partition.
