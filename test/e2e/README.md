@@ -41,13 +41,17 @@ docker compose down -v         # tear down, drop cluster state
 `deploy.sh` renders `charts/kfklease` (helm, or the `alpine/helm` image when
 helm is not installed) with holder prefix `<cluster>` and the `singleton`
 deployment from `manifests/` as the scale target: one replica while the
-cluster holds the lease, zero otherwise.
+cluster holds the lease, zero otherwise. `singleton` runs the heartbeat
+example from `examples/`, built into `kfklease-heartbeat:dev` by
+`build-image.sh`.
 
 ## Scenarios
 
 `scenarios.sh` runs them all or by name. Each fails if the workload ever
-runs in both clusters at once. Results with TTL 10 s, `pollingInterval: 5`,
-`cooldownPeriod: 0`:
+runs in both clusters at once, and, since the workload is the heartbeat
+example, if two lease epochs ever wrote at the same time or a stale record
+got past the fence, measured by the broker's clock to 200 ms. Results with
+TTL 10 s, `pollingInterval: 5`, `cooldownPeriod: 0`:
 
 | Scenario    | What happens                                   | Result                                   |
 |-------------|------------------------------------------------|------------------------------------------|
@@ -59,9 +63,9 @@ runs in both clusters at once. Results with TTL 10 s, `pollingInterval: 5`,
 
 Takeover timing is TTL plus KEDA's reaction and pod start; the standby
 never claims before the term in the log runs out, and the old holder stops
-believing a margin earlier than that. Pods are polled once a second, so an
-overlap shorter than that can slip past the check; the lease itself is
-checked to the millisecond by the simulation and the integration tests.
+believing a margin earlier than that. Pods are polled once a second, so a
+pod-level overlap shorter than that can slip past that check; what matters
+is the heartbeat check, which sees every write.
 
 ## Failure injection
 
