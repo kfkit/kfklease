@@ -76,7 +76,7 @@ release name and namespace, so the same command works in every cluster with
 a different `holderPrefix`:
 
 ```bash
-helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.2.0 \
+helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.2.1 \
   -n kfklease --create-namespace \
   --set brokers=kafka:9092 --set topic=my-lease --set holderPrefix=eu-west \
   --set scaledObject.target=my-singleton
