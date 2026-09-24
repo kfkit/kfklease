@@ -41,7 +41,7 @@ runs in both clusters at once. Results with TTL 10 s, `pollingInterval: 5`,
 | Scenario    | What happens                                   | Result                                   |
 |-------------|------------------------------------------------|------------------------------------------|
 | `coldstart` | both clusters start                            | one holder within 1 s, standby idle      |
-| `crash`     | `docker compose kill` the holder's cluster     | takeover after 9–12 s; revived cluster stays idle |
+| `crash`     | `docker compose kill` the holder's cluster     | takeover after 9–12 s; the revived cluster restarts its stale pod for ~30 s until its KEDA is back, then stays idle |
 | `partition` | holder's cluster cut off from Kafka            | holder's pod down at ~10–12 s, standby's up ~1 s later, no overlap |
 | `pause`     | holder's cluster frozen for 2 × TTL            | takeover ~10 s into the freeze; on wake-up the frozen pod goes within 1 s |
 | `broker`    | `docker compose restart kafka`                 | holder's pod down within a TTL; a holder again ~10 s after the broker is back |

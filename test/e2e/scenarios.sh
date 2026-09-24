@@ -113,13 +113,20 @@ scenario_crash() {
   t=$(wait_running "$o" 1 $(( 3 * TTL )))
   echo "   ${o} took over ${t}s after ${h} died (ttl ${TTL}s)"
   docker compose up -d --wait "$h" >/dev/null 2>&1
-  # The revived cluster restarts its scaler with a new holder id and must
-  # not take the lease back.
+  # The revived cluster still has the workload at one replica in its own
+  # state, so its kubelet restarts the stale pod until KEDA is back up and
+  # scales it down. That window is a property of Kubernetes, not of the
+  # lease; it is why workloads that must not overlap check the epoch.
+  local t0
+  t0=$(date +%s)
+  kc "$h" -n keda rollout status deploy/keda-operator --timeout=180s >/dev/null
   kc "$h" -n "$NS" rollout status "deploy/$RELEASE" --timeout=120s >/dev/null
-  wait_running "$h" 0 $(( 2 * TTL )) >/dev/null
+  t=$(wait_running "$h" 0 $(( 3 * TTL )))
+  echo "   ${h} came back and ran its stale pod for $(( $(date +%s) - t0 ))s before KEDA scaled it down"
+  # The revived scaler has a new holder id and must not take the lease back.
   watch_exclusive $(( 2 * TTL ))
   [[ $(holder) == "$o" ]] || { echo "FAILED: lease moved back to the revived cluster" >&2; return 1; }
-  echo "   ok: ${h} came back and stayed idle"
+  echo "   ok: ${h} stayed idle"
 }
 
 scenario_partition() {

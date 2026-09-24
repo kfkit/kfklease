@@ -89,8 +89,10 @@ chart uses the pod name). The two-cluster stand the chart is tested on is in
 [test/e2e](test/e2e).
 
 KEDA gives failover, not mutual exclusion: the old pod is still terminating
-while the new one starts, and a `cooldownPeriod` above zero stretches that.
-Workloads that must not overlap check the epoch downstream.
+while the new one starts, a `cooldownPeriod` above zero stretches that, and a
+cluster coming back from a crash restarts its stale pod until its own KEDA
+is up again and scales it down. Workloads that must not overlap check the
+epoch downstream.
 
 `Status().Holding` is a belief with a deadline, not a fact: a holder that
 cannot reach Kafka stops believing after one TTL minus a margin, and the next
