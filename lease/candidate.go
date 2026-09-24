@@ -39,9 +39,9 @@ type Config struct {
 	// lease and must be the same for every participant.
 	TTL time.Duration
 	// Margin is subtracted from every deadline the holder sets for itself.
-	// It has to cover the clock skew between brokers and the difference
-	// between the client's monotonic clock and the broker's over one TTL.
-	// Zero means TTL / 5.
+	// It has to cover twice the clock skew between brokers, the drift of
+	// this client's clock over one TTL, and the latency of a renewal; see
+	// docs/protocol.md. Zero means TTL / 5.
 	Margin time.Duration
 	// RenewEvery is how often a holder renews. Zero means TTL / 3.
 	RenewEvery time.Duration
