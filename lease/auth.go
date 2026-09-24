@@ -9,8 +9,10 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sasl"
@@ -28,12 +30,19 @@ type Auth struct {
 }
 
 // TLS configures the connection. Enabled alone means TLS with the system
-// roots; CAFile adds a private CA; CertFile and KeyFile add a client
-// certificate (mTLS).
+// roots; a CA adds a private CA; a client certificate and key add mTLS.
+// Each of the three comes either inline as PEM (from an environment
+// variable, say) or as a file. Files are re-read on every new connection,
+// so a certificate renewed in a mounted Secret is picked up on the next
+// reconnect without a restart; inline values are fixed for the life of the
+// process.
 type TLS struct {
 	Enabled  bool
+	CA       string // PEM
 	CAFile   string
+	Cert     string // PEM
 	CertFile string
+	Key      string // PEM
 	KeyFile  string
 	// ServerName overrides the name the broker's certificate is checked
 	// against, for brokers advertised by IP.
@@ -50,7 +59,9 @@ type SASL struct {
 	// Mechanism is one of "plain", "scram-sha-256", "scram-sha-512" or
 	// "oauthbearer"; empty means no SASL.
 	Mechanism string
-	Username  string
+	// Username or UsernameFile, for plain and scram.
+	Username     string
+	UsernameFile string
 	// Password or PasswordFile, for plain and scram.
 	Password     string
 	PasswordFile string
@@ -67,19 +78,18 @@ const (
 	MechanismOAuthBearer = "oauthbearer"
 )
 
-// clientOpts turns the auth config into client options. Files named in the
-// TLS config are read once, here; SASL secret files are read on every
-// authentication.
+// clientOpts turns the auth config into client options. Everything is
+// validated here, so that a bad file or PEM fails at startup; the secrets
+// themselves are then read again on every connection or authentication.
 func (a Auth) clientOpts() ([]kgo.Opt, error) {
 	var opts []kgo.Opt
 	if a.TLS.Enabled {
-		cfg, err := a.TLS.config()
-		if err != nil {
+		if _, err := a.TLS.config(); err != nil {
 			return nil, err
 		}
-		opts = append(opts, kgo.DialTLSConfig(cfg))
-	} else if a.TLS.CAFile != "" || a.TLS.CertFile != "" || a.TLS.KeyFile != "" {
-		return nil, errors.New("lease: tls files given but tls is not enabled")
+		opts = append(opts, kgo.Dialer(a.TLS.dial))
+	} else if a.TLS.given() {
+		return nil, errors.New("lease: tls material given but tls is not enabled")
 	}
 	mech, err := a.SASL.mechanism()
 	if err != nil {
@@ -91,63 +101,113 @@ func (a Auth) clientOpts() ([]kgo.Opt, error) {
 	return opts, nil
 }
 
+func (t TLS) given() bool {
+	return t.CA != "" || t.CAFile != "" || t.Cert != "" || t.CertFile != "" || t.Key != "" || t.KeyFile != ""
+}
+
+// dial opens a TLS connection with a config built from the current
+// contents of the files.
+func (t TLS) dial(ctx context.Context, network, host string) (net.Conn, error) {
+	cfg, err := t.config()
+	if err != nil {
+		return nil, err
+	}
+	d := tls.Dialer{NetDialer: &net.Dialer{Timeout: 10 * time.Second}, Config: cfg}
+	return d.DialContext(ctx, network, host)
+}
+
+// config reads the PEM material, inline or from files, into a tls.Config.
 func (t TLS) config() (*tls.Config, error) {
 	cfg := &tls.Config{
 		MinVersion:         tls.VersionTLS12,
 		ServerName:         t.ServerName,
 		InsecureSkipVerify: t.InsecureSkipVerify, //nolint:gosec // opt-in, documented as unsafe
 	}
-	if t.CAFile != "" {
-		pem, err := os.ReadFile(t.CAFile)
-		if err != nil {
-			return nil, fmt.Errorf("lease: tls ca: %w", err)
-		}
+	ca, err := pemSource(t.CA, t.CAFile, "ca")
+	if err != nil {
+		return nil, fmt.Errorf("lease: tls: %w", err)
+	}
+	if ca != nil {
 		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("lease: tls ca: no certificates in %s", t.CAFile)
+		if !pool.AppendCertsFromPEM(ca) {
+			return nil, errors.New("lease: tls ca: no certificates in the PEM")
 		}
 		cfg.RootCAs = pool
 	}
+	cert, err := pemSource(t.Cert, t.CertFile, "client certificate")
+	if err != nil {
+		return nil, fmt.Errorf("lease: tls: %w", err)
+	}
+	key, err := pemSource(t.Key, t.KeyFile, "client key")
+	if err != nil {
+		return nil, fmt.Errorf("lease: tls: %w", err)
+	}
 	switch {
-	case t.CertFile != "" && t.KeyFile != "":
-		cert, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile)
+	case cert != nil && key != nil:
+		pair, err := tls.X509KeyPair(cert, key)
 		if err != nil {
 			return nil, fmt.Errorf("lease: tls client certificate: %w", err)
 		}
-		cfg.Certificates = []tls.Certificate{cert}
-	case t.CertFile != "" || t.KeyFile != "":
+		cfg.Certificates = []tls.Certificate{pair}
+	case cert != nil || key != nil:
 		return nil, errors.New("lease: tls client certificate needs both cert and key")
 	}
 	return cfg, nil
 }
 
+// pemSource returns PEM given inline or as a file, or nil when neither.
+func pemSource(value, file, what string) ([]byte, error) {
+	switch {
+	case value != "" && file != "":
+		return nil, fmt.Errorf("%s given both inline and as a file", what)
+	case value != "":
+		return []byte(value), nil
+	case file != "":
+		b, err := os.ReadFile(file)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", what, err)
+		}
+		return b, nil
+	default:
+		return nil, nil
+	}
+}
+
 func (s SASL) mechanism() (sasl.Mechanism, error) {
 	mech := strings.ToLower(s.Mechanism)
 	if mech == "" {
-		if s.Username != "" || s.Password != "" || s.PasswordFile != "" || s.Token != "" || s.TokenFile != "" {
+		if s.Username != "" || s.UsernameFile != "" || s.Password != "" || s.PasswordFile != "" || s.Token != "" || s.TokenFile != "" {
 			return nil, errors.New("lease: sasl credentials given but no mechanism")
 		}
 		return nil, nil
 	}
 	switch mech {
 	case MechanismPlain, MechanismScramSha256, MechanismScramSha512:
-		if s.Username == "" {
-			return nil, fmt.Errorf("lease: sasl %s needs a username", mech)
+		username, err := secretSource(s.Username, s.UsernameFile, "username")
+		if err != nil {
+			return nil, fmt.Errorf("lease: sasl %s: %w", mech, err)
 		}
 		password, err := secretSource(s.Password, s.PasswordFile, "password")
 		if err != nil {
 			return nil, fmt.Errorf("lease: sasl %s: %w", mech, err)
 		}
+		credentials := func() (user, pass string, err error) {
+			if user, err = username(); err != nil {
+				return "", "", err
+			}
+			pass, err = password()
+			return user, pass, err
+		}
 		switch mech {
 		case MechanismPlain:
 			return plain.Plain(func(context.Context) (plain.Auth, error) {
-				p, err := password()
-				return plain.Auth{User: s.Username, Pass: p}, err
+				u, p, err := credentials()
+				return plain.Auth{User: u, Pass: p}, err
 			}), nil
 		case MechanismScramSha256:
-			return scram.Sha256(s.scramAuth(password)), nil
+			return scram.Sha256(scramAuth(credentials)), nil
 		default:
-			return scram.Sha512(s.scramAuth(password)), nil
+			return scram.Sha512(scramAuth(credentials)), nil
 		}
 	case MechanismOAuthBearer:
 		token, err := secretSource(s.Token, s.TokenFile, "token")
@@ -163,10 +223,10 @@ func (s SASL) mechanism() (sasl.Mechanism, error) {
 	}
 }
 
-func (s SASL) scramAuth(password func() (string, error)) func(context.Context) (scram.Auth, error) {
+func scramAuth(credentials func() (string, string, error)) func(context.Context) (scram.Auth, error) {
 	return func(context.Context) (scram.Auth, error) {
-		p, err := password()
-		return scram.Auth{User: s.Username, Pass: p}, err
+		u, p, err := credentials()
+		return scram.Auth{User: u, Pass: p}, err
 	}
 }
 

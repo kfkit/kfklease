@@ -15,9 +15,10 @@ k3s-b   k3s + KEDA,          172.30.0.12        (API: https://127.0.0.1:6444)
 The `certs` service writes a CA, the broker certificate, a client
 certificate and the broker's `jaas.conf` (PLAIN user `kfklease`) to
 `.out/certs` on every start. The integration tests use all three listeners;
-on the stand, `deploy.sh` connects k3s-a over mTLS and k3s-b over SASL
-PLAIN, each from a Kubernetes Secret through the chart's `auth` values, so
-the two clusters share the lease across two kinds of authentication.
+on the stand, `deploy.sh` connects k3s-a over mTLS from a mounted Secret
+and k3s-b over SASL PLAIN with username and password from a Secret as
+environment variables, so the two clusters share the lease across both
+kinds of authentication the chart offers.
 
 Kafka runs as a plain container outside both clusters on purpose: killing,
 pausing or partitioning a cluster must never take the arbiter down with it.
@@ -84,4 +85,8 @@ when an interface disappears.
   host.
 - Locally built images: `docker save <image> -o images/<name>.tar` before the
   stand starts. k3s imports every tarball from that directory on boot.
+- CI runners start empty, so `cache-images.sh` keeps every image the stand
+  needs as a tarball: the compose images in `.cache/`, KEDA and the test
+  workload in `images/` for k3s to import. Both directories live in the
+  Actions cache. Locally Docker's own cache does the job; do not bother.
 - KEDA is installed by the k3s helm-controller from `manifests/keda.yaml`.

@@ -19,26 +19,33 @@ holderPrefix: ""
 
 logLevel: info
 
-# Authentication to the brokers. Secrets are mounted from Kubernetes
-# Secrets and read by the scaler from files, so a rotated Secret takes
-# effect on the next reconnect.
+# Authentication to the brokers. The chart holds no secret itself: it points
+# at Kubernetes Secrets, whoever creates them (cert-manager, Strimzi,
+# External Secrets, kubectl).
 auth:
+  # Certificates are mounted from the Secret as files, the usual way, and
+  # re-read on every connection: a renewed certificate needs no restart.
   tls:
     enabled: false
-    # Secret with the CA (and the client certificate for mTLS). Keys below.
-    secretName: ""
+    secretName: ""     # holds the CA and, for mTLS, the client certificate
     caKey: ca.crt
-    certKey: ""        # e.g. tls.crt; with keyKey, enables mTLS
-    keyKey: ""         # e.g. tls.key
-    serverName: ""
+    clientCert: false  # mTLS with certKey and keyKey from the same Secret
+    certKey: tls.crt   # kubernetes.io/tls layout; Strimzi: user.crt
+    keyKey: tls.key    #                           Strimzi: user.key
+    serverName: ""     # when brokers are advertised by IP
     insecureSkipVerify: false
+  # Credentials go in as environment variables from the Secret. A pod reads
+  # its environment once, so restart it when the Secret changes: with
+  # stakater/reloader, set podAnnotations to reloader.stakater.com/auto: "true".
   sasl:
     mechanism: ""      # plain, scram-sha-256, scram-sha-512, oauthbearer
-    username: ""
-    # Secret with the password (plain, scram) or the token (oauthbearer).
     secretName: ""
-    passwordKey: password
-    tokenKey: token
+    username: ""       # or usernameKey when the Secret holds it too
+    usernameKey: ""
+    passwordKey: password   # plain, scram; Strimzi's KafkaUser layout
+    tokenKey: token         # oauthbearer
+
+podAnnotations: {}
 
 # A ScaledObject that keeps a workload at one replica while this cluster
 # holds the lease and at zero otherwise. Disable it to write your own.

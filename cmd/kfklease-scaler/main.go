@@ -68,13 +68,14 @@ func run() error {
 		logLevel    = flag.String("log-level", env("KFKLEASE_LOG_LEVEL", "info"), "debug, info, warn or error (KFKLEASE_LOG_LEVEL)")
 
 		tlsEnabled  = flag.Bool("tls", env("KFKLEASE_TLS", "false") == "true", "connect with TLS (KFKLEASE_TLS)")
-		tlsCA       = flag.String("tls-ca-file", env("KFKLEASE_TLS_CA_FILE", ""), "PEM file with the CA that signed the brokers' certificates (KFKLEASE_TLS_CA_FILE)")
-		tlsCert     = flag.String("tls-cert-file", env("KFKLEASE_TLS_CERT_FILE", ""), "PEM client certificate for mTLS (KFKLEASE_TLS_CERT_FILE)")
-		tlsKey      = flag.String("tls-key-file", env("KFKLEASE_TLS_KEY_FILE", ""), "PEM client key for mTLS (KFKLEASE_TLS_KEY_FILE)")
+		tlsCA       = flag.String("tls-ca-file", env("KFKLEASE_TLS_CA_FILE", ""), "PEM file with the CA that signed the brokers' certificates, re-read on every connection (KFKLEASE_TLS_CA_FILE; or the PEM itself in KFKLEASE_TLS_CA)")
+		tlsCert     = flag.String("tls-cert-file", env("KFKLEASE_TLS_CERT_FILE", ""), "PEM client certificate for mTLS, re-read on every connection (KFKLEASE_TLS_CERT_FILE; or the PEM itself in KFKLEASE_TLS_CERT)")
+		tlsKey      = flag.String("tls-key-file", env("KFKLEASE_TLS_KEY_FILE", ""), "PEM client key for mTLS, re-read on every connection (KFKLEASE_TLS_KEY_FILE; or the PEM itself in KFKLEASE_TLS_KEY)")
 		tlsServer   = flag.String("tls-server-name", env("KFKLEASE_TLS_SERVER_NAME", ""), "name to verify the brokers' certificates against (KFKLEASE_TLS_SERVER_NAME)")
 		tlsInsecure = flag.Bool("tls-insecure-skip-verify", env("KFKLEASE_TLS_INSECURE_SKIP_VERIFY", "false") == "true", "skip certificate verification; test stands only (KFKLEASE_TLS_INSECURE_SKIP_VERIFY)")
 		saslMech    = flag.String("sasl-mechanism", env("KFKLEASE_SASL_MECHANISM", ""), "plain, scram-sha-256, scram-sha-512 or oauthbearer (KFKLEASE_SASL_MECHANISM)")
 		saslUser    = flag.String("sasl-username", env("KFKLEASE_SASL_USERNAME", ""), "SASL username (KFKLEASE_SASL_USERNAME)")
+		saslUserF   = flag.String("sasl-username-file", env("KFKLEASE_SASL_USERNAME_FILE", ""), "file with the SASL username, for secrets that hold both (KFKLEASE_SASL_USERNAME_FILE)")
 		saslPass    = flag.String("sasl-password", env("KFKLEASE_SASL_PASSWORD", ""), "SASL password; prefer the file (KFKLEASE_SASL_PASSWORD)")
 		saslPassF   = flag.String("sasl-password-file", env("KFKLEASE_SASL_PASSWORD_FILE", ""), "file with the SASL password, re-read on every authentication (KFKLEASE_SASL_PASSWORD_FILE)")
 		saslToken   = flag.String("sasl-token", env("KFKLEASE_SASL_TOKEN", ""), "OAUTHBEARER token; prefer the file (KFKLEASE_SASL_TOKEN)")
@@ -101,11 +102,14 @@ func run() error {
 		Margin:      *margin,
 		Auth: lease.Auth{
 			TLS: lease.TLS{
-				Enabled: *tlsEnabled, CAFile: *tlsCA, CertFile: *tlsCert, KeyFile: *tlsKey,
+				Enabled: *tlsEnabled,
+				CA:      os.Getenv("KFKLEASE_TLS_CA"), CAFile: *tlsCA,
+				Cert: os.Getenv("KFKLEASE_TLS_CERT"), CertFile: *tlsCert,
+				Key: os.Getenv("KFKLEASE_TLS_KEY"), KeyFile: *tlsKey,
 				ServerName: *tlsServer, InsecureSkipVerify: *tlsInsecure,
 			},
 			SASL: lease.SASL{
-				Mechanism: *saslMech, Username: *saslUser,
+				Mechanism: *saslMech, Username: *saslUser, UsernameFile: *saslUserF,
 				Password: *saslPass, PasswordFile: *saslPassF,
 				Token: *saslToken, TokenFile: *saslTokenF,
 			},
