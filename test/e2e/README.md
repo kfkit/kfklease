@@ -16,15 +16,38 @@ does not matter here.
 
 ## Usage
 
-Requires Docker with cgroup v2, `docker compose` and `kubectl`. About 2 GB of
-memory for the whole stand.
+Requires Docker with cgroup v2, `docker compose`, `kubectl` and `envsubst`.
+About 2 GB of memory for the whole stand.
 
 ```bash
 ./smoke.sh                     # up + readiness checks
-kubectl --kubeconfig .out/k3s-a/kubeconfig.yaml get pods -A
-kubectl --kubeconfig .out/k3s-b/kubeconfig.yaml get pods -A
+./build-image.sh               # scaler image, imported into both clusters
+./deploy.sh k3s-a; ./deploy.sh k3s-b
+./scenarios.sh                 # failover scenarios, see below
 docker compose down -v         # tear down, drop cluster state
 ```
+
+`manifests/kfklease.yaml` deploys into each cluster a `kfklease-scaler`
+(one lease participant, holder id `<cluster>/<pod>`), a `singleton`
+deployment and a ScaledObject that keeps `singleton` at one replica while
+the cluster holds the lease and at zero otherwise.
+
+## Scenarios
+
+`scenarios.sh` runs them all or by name. Each fails if the workload ever
+runs in both clusters at once. Results with TTL 10 s, `pollingInterval: 5`,
+`cooldownPeriod: 0`:
+
+| Scenario    | What happens                                   | Result                                   |
+|-------------|------------------------------------------------|------------------------------------------|
+| `coldstart` | both clusters start                            | one holder within 1 s, standby idle      |
+| `crash`     | `docker compose kill` the holder's cluster     | takeover after 9–12 s; revived cluster stays idle |
+| `partition` | holder's cluster cut off from Kafka            | holder's pod down at ~10–12 s, standby's up ~1 s later, no overlap |
+| `pause`     | holder's cluster frozen for 2 × TTL            | takeover ~10 s into the freeze; on wake-up the frozen pod goes within 1 s |
+
+Takeover timing is TTL plus KEDA's reaction and pod start; the standby
+never claims before the term in the log runs out, and the old holder stops
+believing a margin earlier than that.
 
 ## Failure injection
 

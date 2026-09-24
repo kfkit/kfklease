@@ -30,3 +30,23 @@ func TestConfigDefaults(t *testing.T) {
 		}
 	}
 }
+
+func TestStatusHoldingExpiresWithoutTheLoop(t *testing.T) {
+	c, err := NewCandidate(Config{Brokers: []string{"b:9092"}, Topic: "t", TTL: 10 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.setStatus(Status{Certain: true}, time.Now().Add(50*time.Millisecond), 3)
+	if s := c.Status(); !s.Holding || s.Epoch != 3 {
+		t.Fatalf("before the deadline: %+v", s)
+	}
+	select {
+	case <-c.Changed():
+	default:
+		t.Fatal("no change signal")
+	}
+	time.Sleep(60 * time.Millisecond)
+	if s := c.Status(); s.Holding || s.Epoch != 0 || !s.Certain {
+		t.Fatalf("after the deadline, with no loop running: %+v", s)
+	}
+}

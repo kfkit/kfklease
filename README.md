@@ -54,6 +54,29 @@ for range c.Changed() {
 }
 ```
 
+### KEDA
+
+`kfklease-scaler` runs one participant per cluster and serves it to KEDA as an
+[external scaler](https://keda.sh/docs/latest/scalers/external-push/). A
+ScaledObject with `maxReplicaCount: 1` then runs the workload where the lease
+is held and nowhere else:
+
+```yaml
+triggers:
+  - type: external-push
+    metadata:
+      scalerAddress: kfklease-scaler.kfklease.svc:9090
+```
+
+Configuration is by flags or environment: `KFKLEASE_BROKERS`, `KFKLEASE_TOPIC`,
+`KFKLEASE_TTL`, `KFKLEASE_HOLDER` (unique per process; in Kubernetes use the
+pod name). A full example, with the two-cluster stand it runs on, is in
+[test/e2e](test/e2e).
+
+KEDA gives failover, not mutual exclusion: the old pod is still terminating
+while the new one starts, and a `cooldownPeriod` above zero stretches that.
+Workloads that must not overlap check the epoch downstream.
+
 `Status().Holding` is a belief with a deadline, not a fact: a holder that
 cannot reach Kafka stops believing after one TTL minus a margin, and the next
 holder is elected only after the term runs out in the log, so the two never
@@ -64,6 +87,8 @@ overlap as long as the margin covers clock skew.
 ```bash
 make test          # unit tests, no broker needed
 make integration   # starts the Kafka container from test/e2e and runs the client tests
+make image         # builds the scaler image
+make generate      # regenerates the KEDA gRPC stubs from proto/ (buf via go run)
 ```
 
 The end-to-end stand with two Kubernetes clusters is described in
@@ -73,9 +98,11 @@ The end-to-end stand with two Kubernetes clusters is described in
 
 - [x] Lease protocol on a compacted topic: acquire, renew, release, fencing
 - [x] Go library
-- [ ] KEDA external scaler / metrics endpoint
-- [ ] Helm chart and container image
-- [ ] Failure-mode tests (partitions, clock skew, broker loss)
+- [x] KEDA external scaler
+- [x] Container image
+- [ ] Helm chart
+- [x] Failure-mode tests: crash, partition, freeze
+- [ ] Failure-mode tests: clock skew, broker loss
 
 ## License
 

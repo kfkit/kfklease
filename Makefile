@@ -1,7 +1,7 @@
 GO ?= go
 BROKERS ?= localhost:19092
 
-.PHONY: test integration lint
+.PHONY: test integration lint image generate
 
 test:
 	$(GO) vet ./...
@@ -15,3 +15,9 @@ integration:
 lint:
 	test -z "$$(gofmt -l .)"
 	$(GO) vet ./...
+
+image:
+	docker build -t kfklease-scaler:dev .
+
+generate:
+	$(GO) generate ./...

@@ -92,6 +92,16 @@ func (c Config) withDefaults() (Config, error) {
 	return c, nil
 }
 
+// consumeFromStart is the partition to follow, from its first retained
+// record.
+func (c Config) consumeFromStart() map[string]map[int32]kgo.Offset {
+	return map[string]map[int32]kgo.Offset{c.Topic: {c.Partition: kgo.NewOffset().AtStart()}}
+}
+
+// pollEvery is how long the loop waits for records before looking at its
+// timers again.
+func (c Config) pollEvery() time.Duration { return c.RenewEvery / 4 }
+
 // Status is what a participant currently knows and believes.
 type Status struct {
 	// Holding is this participant's belief that it holds the lease. It is the
@@ -120,8 +130,13 @@ type Candidate struct {
 	log *slog.Logger
 
 	mu      sync.Mutex
-	status  Status
+	status  Status // without Holding and Epoch, which depend on the clock
 	changed chan struct{}
+	// The belief: holder of epoch until deadline (monotonic). Status checks
+	// the deadline itself, so that a Candidate whose loop is stalled (a
+	// frozen process waking up) never reports a belief it has outlived.
+	deadline time.Time
+	epoch    int64
 
 	// testCrash makes Run return at once, without a release, when closed.
 	testCrash <-chan struct{}
@@ -144,21 +159,27 @@ func NewCandidate(cfg Config) (*Candidate, error) {
 // Holder returns this participant's identity in the log.
 func (c *Candidate) Holder() string { return c.cfg.Holder }
 
-// Status returns the current status.
+// Status returns the current status. Holding is evaluated against the clock
+// at the time of the call.
 func (c *Candidate) Status() Status {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.status
+	s := c.status
+	if !c.deadline.IsZero() && time.Now().Before(c.deadline) {
+		s.Holding = true
+		s.Epoch = c.epoch
+	}
+	return s
 }
 
 // Changed is signalled whenever Status changes. Signals coalesce: a receiver
 // that lags sees one signal for several changes, never none.
 func (c *Candidate) Changed() <-chan struct{} { return c.changed }
 
-func (c *Candidate) publish(s Status) {
+func (c *Candidate) setStatus(s Status, deadline time.Time, epoch int64) {
 	c.mu.Lock()
-	same := c.status == s
-	c.status = s
+	same := c.status == s && c.deadline.Equal(deadline) && c.epoch == epoch
+	c.status, c.deadline, c.epoch = s, deadline, epoch
 	c.mu.Unlock()
 	if same {
 		return
@@ -182,10 +203,8 @@ func (c *Candidate) Run(ctx context.Context) error {
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(cfg.Brokers...),
 		kgo.ClientID("kfklease"),
-		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
-			cfg.Topic: {cfg.Partition: kgo.NewOffset().AtStart()},
-		}),
-		kgo.FetchMaxWait(cfg.RenewEvery / 4),
+		kgo.ConsumePartitions(cfg.consumeFromStart()),
+		kgo.FetchMaxWait(cfg.pollEvery()),
 		kgo.KeepRetryableFetchErrors(),
 		kgo.RecordPartitioner(kgo.ManualPartitioner()),
 		kgo.RequiredAcks(kgo.AllISRAcks()),
@@ -298,10 +317,7 @@ func (r *run) bootstrap(ctx context.Context) error {
 // while before giving up.
 func (r *run) partitionBounds(ctx context.Context) (start, end kadm.ListedOffset, err error) {
 	adm := kadm.NewClient(r.cl)
-	deadline := time.Now().Add(r.cfg.TTL)
-	if deadline.Before(time.Now().Add(10 * time.Second)) {
-		deadline = time.Now().Add(10 * time.Second)
-	}
+	deadline := time.Now().Add(max(r.cfg.TTL, 10*time.Second))
 	for {
 		start, end, err = listBounds(ctx, adm, r.cfg.Topic, r.cfg.Partition)
 		if err == nil || time.Now().After(deadline) {
@@ -309,9 +325,7 @@ func (r *run) partitionBounds(ctx context.Context) (start, end kadm.ListedOffset
 		}
 		r.log.Debug("partition not ready", "err", err)
 		r.cl.PurgeTopicsFromClient(r.cfg.Topic)
-		r.cl.AddConsumePartitions(map[string]map[int32]kgo.Offset{
-			r.cfg.Topic: {r.cfg.Partition: kgo.NewOffset().AtStart()},
-		})
+		r.cl.AddConsumePartitions(r.cfg.consumeFromStart())
 		select {
 		case <-ctx.Done():
 			return start, end, ctx.Err()
@@ -334,18 +348,15 @@ func listBounds(ctx context.Context, adm *kadm.Client, topic string, partition i
 		return start, end, fmt.Errorf("lease: topic %q partition %d not found", topic, partition)
 	}
 	end, _ = ends.Lookup(topic, partition)
-	if start.Err != nil {
-		return start, end, fmt.Errorf("lease: topic %q partition %d: %w", topic, partition, start.Err)
-	}
-	if end.Err != nil {
-		return start, end, fmt.Errorf("lease: topic %q partition %d: %w", topic, partition, end.Err)
+	if err := errors.Join(start.Err, end.Err); err != nil {
+		return start, end, fmt.Errorf("lease: topic %q partition %d: %w", topic, partition, err)
 	}
 	return start, end, nil
 }
 
 func (r *run) loop(ctx context.Context) error {
 	for {
-		pollCtx, cancel := context.WithTimeout(ctx, r.cfg.RenewEvery/4)
+		pollCtx, cancel := context.WithTimeout(ctx, r.cfg.pollEvery())
 		fetches := r.cl.PollFetches(pollCtx)
 		cancel()
 		if fetches.IsClientClosed() {
@@ -512,22 +523,16 @@ func (r *run) settle(out Outcome) {
 		r.log.Warn("own record unjudged", "kind", in.kind, "offset", in.offset)
 	case in.kind == Claim && out == Accepted:
 		r.epoch = in.offset
-		r.deadline = in.sentAt.Add(r.cfg.TTL - r.cfg.Margin)
+		r.extendBelief(in.sentAt)
 		r.log.Info("acquired", "epoch", r.epoch)
 	case in.kind == Claim:
 		s := r.view.State()
-		wait := s.Expires.Sub(r.brokerNow(now))
-		if wait < r.cfg.RenewEvery/4 {
-			wait = r.cfg.RenewEvery / 4
-		}
-		if wait > r.cfg.TTL {
-			wait = r.cfg.TTL
-		}
+		wait := min(max(s.Expires.Sub(r.brokerNow(now)), r.cfg.pollEvery()), r.cfg.TTL)
 		r.nextClaimAt = now.Add(wait)
 		r.log.Debug("claim rejected", "log_holder", s.Holder, "log_epoch", s.Epoch, "retry_in", wait)
 	case in.kind == Renew && out == Accepted:
 		if r.believing(now) {
-			r.deadline = in.sentAt.Add(r.cfg.TTL - r.cfg.Margin)
+			r.extendBelief(in.sentAt)
 		}
 	case in.kind == Renew:
 		r.log.Warn("renew rejected", "epoch", r.epoch)
@@ -537,6 +542,13 @@ func (r *run) settle(out Outcome) {
 }
 
 func (r *run) believing(now time.Time) bool { return now.Before(r.deadline) }
+
+// extendBelief sets the deadline from the send time of an accepted record:
+// the record landed after it was sent, so the term in the log outlives the
+// belief by at least the margin.
+func (r *run) extendBelief(sentAt time.Time) {
+	r.deadline = sentAt.Add(r.cfg.TTL - r.cfg.Margin)
+}
 
 func (r *run) dropBelief() {
 	if r.deadline.IsZero() {
@@ -588,11 +600,7 @@ func (r *run) step(ctx context.Context) {
 }
 
 func (r *run) send(ctx context.Context, kind Kind) {
-	rec := Record{Kind: kind, Holder: r.cfg.Holder, TTL: r.cfg.TTL}
-	if kind != Claim {
-		rec.Epoch = r.epoch
-	}
-	value, err := EncodeValue(rec)
+	kr, err := r.record(kind, r.epoch)
 	if err != nil {
 		r.log.Error("encode record", "err", err)
 		return
@@ -600,13 +608,26 @@ func (r *run) send(ctx context.Context, kind Kind) {
 	now := time.Now()
 	r.inflight = &inflight{kind: kind, sentAt: now, offset: -1}
 	r.lastSend = now
-	r.cl.Produce(ctx, r.kafkaRecord(value), func(kr *kgo.Record, err error) {
+	r.cl.Produce(ctx, kr, func(kr *kgo.Record, err error) {
 		r.results <- produceResult{offset: kr.Offset, err: err}
 	})
 }
 
-func (r *run) kafkaRecord(value []byte) *kgo.Record {
-	return &kgo.Record{Topic: r.cfg.Topic, Partition: r.cfg.Partition, Key: []byte("lease"), Value: value}
+// recordKey is the same for every record: one lease per partition, and
+// compaction keeps the latest record.
+const recordKey = "lease"
+
+// record builds the Kafka record for a lease record by this participant.
+func (r *run) record(kind Kind, epoch int64) (*kgo.Record, error) {
+	rec := Record{Kind: kind, Holder: r.cfg.Holder, TTL: r.cfg.TTL}
+	if kind != Claim {
+		rec.Epoch = epoch
+	}
+	value, err := EncodeValue(rec)
+	if err != nil {
+		return nil, err
+	}
+	return &kgo.Record{Topic: r.cfg.Topic, Partition: r.cfg.Partition, Key: []byte(recordKey), Value: value}, nil
 }
 
 // shutdown gives the lease up if the participant believes it holds it. The
@@ -622,13 +643,14 @@ func (r *run) shutdown() {
 	r.dropBelief()
 	r.publish(now)
 
-	value, err := EncodeValue(Record{Kind: Release, Holder: r.cfg.Holder, Epoch: epoch})
+	kr, err := r.record(Release, epoch)
 	if err != nil {
+		r.log.Error("encode record", "err", err)
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), r.cfg.TTL)
 	defer cancel()
-	if err := r.cl.ProduceSync(ctx, r.kafkaRecord(value)).FirstErr(); err != nil {
+	if err := r.cl.ProduceSync(ctx, kr).FirstErr(); err != nil {
 		r.log.Warn("release not written", "epoch", epoch, "err", err)
 		return
 	}
@@ -640,9 +662,9 @@ func (r *run) publish(now time.Time) {
 	if s.Certain {
 		s.Lease = r.view.State()
 	}
-	if r.believing(now) {
-		s.Holding = true
-		s.Epoch = r.epoch
+	deadline := r.deadline
+	if !r.believing(now) {
+		deadline = time.Time{}
 	}
-	r.c.publish(s)
+	r.c.setStatus(s, deadline, r.epoch)
 }
