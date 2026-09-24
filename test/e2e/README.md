@@ -85,8 +85,4 @@ when an interface disappears.
   host.
 - Locally built images: `docker save <image> -o images/<name>.tar` before the
   stand starts. k3s imports every tarball from that directory on boot.
-- CI runners start empty, so `cache-images.sh` keeps every image the stand
-  needs as a tarball: the compose images in `.cache/`, KEDA and the test
-  workload in `images/` for k3s to import. Both directories live in the
-  Actions cache. Locally Docker's own cache does the job; do not bother.
 - KEDA is installed by the k3s helm-controller from `manifests/keda.yaml`.
