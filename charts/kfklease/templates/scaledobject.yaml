@@ -1,0 +1,21 @@
+{{- if .Values.scaledObject.enabled }}
+{{- if not .Values.scaledObject.target }}{{ fail "scaledObject.target is required when scaledObject.enabled" }}{{ end }}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ .Values.scaledObject.target }}
+  labels:
+    {{- include "kfklease.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: {{ .Values.scaledObject.target }}
+  minReplicaCount: 0
+  maxReplicaCount: 1
+  pollingInterval: {{ .Values.scaledObject.pollingInterval }}
+  cooldownPeriod: {{ .Values.scaledObject.cooldownPeriod }}
+  triggers:
+    - type: external-push
+      metadata:
+        scalerAddress: {{ printf "%s.%s.svc:%d" (include "kfklease.name" .) .Release.Namespace (int .Values.service.port) | quote }}
+        topic: {{ .Values.topic | quote }}
+{{- end }}

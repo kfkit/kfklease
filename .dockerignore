@@ -1,0 +1,5 @@
+.git
+test/e2e/.out
+test/e2e/images
+docs
+*.md

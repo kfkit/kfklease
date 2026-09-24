@@ -111,19 +111,36 @@ merely honest about who they are.
 
 ## What is tested
 
-`lease/sim_test.go` runs participants that follow the writer rules against a
-shared log with lagging consumers, produce requests that land up to two TTLs
-late, and processes frozen for up to three TTLs. Clocks are perfect and the
-margin is zero, so any overlap is a protocol bug. It checks that
+The writer rules live in one place, `lease/agent.go`, which does no I/O and
+reads no clock: the Kafka client feeds it records, fetch results and
+acknowledgements, and the tests feed it the same things from a fake log.
 
-- no two participants ever believe they hold the lease at the same instant;
+`lease/sim_test.go` runs real agents against a shared log with lagging
+consumers, produce requests that land up to two TTLs late, delivery timeouts
+after which the record lands anyway, acknowledgements that arrive after the
+record was read back, processes frozen for up to three TTLs, and
+participants that join late and see only a tail of the log with holes in it.
+Clocks are perfect and the margin is zero, so any overlap is a protocol bug.
+It checks that
+
+- no two agents ever believe they hold the lease at the same instant;
 - a reader started at any offset, once certain, has exactly the state of a
-  reader that saw the whole log.
+  reader that saw the whole log;
+- candidates do not spam the log with claims they can see are hopeless.
 
-Breaking any single rule (trusting a lone renew, letting a late renew revive a
-term, halving the silence period, basing the deadline on read-back time,
-granting claims on a held lease, skipping the replay after an anchor) makes
-the simulation fail.
+`lease/agent_test.go` pins down the rules one at a time: the deadline counts
+from the send time whatever the landing and read-back times; the belief needs
+both the acknowledgement and the read-back, in either order; a record the
+client gave up on is never taken for the one in flight; a term that ended in
+the log ends the belief; nothing is written on an uncertain view; silence is
+measured only while fetches succeed; a hole makes the view uncertain; a
+release drops the belief before the record is written.
+
+Breaking a rule in `view.go` or `agent.go` (trusting a lone renew, reviving a
+term with a late renew, halving the silence period, taking the deadline from
+the acknowledgement time, believing on the acknowledgement alone, matching own
+records by kind instead of offset, ignoring holes, claiming without looking)
+fails at least one of these tests; that was checked by mutation, by hand.
 
 ## The client
 
@@ -148,12 +165,15 @@ among two candidates, handover after a release (tens of milliseconds) and
 after a crash (about one TTL, never before the crashed holder's deadline),
 a late reader agreeing with the holder, epochs growing across terms.
 
+`test/e2e` runs the whole thing, scaler and KEDA included, on two k3s
+clusters: cold start, crash, partition, freeze and broker restart, with a
+check that the workload never runs in both clusters at once.
+
 ## Not covered yet
 
 - Clock drift between a client's monotonic clock and the broker's, and clock
   skew between brokers: both go into the margin, which is not modelled.
-- A process frozen for longer than a TTL: the deadline rule handles it, but
-  it is not exercised against a broker. On Linux the monotonic clock does not
-  advance during system suspend, so a suspended holder can wake up still
-  believing; container pauses are fine.
+- System suspend: on Linux the monotonic clock does not advance during
+  suspend, so a suspended holder can wake up still believing. Container
+  pauses are covered by the freeze scenario on the stand.
 - Several leases sharing a partition.

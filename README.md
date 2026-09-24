@@ -54,6 +54,46 @@ for range c.Changed() {
 }
 ```
 
+### KEDA
+
+`kfklease-scaler` runs one participant per cluster and serves it to KEDA as an
+[external scaler](https://keda.sh/docs/latest/scalers/external-push/). A
+ScaledObject with `maxReplicaCount: 1` then runs the workload where the lease
+is held and nowhere else:
+
+```yaml
+triggers:
+  - type: external-push
+    metadata:
+      scalerAddress: kfklease-scaler.kfklease.svc:9090
+```
+
+The chart in [charts/kfklease](charts/kfklease) installs the scaler, its
+service and that ScaledObject; one release per cluster:
+
+```bash
+helm install kfklease charts/kfklease -n kfklease --create-namespace \
+  --set brokers=kafka:9092 --set topic=my-lease --set holderPrefix=eu-west \
+  --set scaledObject.target=my-singleton
+```
+
+Releases publish `ghcr.io/kfkit/kfklease-scaler` (linux/amd64 and
+linux/arm64, signed with cosign) and the chart as
+`oci://ghcr.io/kfkit/charts/kfklease`; both are tagged with the release
+version. Until the first release, build the image with `make image` and set
+`image.repository` and `image.tag`.
+
+The binary is configured by flags or environment: `KFKLEASE_BROKERS`,
+`KFKLEASE_TOPIC`, `KFKLEASE_TTL`, `KFKLEASE_HOLDER` (unique per process; the
+chart uses the pod name). The two-cluster stand the chart is tested on is in
+[test/e2e](test/e2e).
+
+KEDA gives failover, not mutual exclusion: the old pod is still terminating
+while the new one starts, a `cooldownPeriod` above zero stretches that, and a
+cluster coming back from a crash restarts its stale pod until its own KEDA
+is up again and scales it down. Workloads that must not overlap check the
+epoch downstream.
+
 `Status().Holding` is a belief with a deadline, not a fact: a holder that
 cannot reach Kafka stops believing after one TTL minus a margin, and the next
 holder is elected only after the term runs out in the log, so the two never
@@ -64,6 +104,8 @@ overlap as long as the margin covers clock skew.
 ```bash
 make test          # unit tests, no broker needed
 make integration   # starts the Kafka container from test/e2e and runs the client tests
+make image         # builds the scaler image
+make generate      # regenerates the KEDA gRPC stubs from proto/ (buf via go run)
 ```
 
 The end-to-end stand with two Kubernetes clusters is described in
@@ -73,9 +115,12 @@ The end-to-end stand with two Kubernetes clusters is described in
 
 - [x] Lease protocol on a compacted topic: acquire, renew, release, fencing
 - [x] Go library
-- [ ] KEDA external scaler / metrics endpoint
-- [ ] Helm chart and container image
-- [ ] Failure-mode tests (partitions, clock skew, broker loss)
+- [x] KEDA external scaler
+- [x] Container image
+- [x] Helm chart
+- [x] Failure-mode tests: crash, partition, freeze, broker restart
+- [ ] Failure-mode tests: clock skew
+- [x] Release workflow: image and chart to GHCR, cosign signature
 
 ## License
 

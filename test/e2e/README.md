@@ -16,15 +16,41 @@ does not matter here.
 
 ## Usage
 
-Requires Docker with cgroup v2, `docker compose` and `kubectl`. About 2 GB of
-memory for the whole stand.
+Requires Docker with cgroup v2, `docker compose`, `kubectl` and `envsubst`.
+About 2 GB of memory for the whole stand.
 
 ```bash
 ./smoke.sh                     # up + readiness checks
-kubectl --kubeconfig .out/k3s-a/kubeconfig.yaml get pods -A
-kubectl --kubeconfig .out/k3s-b/kubeconfig.yaml get pods -A
+./build-image.sh               # scaler image, imported into both clusters
+./deploy.sh k3s-a; ./deploy.sh k3s-b   # the chart plus the test workload
+./scenarios.sh                 # failover scenarios, see below
 docker compose down -v         # tear down, drop cluster state
 ```
+
+`deploy.sh` renders `charts/kfklease` (helm, or the `alpine/helm` image when
+helm is not installed) with holder prefix `<cluster>` and the `singleton`
+deployment from `manifests/` as the scale target: one replica while the
+cluster holds the lease, zero otherwise.
+
+## Scenarios
+
+`scenarios.sh` runs them all or by name. Each fails if the workload ever
+runs in both clusters at once. Results with TTL 10 s, `pollingInterval: 5`,
+`cooldownPeriod: 0`:
+
+| Scenario    | What happens                                   | Result                                   |
+|-------------|------------------------------------------------|------------------------------------------|
+| `coldstart` | both clusters start                            | one holder within 1 s, standby idle      |
+| `crash`     | `docker compose kill` the holder's cluster     | takeover after 9–12 s; the revived cluster restarts its stale pod for ~30 s until its KEDA is back, then stays idle |
+| `partition` | holder's cluster cut off from Kafka            | holder's pod down at ~10–12 s, standby's up ~1 s later, no overlap |
+| `pause`     | holder's cluster frozen for 2 × TTL            | takeover ~10 s into the freeze; on wake-up the frozen pod goes within 1 s |
+| `broker`    | `docker compose restart kafka`                 | holder's pod down within a TTL; a holder again ~10 s after the broker is back |
+
+Takeover timing is TTL plus KEDA's reaction and pod start; the standby
+never claims before the term in the log runs out, and the old holder stops
+believing a margin earlier than that. Pods are polled once a second, so an
+overlap shorter than that can slip past the check; the lease itself is
+checked to the millisecond by the simulation and the integration tests.
 
 ## Failure injection
 

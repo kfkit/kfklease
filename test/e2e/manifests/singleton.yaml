@@ -1,0 +1,21 @@
+# The test workload. KEDA owns its replica count through the chart's
+# ScaledObject: 1 while this cluster holds the lease, 0 otherwise.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: singleton
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: singleton
+  template:
+    metadata:
+      labels:
+        app: singleton
+    spec:
+      terminationGracePeriodSeconds: 2
+      containers:
+        - name: singleton
+          image: busybox:1.37
+          command: ["sh", "-c", "echo running on ${CLUSTER}; exec sleep infinity"]

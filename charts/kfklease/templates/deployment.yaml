@@ -1,0 +1,78 @@
+{{- if not .Values.brokers }}{{ fail "brokers is required" }}{{ end }}
+{{- if not .Values.topic }}{{ fail "topic is required" }}{{ end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kfklease.name" . }}
+  labels:
+    {{- include "kfklease.labels" . | nindent 4 }}
+spec:
+  # One participant per cluster. Recreate, not RollingUpdate: two pods of
+  # the same release would be two candidates for the same lease.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "kfklease.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kfklease.selectorLabels" . | nindent 8 }}
+    spec:
+      # Long enough to write the release on shutdown.
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: scaler
+          image: {{ include "kfklease.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: KFKLEASE_BROKERS
+              value: {{ .Values.brokers | quote }}
+            - name: KFKLEASE_TOPIC
+              value: {{ .Values.topic | quote }}
+            - name: KFKLEASE_TTL
+              value: {{ .Values.ttl | quote }}
+            {{- with .Values.margin }}
+            - name: KFKLEASE_MARGIN
+              value: {{ . | quote }}
+            {{- end }}
+            - name: KFKLEASE_CREATE_TOPIC
+              value: {{ .Values.createTopic | quote }}
+            - name: KFKLEASE_LISTEN
+              value: {{ printf ":%d" (int .Values.service.port) | quote }}
+            - name: KFKLEASE_LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Unique per process incarnation: a new pod gets a new name.
+            - name: KFKLEASE_HOLDER
+              value: {{ printf "%s/$(POD_NAME)" (.Values.holderPrefix | default .Release.Name) | quote }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.service.port }}
+          readinessProbe:
+            grpc:
+              port: {{ .Values.service.port }}
+          livenessProbe:
+            grpc:
+              port: {{ .Values.service.port }}
+            periodSeconds: 10
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

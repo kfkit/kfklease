@@ -17,12 +17,12 @@ import (
 
 // The topic configuration the protocol depends on. See docs/protocol.md.
 const (
-	timestampTypeKey     = "message.timestamp.type"
-	timestampTypeValue   = "LogAppendTime"
-	cleanupPolicyKey     = "cleanup.policy"
-	cleanupPolicyValue   = "compact"
-	minCompactionLagKey  = "min.compaction.lag.ms"
-	minCompactionLagFlor = time.Hour
+	timestampTypeKey      = "message.timestamp.type"
+	timestampTypeValue    = "LogAppendTime"
+	cleanupPolicyKey      = "cleanup.policy"
+	cleanupPolicyValue    = "compact"
+	minCompactionLagKey   = "min.compaction.lag.ms"
+	minCompactionLagFloor = time.Hour
 )
 
 // EnsureTopic creates the lease topic if it does not exist: one partition,
@@ -35,10 +35,7 @@ func EnsureTopic(ctx context.Context, cl *kgo.Client, topic string, ttl time.Dur
 	}
 	adm := kadm.NewClient(cl)
 
-	lag := 100 * ttl
-	if lag < minCompactionLagFlor {
-		lag = minCompactionLagFlor
-	}
+	lag := max(100*ttl, minCompactionLagFloor)
 	configs := map[string]*string{
 		timestampTypeKey:    ptr(timestampTypeValue),
 		cleanupPolicyKey:    ptr(cleanupPolicyValue),

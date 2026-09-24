@@ -4,16 +4,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
-
-KAFKA_ADDR=172.30.0.10
-KAFKA_PORT=9092
-CLUSTERS=(k3s-a k3s-b)
-
-kc() {
-  local cluster=$1
-  shift
-  kubectl --kubeconfig ".out/${cluster}/kubeconfig.yaml" "$@"
-}
+# shellcheck source=lib.sh
+source ./lib.sh
 
 wait_for() {
   local what=$1 tries=$2
