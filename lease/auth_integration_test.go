@@ -123,8 +123,19 @@ func TestIntegrationMTLS(t *testing.T) {
 	}
 	ca, cert, key := filepath.Join(dir, "ca.crt"), filepath.Join(dir, "client.crt"), filepath.Join(dir, "client.key")
 	acquiresWith(t, bs, Auth{TLS: TLS{Enabled: true, CAFile: ca, CertFile: cert, KeyFile: key}})
+	// The same material inline, as it arrives through environment variables.
+	acquiresWith(t, bs, Auth{TLS: TLS{Enabled: true, CA: readFile(t, ca), Cert: readFile(t, cert), Key: readFile(t, key)}})
 	// Without the client certificate the broker rejects the handshake.
 	failsWith(t, bs, Auth{TLS: TLS{Enabled: true, CAFile: ca}})
 	// Without the CA the client rejects the broker.
 	failsWith(t, bs, Auth{TLS: TLS{Enabled: true, CertFile: cert, KeyFile: key}})
+}
+
+func readFile(t *testing.T, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }

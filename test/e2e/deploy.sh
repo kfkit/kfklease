@@ -32,13 +32,15 @@ case "$cluster" in
       --from-file=ca.crt=.out/certs/ca.crt --from-file=tls.crt=.out/certs/client.crt --from-file=tls.key=.out/certs/client.key \
       | kc "$cluster" apply -f - >/dev/null
     auth=(--set brokers="$KAFKA_ADDR:9095" --set auth.tls.enabled=true --set auth.tls.secretName=kafka-mtls
-          --set auth.tls.certKey=tls.crt --set auth.tls.keyKey=tls.key)
+          --set auth.tls.clientCert=true)
     ;;
   k3s-b)
+    # Username and password both in the Secret, as an External Secrets
+    # managed Secret usually has them.
     kc "$cluster" -n "$NS" create secret generic kfklease-sasl --dry-run=client -o yaml \
-      --from-literal=password=kfklease-secret | kc "$cluster" apply -f - >/dev/null
-    auth=(--set brokers="$KAFKA_ADDR:9094" --set auth.sasl.mechanism=plain --set auth.sasl.username=kfklease
-          --set auth.sasl.secretName=kfklease-sasl)
+      --from-literal=username=kfklease --from-literal=password=kfklease-secret | kc "$cluster" apply -f - >/dev/null
+    auth=(--set brokers="$KAFKA_ADDR:9094" --set auth.sasl.mechanism=plain --set auth.sasl.secretName=kfklease-sasl
+          --set auth.sasl.usernameKey=username)
     ;;
 esac
 

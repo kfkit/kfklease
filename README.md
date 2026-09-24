@@ -87,16 +87,25 @@ command are in the [release notes](https://github.com/kfkit/kfklease/releases).
 The chart's values are documented in
 [charts/kfklease/values.yaml](charts/kfklease/values.yaml).
 
-Brokers that need authentication are configured under `auth`: TLS with a
-private CA or mTLS from a Secret holding the certificates, SASL PLAIN,
-SCRAM-SHA-256/512 or OAUTHBEARER with the password or token in a Secret.
-The scaler reads secrets from the mounted files on every authentication, so
-a rotated Secret takes effect on the next reconnect:
+### Authentication
+
+Brokers that need authentication are configured under `auth`. The chart
+holds no secret itself; it points at Kubernetes Secrets, whoever creates
+them (cert-manager, Strimzi, External Secrets, `kubectl`):
+
+- **TLS / mTLS**: certificates are mounted from the Secret as files and
+  re-read on every connection, so a renewed certificate is picked up on the
+  next reconnect without a restart. The defaults fit the `kubernetes.io/tls`
+  layout (`ca.crt`, `tls.crt`, `tls.key`); a Strimzi `KafkaUser` uses
+  `user.crt` and `user.key`.
+- **SASL** (PLAIN, SCRAM-SHA-256/512, OAUTHBEARER): the password or token,
+  and optionally the username, come in as environment variables straight
+  from the Secret. A pod reads its environment once, so pair it with a
+  restart on change, for example stakater/reloader through `podAnnotations`.
 
 ```bash
-  --set auth.tls.enabled=true --set auth.tls.secretName=kafka-ca \
-  --set auth.sasl.mechanism=scram-sha-512 --set auth.sasl.username=kfklease \
-  --set auth.sasl.secretName=kfklease-sasl
+  --set auth.tls.enabled=true --set auth.tls.secretName=kafka-client-tls --set auth.tls.clientCert=true \
+  --set auth.sasl.mechanism=scram-sha-512 --set auth.sasl.secretName=kfklease-sasl --set auth.sasl.usernameKey=username
 ```
 
 The same settings are flags and `KFKLEASE_TLS_*` / `KFKLEASE_SASL_*`
