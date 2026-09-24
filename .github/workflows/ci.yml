@@ -12,8 +12,8 @@ jobs:
   unit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - run: make lint
@@ -26,8 +26,8 @@ jobs:
   integration:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - run: make integration
@@ -35,13 +35,13 @@ jobs:
   image:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - run: docker build -t kfklease-scaler:dev .
 
   chart:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - run: helm lint charts/kfklease --set brokers=k:9092 --set topic=t --set scaledObject.target=w
       - run: helm template t charts/kfklease --set brokers=k:9092 --set topic=t --set scaledObject.target=w > /dev/null
 
@@ -52,7 +52,7 @@ jobs:
     needs: [unit, integration, image, chart]
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - run: test/e2e/build-image.sh
       - run: test/e2e/smoke.sh
       - run: test/e2e/deploy.sh k3s-a && test/e2e/deploy.sh k3s-b
