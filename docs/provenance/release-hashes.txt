@@ -1,0 +1,14 @@
+kfklease release hashes, for timestamping.
+
+Repository: https://github.com/kfkit/kfklease
+Module:     github.com/kfkit/kfklease (proxy.golang.org, sum.golang.org)
+Copyright:  2026 Ivan Abramov, Apache-2.0
+
+Each line names a signed git tag, the tag object, the commit it points at
+(a hash of the whole source tree) and the SHA-256 of the source archive
+produced by `git archive --format=tar <tag>` with git 2.55.0.
+
+v0.1.0 tag=1d7a64409b88e8ad6dd7d48fa2607ec5ac248b7b commit=b39fa191eec0500822151a7b720efb83b8c43ecd archive_sha256=ee5be87b8f0257ab1ff513d215a12da8e9d0eaf7176ae117ed327f22d5fd45cb
+v0.3.0 tag=177c9958b7f764783ecc2f2f2890a7db7e8821f2 commit=5e2913954bbc2f7c803a7bec27bb2317dacdb60d archive_sha256=9cfa5dfdf2d3e9f19bcab22260fd28e631742c405922a001260431070dfd8e7c
+
+First release v0.1.0: https://github.com/kfkit/kfklease/releases/tag/v0.1.0 (2026-09-24).
