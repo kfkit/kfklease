@@ -1,0 +1,36 @@
+name: Task
+description: A unit of work with acceptance criteria. Label it `ready` when an agent may pick it up.
+labels: []
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: One paragraph. What exists when this is done, and why it matters.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Files, classes, docs, prior decisions, links. What the implementer needs to know first.
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Numbered AC1, AC2, … Each one checkable by a test or a command. The PR maps every AC to a test.
+      placeholder: |
+        - AC1: …
+        - AC2: …
+    validations:
+      required: true
+  - type: textarea
+    id: out
+    attributes:
+      label: Out of scope
+      description: What this task deliberately does not do.
+  - type: textarea
+    id: verify
+    attributes:
+      label: How to verify
+      description: Commands a reviewer runs, expected output.
