@@ -27,6 +27,9 @@ spec:
     metadata:
       labels:
         {{- include "kfklease.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- if or .Values.podAnnotations .Values.metrics.podAnnotations }}
       annotations:
         {{- if .Values.metrics.podAnnotations }}
@@ -41,10 +44,25 @@ spec:
     spec:
       # Long enough to write the release on shutdown.
       terminationGracePeriodSeconds: 15
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: scaler
           image: {{ include "kfklease.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           env:
             - name: KFKLEASE_BROKERS
               value: {{ .Values.brokers | quote }}

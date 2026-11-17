@@ -76,6 +76,9 @@ and this project adheres to
   log names, reported by every participant, so any cluster's scaler says
   where the lease is. `site` is the holder id up to its last slash (the
   chart's `holderPrefix`).
+- Chart: `imagePullSecrets`, `podLabels`, `priorityClassName`,
+  `podSecurityContext` and `securityContext` (the container's), all empty
+  by default.
 - An existing lease topic is checked at start: fewer replicas than asked
   for, `min.insync.replicas` below the expected value,
   `unclean.leader.election.enable=true` or a `cleanup.policy` without

@@ -69,6 +69,20 @@ auth:
     tokenKey: token         # oauthbearer
 
 podAnnotations: {}
+# Extra labels on the scaler pod, next to the chart's own.
+podLabels: {}
+
+# The image is pulled with these, e.g. [{name: regcred}].
+imagePullSecrets: []
+priorityClassName: ""
+# The pod's and the container's securityContext. The image runs as
+# nonroot (65532) and needs no writable filesystem, so the restricted Pod
+# Security Standard fits, e.g.:
+#   podSecurityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+#   securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true,
+#                     capabilities: {drop: [ALL]}}
+podSecurityContext: {}
+securityContext: {}
 
 # A ScaledObject that keeps a workload at `replicas` while this cluster
 # holds the lease and at zero otherwise. Disable it to write your own.

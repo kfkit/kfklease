@@ -93,6 +93,24 @@ jobs:
           out=$(dep --set replicationFactor=1 --set minInsyncReplicas=1 --set flushEveryRecord=true)
           echo "$out"
           val KFKLEASE_REPLICATION_FACTOR 1; val KFKLEASE_MIN_INSYNC_REPLICAS 1; val KFKLEASE_FLUSH_EVERY_RECORD true
+      - name: Pod settings render where Kubernetes reads them
+        run: |
+          dep() { helm template t charts/kfklease --set brokers=k:9092 --set topic=t \
+                    --set scaledObject.targetRef.name=w "$@" -s templates/deployment.yaml; }
+          for bad in imagePullSecrets priorityClassName securityContext; do
+            if dep | grep -q "$bad"; then echo "$bad rendered by default"; exit 1; fi
+          done
+          out=$(dep --set 'imagePullSecrets[0].name=regcred' --set priorityClassName=critical \
+                    --set podLabels.team=data --set podSecurityContext.runAsNonRoot=true \
+                    --set securityContext.readOnlyRootFilesystem=true)
+          echo "$out"
+          sel=$(sed -n '/^  selector:/,/^  template:/p' <<<"$out")
+          grep -q 'team: data' <<<"$sel" && { echo "podLabels leaked into the selector"; exit 1; }
+          for want in '      imagePullSecrets:' '        - name: regcred' '      priorityClassName: critical' \
+                      '        team: data' '      securityContext:' '        runAsNonRoot: true' \
+                      '          securityContext:' '            readOnlyRootFilesystem: true'; do
+            grep -qxF "$want" <<<"$out" || { echo "missing: $want"; exit 1; }
+          done
       - name: Several leases in one release, one ScaledObject each
         run: |
           t() { helm template t charts/kfklease --set brokers=k:9092 --set topic=a \

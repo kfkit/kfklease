@@ -66,6 +66,8 @@ helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.3.0 \
 | `scaledObject.replicas` | replicas while this cluster holds the lease, 1 by default; zero otherwise |
 | `scaledObject.fallback.enabled` | `true` by default: when KEDA cannot reach the scaler, scale the workload to zero instead of leaving it running; see [When the scaler is gone](#when-the-scaler-is-gone) |
 | `scaledObject.enabled` | `false` to write your own ScaledObject; see below |
+| `imagePullSecrets`, `podLabels`, `priorityClassName` | for the scaler pod, empty by default |
+| `podSecurityContext`, `securityContext` | the pod's and the container's, empty by default. The image runs as nonroot and writes nothing, so the restricted Pod Security Standard fits; `values.yaml` has an example |
 
 Upgrading from 0.3.0: `scaledObject.target` is renamed to
 `scaledObject.targetRef.name`; a release that still sets the old value
