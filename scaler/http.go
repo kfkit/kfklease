@@ -32,6 +32,9 @@ type StatusResponse struct {
 	Lease *LeaseResponse `json:"lease,omitempty"`
 	// AsOf is the broker time of the last record seen.
 	AsOf time.Time `json:"as_of"`
+	// CooldownIn is how long this participant claims nothing after the
+	// health gate released the lease, in seconds; 0 otherwise.
+	CooldownIn float64 `json:"health_cooldown_in_seconds"`
 }
 
 // LeaseResponse is the log's view of the lease.
@@ -103,10 +106,10 @@ func (h *HTTP) Handler() http.Handler {
 func (h *HTTP) status(w http.ResponseWriter, _ *http.Request) {
 	s := h.src.Status()
 	h.note()
-	resp := StatusResponse{Holder: h.holder, Holding: s.Holding, Certain: s.Certain, AsOf: s.AsOf}
+	resp := StatusResponse{Holder: h.holder, Holding: s.Holding, Certain: s.Certain, AsOf: s.AsOf, CooldownIn: untilNow(s.CooldownUntil)}
 	if s.Holding {
 		resp.Epoch = s.Epoch
-		resp.DeadlineIn = max(0, time.Until(s.Deadline).Seconds())
+		resp.DeadlineIn = untilNow(s.Deadline)
 	}
 	if s.Certain {
 		resp.Lease = &LeaseResponse{Holder: s.Lease.Holder, Epoch: s.Lease.Epoch, Expires: s.Lease.Expires}
@@ -125,11 +128,12 @@ var (
 	descCertain   = prometheus.NewDesc("kfklease_certain", "1 when the view of the log can be trusted.", nil, nil)
 	descLeaseHeld = prometheus.NewDesc("kfklease_lease_held", "1 when the log says someone holds the lease, as of the last record seen.", nil, nil)
 	descLeaseAge  = prometheus.NewDesc("kfklease_lease_as_of_seconds", "Unix time of the last record seen, on the broker's clock.", nil, nil)
+	descCooldown  = prometheus.NewDesc("kfklease_health_cooldown_seconds", "Seconds until this participant may claim again after the health gate released the lease; 0 otherwise.", nil, nil)
 )
 
 // Describe implements prometheus.Collector.
 func (h *HTTP) Describe(ch chan<- *prometheus.Desc) {
-	for _, d := range []*prometheus.Desc{descHolding, descEpoch, descDeadline, descCertain, descLeaseHeld, descLeaseAge} {
+	for _, d := range []*prometheus.Desc{descHolding, descEpoch, descDeadline, descCertain, descLeaseHeld, descLeaseAge, descCooldown} {
 		ch <- d
 	}
 }
@@ -140,16 +144,25 @@ func (h *HTTP) Collect(ch chan<- prometheus.Metric) {
 	epoch, remaining := -1.0, 0.0
 	if s.Holding {
 		epoch = float64(s.Epoch)
-		remaining = max(0, time.Until(s.Deadline).Seconds())
+		remaining = untilNow(s.Deadline)
 	}
 	ch <- prometheus.MustNewConstMetric(descHolding, prometheus.GaugeValue, b2f(s.Holding))
 	ch <- prometheus.MustNewConstMetric(descEpoch, prometheus.GaugeValue, epoch)
 	ch <- prometheus.MustNewConstMetric(descDeadline, prometheus.GaugeValue, remaining)
 	ch <- prometheus.MustNewConstMetric(descCertain, prometheus.GaugeValue, b2f(s.Certain))
 	ch <- prometheus.MustNewConstMetric(descLeaseHeld, prometheus.GaugeValue, b2f(s.Certain && s.Lease.HeldAt(s.AsOf)))
+	ch <- prometheus.MustNewConstMetric(descCooldown, prometheus.GaugeValue, untilNow(s.CooldownUntil))
 	if !s.AsOf.IsZero() {
 		ch <- prometheus.MustNewConstMetric(descLeaseAge, prometheus.GaugeValue, float64(s.AsOf.UnixMilli())/1000)
 	}
+}
+
+// untilNow is the seconds left until t, or 0 when t is zero or past.
+func untilNow(t time.Time) float64 {
+	if t.IsZero() {
+		return 0
+	}
+	return max(0, time.Until(t).Seconds())
 }
 
 func b2f(b bool) float64 {

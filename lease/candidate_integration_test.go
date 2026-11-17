@@ -51,6 +51,11 @@ type participant struct {
 
 func start(t *testing.T, topic, holder string) *participant {
 	t.Helper()
+	return startGated(t, topic, holder, HealthGate{})
+}
+
+func startGated(t *testing.T, topic, holder string, gate HealthGate) *participant {
+	t.Helper()
 	c, err := NewCandidate(Config{
 		Brokers:     brokers(t),
 		Topic:       topic,
@@ -58,6 +63,7 @@ func start(t *testing.T, topic, holder string) *participant {
 		Holder:      holder,
 		TTL:         itTTL,
 		Margin:      itMargin,
+		Health:      gate,
 		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	})
 	if err != nil {
@@ -228,4 +234,54 @@ func TestIntegrationEpochsFence(t *testing.T) {
 			t.Fatalf("epochs not strictly increasing: %v", epochs)
 		}
 	}
+}
+
+func TestIntegrationHealthGate(t *testing.T) {
+	topic := randomTopic(t)
+	gate := HealthGate{FailAfter: time.Second, Cooldown: 3 * itTTL}
+	a := startGated(t, topic, "a", gate)
+	waitFor(t, itTTL, "a holds", func() bool { return a.Status().Holding })
+	b := start(t, topic, "b")
+	waitFor(t, itTTL, "b is certain", func() bool { return b.Status().Certain })
+
+	// A healthy workload keeps the lease well past FailAfter.
+	until := time.Now().Add(3 * gate.FailAfter)
+	for time.Now().Before(until) {
+		a.ReportHealthy()
+		if !a.Status().Holding {
+			t.Fatal("a gave up the lease while its workload was healthy")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// The workload goes quiet: a lets go after FailAfter and b takes over
+	// at once, from the release, not from the term running out.
+	quiet := time.Now()
+	waitFor(t, gate.FailAfter+itTTL, "a releases", func() bool { return !a.Status().Holding })
+	released := time.Since(quiet)
+	waitFor(t, itTTL/2, "b takes over", func() bool { return b.Status().Holding })
+	took := time.Since(quiet)
+	t.Logf("released %v after the last healthy report, b holding after %v", released, took)
+	if released < gate.FailAfter-100*time.Millisecond {
+		t.Fatalf("released after %v, before FailAfter %v", released, gate.FailAfter)
+	}
+	if took > gate.FailAfter+itTTL-itMargin {
+		t.Fatalf("b took over after %v: waited for the term instead of the release", took)
+	}
+	if s := a.Status(); s.CooldownUntil.IsZero() {
+		t.Fatalf("a reports no cooldown: %+v", s)
+	}
+
+	// b stops and releases: the lease is free, but a stays out until its
+	// cooldown is over, and claims it after that.
+	b.stop(t)
+	coolEnd := a.Status().CooldownUntil
+	for time.Now().Before(coolEnd.Add(-100 * time.Millisecond)) {
+		a.ReportHealthy()
+		if a.Status().Holding {
+			t.Fatalf("a claimed %v before the end of its cooldown", time.Until(coolEnd))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	waitFor(t, 2*itTTL, "a holds again after the cooldown", func() bool { a.ReportHealthy(); return a.Status().Holding })
 }

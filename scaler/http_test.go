@@ -112,6 +112,23 @@ func TestHTTPStatusAndMetrics(t *testing.T) {
 	if metric(t, body, "kfklease_holding") != "0" || metric(t, body, "kfklease_lease_held") != "1" || metric(t, body, "kfklease_belief_remaining_seconds") != "0" {
 		t.Fatalf("lost metrics:\n%s", body)
 	}
+	if metric(t, body, "kfklease_health_cooldown_seconds") != "0" {
+		t.Fatalf("cooldown without a gate:\n%s", body)
+	}
+
+	// The health gate released it and holds claims back for a minute.
+	src.setStatus(lease.Status{Certain: true, AsOf: asOf, CooldownUntil: time.Now().Add(time.Minute)})
+	_, body = get(t, srv, "/metrics")
+	if v := metric(t, body, "kfklease_health_cooldown_seconds"); !strings.HasPrefix(v, "59.") {
+		t.Fatalf("cooldown = %s", v)
+	}
+	_, body = get(t, srv, "/status")
+	if err := json.Unmarshal([]byte(body), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Holding || st.CooldownIn < 59 || st.CooldownIn > 60 {
+		t.Fatalf("cooldown status = %+v", st)
+	}
 	if code, _ := get(t, srv, "/nope"); code != 404 {
 		t.Fatalf("unknown path: %d", code)
 	}

@@ -282,3 +282,111 @@ func TestAgentBacksOffAfterRejectedClaim(t *testing.T) {
 	}
 	h.wantSend(at(10.3), Claim)
 }
+
+func newGatedHarness(t *testing.T, gate HealthGate) *agentHarness {
+	t.Helper()
+	h := newHarness(t, 0)
+	h.a.cfg.Health = gate
+	return h
+}
+
+func TestAgentHealthGateOffByDefault(t *testing.T) {
+	h := newHarness(t, 0)
+	h.acquire(at(0))
+	// Nobody ever reports the workload healthy, and the holder keeps
+	// renewing.
+	for s := 3.0; s < 60; s += 3 {
+		renew := h.wantSend(at(s), Renew)
+		off := h.land(at(s+0.1), renew)
+		h.a.acked(at(s+0.2), off, nil)
+		h.read(at(s + 0.3))
+	}
+	h.wantBelief(at(60), true)
+}
+
+// renewAt walks one renew through the log.
+func (h *agentHarness) renewAt(s float64) {
+	h.t.Helper()
+	renew := h.wantSend(at(s), Renew)
+	off := h.land(at(s+0.1), renew)
+	h.a.acked(at(s+0.2), off, nil)
+	h.read(at(s + 0.3))
+}
+
+func TestAgentHealthGateReleasesAndCoolsDown(t *testing.T) {
+	h := newGatedHarness(t, HealthGate{FailAfter: 20 * time.Second, Cooldown: 60 * time.Second})
+	epoch := h.acquire(at(0)) // the term starts when the claim settles, at 0.2
+	// Healthy at 5, then never again: the gate counts from there.
+	h.a.healthy(at(5))
+	for _, s := range []float64{3, 6, 9, 12, 15, 18, 21, 24} {
+		h.renewAt(s)
+	}
+	h.wantBelief(at(24.9), true)
+	rel := h.wantSend(at(25), Release)
+	if rel.Epoch != epoch {
+		t.Fatalf("release epoch = %d, want %d", rel.Epoch, epoch)
+	}
+	h.wantBelief(at(25), false)
+	if s, _, _ := h.a.status(at(25)); !s.CooldownUntil.Equal(at(85)) {
+		t.Fatalf("cooldown until %v, want 85s", s.CooldownUntil.Sub(t0))
+	}
+	off := h.land(at(25.1), rel)
+	h.a.acked(at(25.2), off, nil)
+	h.read(at(25.3))
+	if h.a.view.State().HeldAt(h.a.view.Clock()) {
+		t.Fatal("the release did not end the term in the log")
+	}
+	// The lease is free, but the participant stays out until the cooldown
+	// is over, whatever the workload does meanwhile.
+	h.a.healthy(at(30))
+	for s := 25.5; s < 85; s += 0.5 {
+		h.wantSilent(at(s))
+	}
+	if s, _, _ := h.a.status(at(85)); !s.CooldownUntil.IsZero() {
+		t.Fatalf("cooldown still reported after it ended: %v", s.CooldownUntil.Sub(t0))
+	}
+	h.wantSend(at(85.1), Claim)
+}
+
+func TestAgentHealthGateGivesANewTermTimeToComeUp(t *testing.T) {
+	h := newGatedHarness(t, HealthGate{FailAfter: 10 * time.Second, Cooldown: time.Minute})
+	// A healthy report from long before the term counts for nothing, and
+	// does not trip the gate at once either.
+	h.a.healthy(at(0))
+	h.land(at(0), Record{Kind: Claim, Holder: "other", TTL: agTTL})
+	h.read(at(0.1))
+	h.acquire(at(10.2)) // settles at 10.4
+	h.renewAt(13.2)
+	h.renewAt(16.2)
+	h.renewAt(19.2)
+	h.wantBelief(at(20.3), true)
+	if rec, ok := h.tick(at(20.4)); !ok || rec.Kind != Release {
+		t.Fatalf("at 20.4: tick = (%v, %v), want a release ten seconds into the term", rec.Kind, ok)
+	}
+}
+
+func TestAgentHealthGateKeepsAHealthyHolder(t *testing.T) {
+	h := newGatedHarness(t, HealthGate{FailAfter: 10 * time.Second, Cooldown: time.Minute})
+	h.acquire(at(0))
+	for s := 3.0; s < 60; s += 3 {
+		h.a.healthy(at(s - 1))
+		h.renewAt(s)
+	}
+	h.wantBelief(at(60), true)
+}
+
+func TestAgentHealthGateReleaseWaitsForTheRecordInFlight(t *testing.T) {
+	h := newGatedHarness(t, HealthGate{FailAfter: 5 * time.Second, Cooldown: time.Minute})
+	h.acquire(at(0)) // the term starts at 0.2
+	renew := h.wantSend(at(3), Renew)
+	// The gate trips at 5.2 while the renew is still in flight: the belief
+	// goes at once, the release waits for its turn.
+	h.wantSilent(at(5.3))
+	h.wantBelief(at(5.3), false)
+	off := h.land(at(5.4), renew)
+	h.a.acked(at(5.5), off, nil)
+	h.read(at(5.6))
+	h.wantBelief(at(5.6), false) // the accepted renew does not bring it back
+	h.wantSend(at(5.7), Release)
+	h.wantSilent(at(5.8))
+}

@@ -128,7 +128,8 @@ The scaler serves HTTP on `:9091` (`service.httpPort`):
 
 - `/metrics`, Prometheus: `kfklease_holding`, `kfklease_epoch`,
   `kfklease_belief_remaining_seconds`, `kfklease_certain`,
-  `kfklease_lease_held`, `kfklease_lease_as_of_seconds` and
+  `kfklease_lease_held`, `kfklease_lease_as_of_seconds`,
+  `kfklease_health_cooldown_seconds` and
   `kfklease_transitions_total{to="holding"|"standby"}`. The pod carries
   `prometheus.io/*` annotations; `metrics.serviceMonitor.enabled` adds a
   ServiceMonitor for the Prometheus Operator.
@@ -149,6 +150,13 @@ epoch downstream. If the scaler alone is gone, KEDA's `fallback`, which
 the chart renders with `replicas: 0`, scales the workload to zero instead
 of leaving it running; see
 [docs/install.md](docs/install.md#when-the-scaler-is-gone).
+
+The lease follows the scaler, not the workload. To fail over when the
+workload cannot run where the lease is held, set `healthGate.url` (the
+Kafka Connect REST API, say): a holder whose workload has not passed a
+probe for `healthGate.failAfter` releases the lease and sits out
+`healthGate.cooldown`; see
+[docs/install.md](docs/install.md#when-the-workload-cannot-run-here).
 
 ### Fencing by epoch
 
@@ -186,6 +194,7 @@ The end-to-end stand with two Kubernetes clusters is described in
 - [x] Helm chart
 - [x] Failure-mode tests: crash, partition, freeze, broker restart
 - [x] N replicas of any scalable target; fail closed when the scaler is gone
+- [x] Optional health gate: fail over when the workload cannot run where the lease is held
 - [x] Failure-mode tests: clock skew and drift, in the simulation
 - [x] Example workload fencing by epoch; workload-level exclusion check on the stand
 - [x] Image and chart on GHCR, cosign-signed
