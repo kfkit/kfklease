@@ -144,3 +144,80 @@ func waitFor(t *testing.T, cond func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+func TestHTTPSeveralLeases(t *testing.T) {
+	a := &fakeSource{changed: make(chan struct{}, 1)}
+	b := &fakeSource{changed: make(chan struct{}, 1)}
+	h, err := NewHTTPLeases([]Lease{{Topic: "connect-a", Holder: "k3s-a/pod", Source: a}, {Topic: "connect-b", Holder: "k3s-a/pod", Source: b}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Watch(ctx)
+	srv := httptest.NewServer(h.Handler())
+	defer srv.Close()
+
+	asOf := time.Now()
+	b.setStatus(lease.Status{Holding: true, Epoch: 42, Deadline: time.Now().Add(8 * time.Second), Certain: true,
+		Lease: lease.State{Holder: "k3s-a/pod", Epoch: 42, Expires: asOf.Add(10 * time.Second)}, AsOf: asOf})
+	waitFor(t, func() bool {
+		_, body := get(t, srv, "/metrics")
+		return metric(t, body, `kfklease_transitions_total{to="holding",topic="connect-b"}`) == "1"
+	})
+	_, body := get(t, srv, "/metrics")
+	for name, want := range map[string]string{
+		`kfklease_holding{topic="connect-a"}`:                        "0",
+		`kfklease_epoch{topic="connect-a"}`:                          "-1",
+		`kfklease_holding{topic="connect-b"}`:                        "1",
+		`kfklease_epoch{topic="connect-b"}`:                          "42",
+		`kfklease_lease_held{topic="connect-b"}`:                     "1",
+		`kfklease_transitions_total{to="holding",topic="connect-a"}`: "0",
+	} {
+		if got := metric(t, body, name); got != want {
+			t.Errorf("%s = %s, want %s", name, got, want)
+		}
+	}
+
+	for topic, holding := range map[string]bool{"connect-a": false, "connect-b": true} {
+		code, body := get(t, srv, "/status?topic="+topic)
+		var st StatusResponse
+		if err := json.Unmarshal([]byte(body), &st); err != nil || code != 200 {
+			t.Fatalf("status %s: %d %v %s", topic, code, err, body)
+		}
+		if st.Topic != topic || st.Holder != "k3s-a/pod" || st.Holding != holding {
+			t.Fatalf("status %s = %+v", topic, st)
+		}
+	}
+	if code, _ := get(t, srv, "/status"); code != http.StatusBadRequest {
+		t.Fatalf("status without a topic: %d, want 400", code)
+	}
+	if code, _ := get(t, srv, "/status?topic=other"); code != http.StatusNotFound {
+		t.Fatalf("status of another topic: %d, want 404", code)
+	}
+}
+
+func TestHTTPOneLeaseTopic(t *testing.T) {
+	src := &fakeSource{changed: make(chan struct{}, 1)}
+	h, err := NewHTTPLeases([]Lease{{Topic: "orders", Holder: "eu/pod", Source: src}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(h.Handler())
+	defer srv.Close()
+	// One lease: /status needs no topic, and the metrics name it.
+	for _, path := range []string{"/status", "/status?topic=orders"} {
+		code, body := get(t, srv, path)
+		var st StatusResponse
+		if err := json.Unmarshal([]byte(body), &st); err != nil || code != 200 || st.Topic != "orders" {
+			t.Fatalf("%s: %d %v %s", path, code, err, body)
+		}
+	}
+	if code, _ := get(t, srv, "/status?topic=other"); code != http.StatusNotFound {
+		t.Fatalf("status of another topic: %d, want 404", code)
+	}
+	_, body := get(t, srv, "/metrics")
+	if metric(t, body, `kfklease_holding{topic="orders"}`) != "0" {
+		t.Fatalf("metrics:\n%s", body)
+	}
+}

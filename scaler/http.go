@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -20,6 +22,8 @@ import (
 // StatusResponse is the body of GET /status: what the participant knows and
 // believes, for dashboards and for workloads that fence by epoch.
 type StatusResponse struct {
+	// Topic names the lease; empty for a handler built without one.
+	Topic   string `json:"topic,omitempty"`
 	Holder  string `json:"holder"`
 	Holding bool   `json:"holding"`
 	// Epoch is the fencing token, valid while Holding.
@@ -44,54 +48,97 @@ type LeaseResponse struct {
 	Expires time.Time `json:"expires"`
 }
 
-// HTTP serves /metrics, /status and /healthz over a Source.
+// HTTP serves /metrics, /status and /healthz over one or more leases.
 type HTTP struct {
-	src    Source
-	holder string
+	leases leases
 	reg    *prometheus.Registry
+	// labels are the variable labels of every lease metric: "topic", or
+	// none for a single lease without a topic.
+	labels []string
+	descs  descs
 
 	transitions *prometheus.CounterVec
-	lastHolding atomic.Bool
+	// lastHolding is per topic; the map is fixed after construction.
+	lastHolding map[string]*atomic.Bool
 }
 
-// NewHTTP returns the handler. holder is this participant's id, reported in
-// /status and as a label on the metrics.
+// NewHTTP returns the handler for one lease. holder is this participant's
+// id, reported in /status. The metrics carry no topic label.
 func NewHTTP(src Source, holder string) *HTTP {
-	h := &HTTP{src: src, holder: holder, reg: prometheus.NewRegistry()}
+	h, err := NewHTTPLeases([]Lease{{Holder: holder, Source: src}})
+	if err != nil {
+		panic(err)
+	}
+	return h
+}
+
+// NewHTTPLeases returns the handler for several leases, at least one, with
+// distinct topics. Every lease metric carries a "topic" label, unless the
+// only lease has no topic. GET /status takes ?topic=, which is required
+// when there is more than one lease.
+func NewHTTPLeases(ls []Lease) (*HTTP, error) {
+	set, err := newLeases(ls)
+	if err != nil {
+		return nil, err
+	}
+	h := &HTTP{leases: set, reg: prometheus.NewRegistry(), lastHolding: make(map[string]*atomic.Bool, len(ls))}
+	if !(len(set.topics) == 1 && set.topics[0] == "") {
+		h.labels = []string{"topic"}
+	}
+	h.descs = newDescs(h.labels)
 	h.transitions = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "kfklease_transitions_total",
 		Help: "Times this participant started (to=\"holding\") or stopped (to=\"standby\") holding the lease.",
-	}, []string{"to"})
-	h.transitions.WithLabelValues("holding")
-	h.transitions.WithLabelValues("standby")
+	}, append(slices.Clone(h.labels), "to"))
+	for _, t := range set.topics {
+		h.transitions.WithLabelValues(h.values(t, "holding")...)
+		h.transitions.WithLabelValues(h.values(t, "standby")...)
+		b := new(atomic.Bool)
+		b.Store(set.byTopic[t].Source.Status().Holding)
+		h.lastHolding[t] = b
+	}
 	h.reg.MustRegister(h.transitions, h, collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-	h.lastHolding.Store(src.Status().Holding)
-	return h
+	return h, nil
+}
+
+// values returns the label values of topic's metrics, followed by more.
+func (h *HTTP) values(topic string, more ...string) []string {
+	if h.labels == nil {
+		return more
+	}
+	return append([]string{topic}, more...)
 }
 
 // Watch counts transitions until ctx is done. Without it the gauges are
 // still right; only kfklease_transitions_total stays at zero.
 func (h *HTTP) Watch(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-h.src.Changed():
-			h.note()
-		}
+	var wg sync.WaitGroup
+	for _, t := range h.leases.topics {
+		wg.Go(func() {
+			src := h.leases.byTopic[t].Source
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-src.Changed():
+					h.note(t)
+				}
+			}
+		})
 	}
+	wg.Wait()
 }
 
-func (h *HTTP) note() {
-	holding := h.src.Status().Holding
-	if h.lastHolding.Swap(holding) == holding {
+func (h *HTTP) note(topic string) {
+	holding := h.leases.byTopic[topic].Source.Status().Holding
+	if h.lastHolding[topic].Swap(holding) == holding {
 		return
 	}
+	to := "standby"
 	if holding {
-		h.transitions.WithLabelValues("holding").Inc()
-	} else {
-		h.transitions.WithLabelValues("standby").Inc()
+		to = "holding"
 	}
+	h.transitions.WithLabelValues(h.values(topic, to)...).Inc()
 }
 
 // Handler routes /metrics, /status and /healthz.
@@ -103,10 +150,20 @@ func (h *HTTP) Handler() http.Handler {
 	return mux
 }
 
-func (h *HTTP) status(w http.ResponseWriter, _ *http.Request) {
-	s := h.src.Status()
-	h.note()
-	resp := StatusResponse{Holder: h.holder, Holding: s.Holding, Certain: s.Certain, AsOf: s.AsOf, CooldownIn: untilNow(s.CooldownUntil)}
+func (h *HTTP) status(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	l, err := h.leases.pick(q.Get("topic"), q.Has("topic"))
+	if err != nil {
+		code := http.StatusNotFound // a topic this handler does not serve
+		if !q.Has("topic") {
+			code = http.StatusBadRequest // several leases and none named
+		}
+		http.Error(w, err.Error(), code)
+		return
+	}
+	s := l.Source.Status()
+	h.note(l.Topic)
+	resp := StatusResponse{Topic: l.Topic, Holder: l.Holder, Holding: s.Holding, Certain: s.Certain, AsOf: s.AsOf, CooldownIn: untilNow(s.CooldownUntil)}
 	if s.Holding {
 		resp.Epoch = s.Epoch
 		resp.DeadlineIn = untilNow(s.Deadline)
@@ -119,41 +176,56 @@ func (h *HTTP) status(w http.ResponseWriter, _ *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// The gauges are read from the Source at scrape time, so they are always
-// current and there is nothing to keep in sync.
-var (
-	descHolding   = prometheus.NewDesc("kfklease_holding", "1 while this participant believes it holds the lease.", nil, nil)
-	descEpoch     = prometheus.NewDesc("kfklease_epoch", "Fencing token of the held term; -1 when not holding.", nil, nil)
-	descDeadline  = prometheus.NewDesc("kfklease_belief_remaining_seconds", "Seconds until the belief expires unless renewed; 0 when not holding.", nil, nil)
-	descCertain   = prometheus.NewDesc("kfklease_certain", "1 when the view of the log can be trusted.", nil, nil)
-	descLeaseHeld = prometheus.NewDesc("kfklease_lease_held", "1 when the log says someone holds the lease, as of the last record seen.", nil, nil)
-	descLeaseAge  = prometheus.NewDesc("kfklease_lease_as_of_seconds", "Unix time of the last record seen, on the broker's clock.", nil, nil)
-	descCooldown  = prometheus.NewDesc("kfklease_health_cooldown_seconds", "Seconds until this participant may claim again after the health gate released the lease; 0 otherwise.", nil, nil)
-)
+// descs are the gauges, read from the Sources at scrape time, so they are
+// always current and there is nothing to keep in sync.
+type descs struct {
+	holding, epoch, deadline, certain, leaseHeld, leaseAge, cooldown *prometheus.Desc
+}
+
+func newDescs(labels []string) descs {
+	d := func(name, help string) *prometheus.Desc { return prometheus.NewDesc(name, help, labels, nil) }
+	return descs{
+		holding:   d("kfklease_holding", "1 while this participant believes it holds the lease."),
+		epoch:     d("kfklease_epoch", "Fencing token of the held term; -1 when not holding."),
+		deadline:  d("kfklease_belief_remaining_seconds", "Seconds until the belief expires unless renewed; 0 when not holding."),
+		certain:   d("kfklease_certain", "1 when the view of the log can be trusted."),
+		leaseHeld: d("kfklease_lease_held", "1 when the log says someone holds the lease, as of the last record seen."),
+		leaseAge:  d("kfklease_lease_as_of_seconds", "Unix time of the last record seen, on the broker's clock."),
+		cooldown:  d("kfklease_health_cooldown_seconds", "Seconds until this participant may claim again after the health gate released the lease; 0 otherwise."),
+	}
+}
 
 // Describe implements prometheus.Collector.
 func (h *HTTP) Describe(ch chan<- *prometheus.Desc) {
-	for _, d := range []*prometheus.Desc{descHolding, descEpoch, descDeadline, descCertain, descLeaseHeld, descLeaseAge, descCooldown} {
-		ch <- d
+	d := h.descs
+	for _, x := range []*prometheus.Desc{d.holding, d.epoch, d.deadline, d.certain, d.leaseHeld, d.leaseAge, d.cooldown} {
+		ch <- x
 	}
 }
 
 // Collect implements prometheus.Collector.
 func (h *HTTP) Collect(ch chan<- prometheus.Metric) {
-	s := h.src.Status()
-	epoch, remaining := -1.0, 0.0
-	if s.Holding {
-		epoch = float64(s.Epoch)
-		remaining = untilNow(s.Deadline)
-	}
-	ch <- prometheus.MustNewConstMetric(descHolding, prometheus.GaugeValue, b2f(s.Holding))
-	ch <- prometheus.MustNewConstMetric(descEpoch, prometheus.GaugeValue, epoch)
-	ch <- prometheus.MustNewConstMetric(descDeadline, prometheus.GaugeValue, remaining)
-	ch <- prometheus.MustNewConstMetric(descCertain, prometheus.GaugeValue, b2f(s.Certain))
-	ch <- prometheus.MustNewConstMetric(descLeaseHeld, prometheus.GaugeValue, b2f(s.Certain && s.Lease.HeldAt(s.AsOf)))
-	ch <- prometheus.MustNewConstMetric(descCooldown, prometheus.GaugeValue, untilNow(s.CooldownUntil))
-	if !s.AsOf.IsZero() {
-		ch <- prometheus.MustNewConstMetric(descLeaseAge, prometheus.GaugeValue, float64(s.AsOf.UnixMilli())/1000)
+	d := h.descs
+	for _, t := range h.leases.topics {
+		s := h.leases.byTopic[t].Source.Status()
+		lv := h.values(t)
+		gauge := func(desc *prometheus.Desc, v float64) {
+			ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, v, lv...)
+		}
+		epoch, remaining := -1.0, 0.0
+		if s.Holding {
+			epoch = float64(s.Epoch)
+			remaining = untilNow(s.Deadline)
+		}
+		gauge(d.holding, b2f(s.Holding))
+		gauge(d.epoch, epoch)
+		gauge(d.deadline, remaining)
+		gauge(d.certain, b2f(s.Certain))
+		gauge(d.leaseHeld, b2f(s.Certain && s.Lease.HeldAt(s.AsOf)))
+		gauge(d.cooldown, untilNow(s.CooldownUntil))
+		if !s.AsOf.IsZero() {
+			gauge(d.leaseAge, float64(s.AsOf.UnixMilli())/1000)
+		}
 	}
 }
 
