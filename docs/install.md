@@ -64,6 +64,10 @@ helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.3.0 \
 | `scaledObject.replicas` | replicas while this cluster holds the lease, 1 by default; zero otherwise |
 | `scaledObject.enabled` | `false` to write your own ScaledObject; see below |
 
+Upgrading from 0.3.0: `scaledObject.target` is renamed to
+`scaledObject.targetRef.name`; a release that still sets the old value
+fails to render with a message that names the new one.
+
 The workload itself is yours, in the same namespace. Its
 replica count belongs to KEDA from now on, so leave `replicas` out or set
 it to 0. Keep `terminationGracePeriodSeconds` short: every second of it is

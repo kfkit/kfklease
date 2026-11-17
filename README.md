@@ -86,6 +86,10 @@ helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.3.0 \
   --set scaledObject.targetRef.name=my-singleton
 ```
 
+Upgrading from 0.3.0: `scaledObject.target` is now
+`scaledObject.targetRef.name` (`--set scaledObject.targetRef.name=my-singleton`);
+the old value fails the render. See [CHANGELOG.md](CHANGELOG.md).
+
 The chart pulls `ghcr.io/kfkit/kfklease-scaler` at the same version:
 linux/amd64 and linux/arm64, signed with cosign. The digest and the verify
 command are in the [release notes](https://github.com/kfkit/kfklease/releases).
