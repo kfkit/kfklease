@@ -13,6 +13,13 @@ and this project adheres to
   A release that still sets `scaledObject.target` fails to render with
   "scaledObject.target was renamed to scaledObject.targetRef.name". Set
   `scaledObject.targetRef.name` instead.
+- Chart: the ScaledObject now has KEDA's `fallback` with `replicas: 0`
+  (`scaledObject.fallback.enabled`, on by default). When KEDA cannot reach
+  the scaler it scales the workload to zero once `cooldownPeriod` has
+  passed, where it used to leave the replicas as they were. A cluster whose
+  scaler is gone no longer keeps running the workload while another cluster
+  takes the lease. To keep the old behaviour, set
+  `scaledObject.fallback.enabled=false`.
 
 ### Added
 
@@ -24,6 +31,11 @@ and this project adheres to
   only a Deployment.
 - Stand: the `replicas` scenario, three workload pods where the lease is
   held, failed over by a partition.
+- Stand: the `scaler-down` scenario: the holder's scaler loses its Service
+  endpoint and Kafka and is killed without a release, and its workload must
+  stop on its own.
+- Docs: "When the scaler is gone" in docs/install.md, with the bound on how
+  soon the old cluster stops on its own.
 
 ### Fixed
 

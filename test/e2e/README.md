@@ -62,6 +62,7 @@ TTL 10 s, `pollingInterval: 5`, `cooldownPeriod: 0`:
 | `pause`     | holder's cluster frozen for 2 × TTL            | takeover ~10 s into the freeze; on wake-up the frozen pod goes within 1 s |
 | `broker`    | Kafka stopped for 2 × TTL                      | holder's pod down within a TTL; a holder again ~10 s after the broker is back |
 | `replicas`  | both clusters redeployed with `REPLICAS=3`, then the holder cut off from Kafka | holder at 3, standby at 0; after the cut the holder's pods all go before the standby's three run; back to 1 at the end |
+| `scaler-down` | the holder's scaler Service loses its endpoint, the holder is cut off from Kafka and the scaler is killed (`crictl stop --timeout 0`, no release) | KEDA's fallback (`replicas: 0`) scales the holder's workload to zero on the scaler error; the standby takes over after the term runs out |
 
 Takeover timing is TTL plus KEDA's reaction and pod start; the standby
 never claims before the term in the log runs out, and the old holder stops
@@ -76,6 +77,7 @@ is the heartbeat check, which sees every write.
 | Cluster dies               | `docker compose kill k3s-a`               |
 | Cluster freezes            | `docker compose pause k3s-a` / `unpause`  |
 | Cluster loses Kafka        | `./partition.sh cut k3s-a` / `heal k3s-a` |
+| Scaler gone, no release    | `docker compose exec k3s-a sh -c 'crictl stop --timeout 0 $(crictl ps -q --name "^scaler$")'` |
 | Arbiter is down            | `docker compose stop kafka` / `up -d --no-deps --no-recreate kafka` (`start` reruns the certs service and issues a new CA) |
 
 `partition.sh` drops packets to Kafka inside the node's network namespace, so

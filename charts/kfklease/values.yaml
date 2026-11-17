@@ -64,6 +64,12 @@ scaledObject:
   # Every second of cooldown is a second the old and the new holder may
   # overlap.
   cooldownPeriod: 0
+  # Scale the target to zero when KEDA cannot reach the scaler (its pod
+  # lost, Pending, not ready), rather than leave it running while the term
+  # runs out and another cluster starts it too. Renders KEDA's fallback
+  # with replicas 0; false keeps the replicas as they are on a scaler error.
+  fallback:
+    enabled: true
 
 service:
   port: 9090

@@ -60,6 +60,16 @@ jobs:
               echo "rendered with $bad"; exit 1
             fi
           done
+      - name: Fail closed by default, a fallback to zero replicas
+        run: |
+          so() { helm template t charts/kfklease --set brokers=k:9092 --set topic=t \
+                   --set scaledObject.targetRef.name=w "$@" -s templates/scaledobject.yaml; }
+          out=$(so)
+          echo "$out"
+          grep -A2 '^  fallback:' <<<"$out" | grep -qx '    replicas: 0' || { echo "no fallback to 0 replicas"; exit 1; }
+          if so --set scaledObject.fallback.enabled=false | grep -q 'fallback:'; then
+            echo "fallback rendered although disabled"; exit 1
+          fi
 
   # The two-cluster stand: k3s + KEDA twice and a Kafka broker, then the
   # failover scenarios. Slow, so it runs after the fast jobs pass.
@@ -79,6 +89,7 @@ jobs:
           for c in k3s-a k3s-b; do
             kubectl --kubeconfig test/e2e/.out/$c/kubeconfig.yaml -n kfklease get pods,scaledobject || true
             kubectl --kubeconfig test/e2e/.out/$c/kubeconfig.yaml -n kfklease logs deploy/kfklease --tail=50 || true
+            kubectl --kubeconfig test/e2e/.out/$c/kubeconfig.yaml -n keda logs deploy/keda-operator --tail=30 || true
           done
       - if: always()
         run: docker compose -f test/e2e/compose.yaml down -v

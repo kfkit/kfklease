@@ -23,6 +23,17 @@ spec:
   maxReplicaCount: {{ $replicas }}
   pollingInterval: {{ $so.pollingInterval }}
   cooldownPeriod: {{ $so.cooldownPeriod }}
+  {{- if $so.fallback.enabled }}
+  # Fail closed when KEDA cannot ask the scaler (pod gone, Pending, not
+  # ready): with replicas 0, a scaler error scales the target to
+  # idleReplicaCount once cooldownPeriod has passed since the last active
+  # answer, instead of leaving it running while another cluster takes the
+  # lease. failureThreshold only counts on the HPA's metric path, which
+  # idle mode bypasses; KEDA requires it.
+  fallback:
+    failureThreshold: 3
+    replicas: 0
+  {{- end }}
   triggers:
     - type: external-push
       metadata:

@@ -6,7 +6,7 @@
 # at once and how long nobody wrote.
 #
 #   ./scenarios.sh            # all
-#   ./scenarios.sh crash      # one: coldstart, crash, partition, pause, broker, replicas
+#   ./scenarios.sh crash      # one: coldstart, crash, partition, pause, broker, replicas, scaler-down
 #
 # Expects the stand to be up (./smoke.sh), the image built (./build-image.sh)
 # and the manifests deployed to both clusters (./deploy.sh k3s-a; ./deploy.sh k3s-b).
@@ -257,10 +257,56 @@ scenario_replicas() {
   echo "   ok: back to ${want} replica in ${t}s"
 }
 
+# scaler_service <cluster> on|off adds a selector term no pod has to the
+# scaler's Service, or takes it away. Off, the Service has no endpoint and
+# kube-proxy refuses new connections to it: what KEDA sees when the scaler
+# pod is gone. Waits until kube-proxy has the rule.
+scaler_service() {
+  local cluster=$1 t0
+  case "$2" in
+    off)
+      kc "$cluster" -n "$NS" patch service "$RELEASE" --type=merge \
+        -p '{"spec":{"selector":{"kfklease-e2e/scaler-down":"true"}}}' >/dev/null
+      t0=$(date +%s)
+      # Not a pipe into grep -q: with pipefail, an early exit is a failure.
+      until grep -qF "${NS}/${RELEASE}:grpc has no endpoints" \
+          <<<"$(docker compose exec -T "$cluster" iptables -t filter -S)"; do
+        (( $(date +%s) - t0 < 30 )) || { echo "FAILED: kube-proxy kept the scaler's endpoint" >&2; return 1; }
+        sleep 1
+      done
+      ;;
+    on)
+      kc "$cluster" -n "$NS" patch service "$RELEASE" --type=merge \
+        -p '{"spec":{"selector":{"kfklease-e2e/scaler-down":null}}}' >/dev/null
+      ;;
+  esac
+}
+
+scenario_scaler_down() {
+  echo "== scaler-down: the holder's scaler is gone, its workload pods are not"
+  local h o since
+  h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
+  # The scaler goes without a word, as with a lost node: KEDA can no longer
+  # reach it, it can no longer reach Kafka, and it is killed, which writes
+  # no release and resets KEDA's open connection to it. The kubelet's
+  # restart of the container reaches neither. Only the fallback can stop
+  # the holder's workload now; without it this times out.
+  scaler_service "$h" off
+  ./partition.sh cut "$h"
+  docker compose exec -T "$h" sh -c 'crictl stop --timeout 0 $(crictl ps -q --name "^scaler$")' >/dev/null
+  echo "   ${h} -> ${o}: $(transition "$h" "$o" $(( 3 * TTL ))) (ttl ${TTL}s)"
+  ./partition.sh heal "$h"
+  scaler_service "$h" on
+  watch_exclusive $(( 2 * TTL ))
+  [[ $(holder) == "$o" ]] || { echo "FAILED: lease moved back after the scaler returned" >&2; return 1; }
+  heartbeats "$since"
+  echo "   ok: ${h} stopped its workload without its scaler and stayed idle"
+}
+
 if (( $# == 0 )); then
-  set -- coldstart crash partition pause broker replicas
+  set -- coldstart crash partition pause broker replicas scaler-down
 fi
 for s in "$@"; do
-  "scenario_$s"
+  "scenario_${s//-/_}"
 done
 echo "all scenarios passed"

@@ -62,6 +62,7 @@ helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.3.0 \
 | `scaledObject.targetRef.name` | the workload to scale, in the release namespace |
 | `scaledObject.targetRef.kind`, `.apiVersion` | its kind, `Deployment` and `apps/v1` by default: anything with a scale subresource, a StatefulSet or Strimzi's `KafkaConnect`, say |
 | `scaledObject.replicas` | replicas while this cluster holds the lease, 1 by default; zero otherwise |
+| `scaledObject.fallback.enabled` | `true` by default: when KEDA cannot reach the scaler, scale the workload to zero instead of leaving it running; see [When the scaler is gone](#when-the-scaler-is-gone) |
 | `scaledObject.enabled` | `false` to write your own ScaledObject; see below |
 
 Upgrading from 0.3.0: `scaledObject.target` is renamed to
@@ -106,6 +107,9 @@ spec:
   maxReplicaCount: 1   # the same N
   pollingInterval: 5
   cooldownPeriod: 0
+  fallback:            # a scaler error scales to idleReplicaCount
+    failureThreshold: 3
+    replicas: 0
   triggers:
     - type: external-push
       metadata:
@@ -119,7 +123,8 @@ while it holds and 0 otherwise; KEDA scales the target to
 keeps it between `minReplicaCount` and `maxReplicaCount`, while it is 1.
 With both at N, that is N replicas in the holding cluster and none
 elsewhere. `cooldownPeriod: 0` because every second of cooldown is a second
-of overlap after a handover.
+of overlap after a handover. `fallback` with `replicas: 0` because without
+it a scaler KEDA cannot reach leaves the workload running; see below.
 
 ## Authentication
 
@@ -230,6 +235,43 @@ lease for longer than a TTL (nobody, or more than one, holds it),
 its view: check its connection to Kafka), and a rising
 `kfklease_transitions_total` (flapping).
 
+## When the scaler is gone
+
+The scaler is one pod per cluster. If it is gone while the workload's pods
+live (its node is lost, it is Pending, its image does not pull), it neither
+renews the lease nor tells KEDA to stop: the term runs out, another cluster
+takes the lease and starts the workload. Without a fallback, KEDA marks
+the ScaledObject not ready and leaves the replicas alone, and both clusters
+run the workload until the scaler is back.
+
+The chart therefore renders KEDA's `fallback` with `replicas: 0`. By the
+KEDA v2.17 source (`pkg/scaling/executor/scale_scaledobjects.go`), a scale
+loop that gets an error from the scaler and no active answer then scales
+the target to `idleReplicaCount`, once `cooldownPeriod` has passed since
+the last active answer. The bound on the old cluster stopping on its own
+is the time until KEDA's next call fails, at most `pollingInterval`, plus
+`cooldownPeriod`, plus the workload's `terminationGracePeriodSeconds`.
+Compare it with how soon another cluster can claim: one TTL after the
+scaler's last renewal, which may be up to TTL/3 older than the moment it
+went, so at the earliest about 6.7 s with the defaults, plus that cluster's
+own KEDA reaction and pod start. With `pollingInterval: 5`, `cooldownPeriod:
+0` and a short grace period the old pods are usually gone first; a lower
+`pollingInterval` or a longer TTL widens the gap. The pod-level window is
+not a guarantee either way: fence by epoch. The `scaler-down` scenario on
+the stand checks the bound.
+
+The cost: any error KEDA gets from the scaler scales the workload to zero,
+a scaler restart included. Today a restarting scaler reports "not holding"
+until it holds again, so a restart stops the workload in any case.
+
+Two cases the fallback does not cover. A scaler that hangs rather than
+fails (a frozen process, a node whose packets vanish) keeps KEDA's call
+waiting instead of failing it; the pod's liveness probe restarts a hung
+scaler, and a lost node takes the scaler's endpoint away once Kubernetes
+marks the node not ready. And KEDA itself down in the old cluster stops
+nothing; that is the revived-cluster case in [Fencing by
+epoch](#fencing-by-epoch).
+
 ## Choosing TTL and margin
 
 - **TTL** is the failover time: after the holder dies, the standby takes
@@ -281,7 +323,7 @@ follow the same lease.
 
 | Symptom | Look at |
 |---|---|
-| ScaledObject shows `READY False`, KEDA logs `connection refused` to the scaler | the scaler pod is not up, or `scalerAddress` names the wrong Service or namespace |
+| ScaledObject shows `READY False`, KEDA logs `connection refused` to the scaler | the scaler pod is not up, or `scalerAddress` names the wrong Service or namespace. With the fallback the workload is at zero in this cluster until the scaler answers |
 | Scaler logs `topic ... does not use LogAppendTime` | the topic exists with `message.timestamp.type=CreateTime`. Set it to `LogAppendTime`, or let `createTopic` create a new one |
 | Scaler logs `partition not ready` a few times at start | a freshly created topic; it settles within seconds |
 | `kfklease_certain` stays 0 | the scaler is not reading the log: check `fetch failed` in its logs, the brokers, the auth |

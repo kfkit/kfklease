@@ -145,7 +145,10 @@ KEDA gives failover, not mutual exclusion: the old pod is still terminating
 while the new one starts, a `cooldownPeriod` above zero stretches that, and a
 cluster coming back from a crash restarts its stale pod until its own KEDA
 is up again and scales it down. Workloads that must not overlap check the
-epoch downstream.
+epoch downstream. If the scaler alone is gone, KEDA's `fallback`, which
+the chart renders with `replicas: 0`, scales the workload to zero instead
+of leaving it running; see
+[docs/install.md](docs/install.md#when-the-scaler-is-gone).
 
 ### Fencing by epoch
 
@@ -182,6 +185,7 @@ The end-to-end stand with two Kubernetes clusters is described in
 - [x] Container image
 - [x] Helm chart
 - [x] Failure-mode tests: crash, partition, freeze, broker restart
+- [x] N replicas of any scalable target; fail closed when the scaler is gone
 - [x] Failure-mode tests: clock skew and drift, in the simulation
 - [x] Example workload fencing by epoch; workload-level exclusion check on the stand
 - [x] Image and chart on GHCR, cosign-signed
