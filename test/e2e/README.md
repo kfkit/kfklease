@@ -77,7 +77,7 @@ is the heartbeat check, which sees every write.
 | Cluster dies               | `docker compose kill k3s-a`               |
 | Cluster freezes            | `docker compose pause k3s-a` / `unpause`  |
 | Cluster loses Kafka        | `./partition.sh cut k3s-a` / `heal k3s-a` |
-| Scaler gone, no release    | `docker compose exec k3s-a sh -c 'k3s crictl stop --timeout 0 $(k3s crictl ps -q --name "^scaler$")'` |
+| Scaler gone, no release    | `docker compose exec k3s-a sh -c 'crictl stop --timeout 0 $(crictl ps -q --name "^scaler$")'` |
 | Arbiter is down            | `docker compose stop kafka` / `up -d --no-deps --no-recreate kafka` (`start` reruns the certs service and issues a new CA) |
 
 `partition.sh` drops packets to Kafka inside the node's network namespace, so

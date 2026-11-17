@@ -293,7 +293,7 @@ scenario_scaler_down() {
   # the holder's workload now; without it this times out.
   scaler_service "$h" off
   ./partition.sh cut "$h"
-  docker compose exec -T "$h" sh -c 'k3s crictl stop --timeout 0 $(k3s crictl ps -q --name "^scaler$")' >/dev/null
+  docker compose exec -T "$h" sh -c 'crictl stop --timeout 0 $(crictl ps -q --name "^scaler$")' >/dev/null
   echo "   ${h} -> ${o}: $(transition "$h" "$o" $(( 3 * TTL ))) (ttl ${TTL}s)"
   ./partition.sh heal "$h"
   scaler_service "$h" on
