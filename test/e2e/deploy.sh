@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Deploys the chart and the test workload into one cluster:  ./deploy.sh k3s-a
-# Uses helm when installed, the alpine/helm image otherwise.
+# Uses helm when installed, the alpine/helm image otherwise. REPLICAS sets
+# the workload's replica count while the cluster holds the lease (default 1).
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -47,7 +48,8 @@ esac
 helm_template --namespace "$NS" \
   --set image.repository=kfklease-scaler --set image.tag=dev --set image.pullPolicy=Never \
   --set topic=kfklease-e2e --set ttl="${TTL}s" \
-  --set holderPrefix="$cluster" --set scaledObject.target=singleton --set logLevel=debug \
+  --set holderPrefix="$cluster" --set scaledObject.targetRef.name=singleton \
+  --set scaledObject.replicas="${REPLICAS:-1}" --set logLevel=debug \
   "${auth[@]}" \
   | kc "$cluster" -n "$NS" apply -f - >/dev/null
 # shellcheck disable=SC2016 # the literal is the variable name for envsubst
