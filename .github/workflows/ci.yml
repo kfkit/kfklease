@@ -60,6 +60,16 @@ jobs:
               echo "rendered with $bad"; exit 1
             fi
           done
+      - name: Fail closed by default, a fallback to zero replicas
+        run: |
+          so() { helm template t charts/kfklease --set brokers=k:9092 --set topic=t \
+                   --set scaledObject.targetRef.name=w "$@" -s templates/scaledobject.yaml; }
+          out=$(so)
+          echo "$out"
+          grep -A2 '^  fallback:' <<<"$out" | grep -qx '    replicas: 0' || { echo "no fallback to 0 replicas"; exit 1; }
+          if so --set scaledObject.fallback.enabled=false | grep -q 'fallback:'; then
+            echo "fallback rendered although disabled"; exit 1
+          fi
 
   # The two-cluster stand: k3s + KEDA twice and a Kafka broker, then the
   # failover scenarios. Slow, so it runs after the fast jobs pass.
