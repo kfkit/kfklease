@@ -61,7 +61,7 @@ func upsertScram(t *testing.T, mechanism kadm.ScramMechanism) {
 // expects it to hold the lease within a ttl.
 func acquiresWith(t *testing.T, bs []string, auth Auth) {
 	t.Helper()
-	c, err := NewCandidate(Config{Brokers: bs, Topic: randomTopic(t), CreateTopic: true, TTL: itTTL, Margin: itMargin, Auth: auth})
+	c, err := NewCandidate(Config{Brokers: bs, Topic: randomTopic(t), CreateTopic: true, TopicSettings: itTopic, TTL: itTTL, Margin: itMargin, Auth: auth})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func acquiresWith(t *testing.T, bs []string, auth Auth) {
 // credentials are wrong.
 func failsWith(t *testing.T, bs []string, auth Auth) {
 	t.Helper()
-	c, err := NewCandidate(Config{Brokers: bs, Topic: randomTopic(t), CreateTopic: true, TTL: itTTL, Auth: auth})
+	c, err := NewCandidate(Config{Brokers: bs, Topic: randomTopic(t), CreateTopic: true, TopicSettings: itTopic, TTL: itTTL, Auth: auth})
 	if err != nil {
 		t.Fatal(err)
 	}

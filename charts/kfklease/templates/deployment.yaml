@@ -59,6 +59,12 @@ spec:
             {{- end }}
             - name: KFKLEASE_CREATE_TOPIC
               value: {{ .Values.createTopic | quote }}
+            - name: KFKLEASE_REPLICATION_FACTOR
+              value: {{ .Values.replicationFactor | quote }}
+            - name: KFKLEASE_MIN_INSYNC_REPLICAS
+              value: {{ .Values.minInsyncReplicas | quote }}
+            - name: KFKLEASE_FLUSH_EVERY_RECORD
+              value: {{ .Values.flushEveryRecord | quote }}
             - name: KFKLEASE_LISTEN
               value: {{ printf ":%d" (int .Values.service.port) | quote }}
             - name: KFKLEASE_HTTP_LISTEN

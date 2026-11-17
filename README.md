@@ -59,6 +59,14 @@ for range c.Changed() {
 }
 ```
 
+`CreateTopic` creates a missing topic as a lease log: compacted,
+`LogAppendTime`, three replicas with `min.insync.replicas=2` and unclean
+leader election off (`Config.TopicSettings`; the chart's
+`replicationFactor`, `minInsyncReplicas` and `flushEveryRecord`). A Kafka
+cluster with fewer than three brokers needs `ReplicationFactor` set to its
+size. An existing topic is checked and never altered; see
+[The lease topic](docs/install.md#the-lease-topic).
+
 ### KEDA
 
 `kfklease-scaler` runs one participant per cluster and serves it to KEDA as an

@@ -23,6 +23,9 @@ const (
 	itMargin = 300 * time.Millisecond
 )
 
+// itTopic fits the stand's single broker.
+var itTopic = TopicSettings{ReplicationFactor: 1}
+
 func brokers(t *testing.T) []string {
 	t.Helper()
 	env := os.Getenv("KFKLEASE_BROKERS")
@@ -57,14 +60,15 @@ func start(t *testing.T, topic, holder string) *participant {
 func startGated(t *testing.T, topic, holder string, gate HealthGate) *participant {
 	t.Helper()
 	c, err := NewCandidate(Config{
-		Brokers:     brokers(t),
-		Topic:       topic,
-		CreateTopic: true,
-		Holder:      holder,
-		TTL:         itTTL,
-		Margin:      itMargin,
-		Health:      gate,
-		Logger:      slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		Brokers:       brokers(t),
+		Topic:         topic,
+		CreateTopic:   true,
+		TopicSettings: itTopic,
+		Holder:        holder,
+		TTL:           itTTL,
+		Margin:        itMargin,
+		Health:        gate,
+		Logger:        slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	})
 	if err != nil {
 		t.Fatal(err)

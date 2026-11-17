@@ -20,6 +20,20 @@ and this project adheres to
   scaler is gone no longer keeps running the workload while another cluster
   takes the lease. To keep the old behaviour, set
   `scaledObject.fallback.enabled=false`.
+- A topic created by `createTopic` (chart), `-create-topic` (binary) or
+  `Config.CreateTopic` (library) gets three replicas, where it used to get
+  the broker's `default.replication.factor`. On a Kafka cluster with fewer
+  than three brokers the scaler now exits with "replicationFactor 3, but
+  the cluster has N brokers" instead of creating the topic. Set
+  `replicationFactor` (chart), `-replication-factor` /
+  `KFKLEASE_REPLICATION_FACTOR` (binary) or
+  `Config.TopicSettings.ReplicationFactor` (library) to the number of
+  brokers. Existing topics are not touched.
+- Library: `lease.EnsureTopic` takes a `lease.TopicSettings` and returns the
+  warnings about an existing topic:
+  `EnsureTopic(ctx, cl, topic, ttl, settings) ([]string, error)` where it
+  was `EnsureTopic(ctx, cl, topic, ttl) error`. Pass
+  `lease.TopicSettings{}` for the defaults and log or ignore the warnings.
 
 ### Added
 
@@ -51,6 +65,17 @@ and this project adheres to
   is required when the scaler serves more than one. `GET /status?topic=`
   picks the lease, and `/status` carries a `topic` field. Library:
   `scaler.Lease`, `scaler.NewLeases`, `scaler.NewHTTPLeases`.
+
+- The lease topic is created with settings chosen for a lease log:
+  `min.insync.replicas` 2 with three or more replicas (`minInsyncReplicas`,
+  `-min-insync-replicas`), `unclean.leader.election.enable=false`, and
+  `segment.ms` equal to `min.compaction.lag.ms`, so that a new participant
+  does not read a week of renewals. Optional `flush.messages=1`
+  (`flushEveryRecord`, `-flush-every-record`), off by default.
+- An existing lease topic is checked at start: fewer replicas than asked
+  for, `min.insync.replicas` below the expected value,
+  `unclean.leader.election.enable=true` or a `cleanup.policy` without
+  `compact` are logged as warnings. It is never altered.
 
 ### Changed
 

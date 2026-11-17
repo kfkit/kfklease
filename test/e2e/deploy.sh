@@ -47,7 +47,7 @@ esac
 
 helm_template --namespace "$NS" \
   --set image.repository=kfklease-scaler --set image.tag=dev --set image.pullPolicy=Never \
-  --set topic=kfklease-e2e --set ttl="${TTL}s" \
+  --set topic=kfklease-e2e --set ttl="${TTL}s" --set replicationFactor=1 \
   --set holderPrefix="$cluster" --set scaledObject.targetRef.name=singleton \
   --set scaledObject.replicas="${REPLICAS:-1}" --set logLevel=debug \
   "${auth[@]}" \

@@ -14,10 +14,12 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -59,6 +61,19 @@ func envDuration(name string, def time.Duration) time.Duration {
 	return d
 }
 
+func envInt(name string, def int) int {
+	v, ok := os.LookupEnv(name)
+	if !ok {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", name, err)
+		os.Exit(2)
+	}
+	return n
+}
+
 func run() error {
 	var (
 		brokers     = flag.String("brokers", env("KFKLEASE_BROKERS", ""), "comma-separated bootstrap addresses (KFKLEASE_BROKERS)")
@@ -66,7 +81,10 @@ func run() error {
 		holder      = flag.String("holder", env("KFKLEASE_HOLDER", ""), "holder id, unique per process; empty for hostname/random (KFKLEASE_HOLDER)")
 		ttl         = flag.Duration("ttl", envDuration("KFKLEASE_TTL", 10*time.Second), "lease ttl, the same for all participants (KFKLEASE_TTL)")
 		margin      = flag.Duration("margin", envDuration("KFKLEASE_MARGIN", 0), "safety margin subtracted from the holder's deadline; 0 for ttl/5 (KFKLEASE_MARGIN)")
-		createTopic = flag.Bool("create-topic", env("KFKLEASE_CREATE_TOPIC", "true") == "true", "create the topic if missing (KFKLEASE_CREATE_TOPIC)")
+		createTopic = flag.Bool("create-topic", env("KFKLEASE_CREATE_TOPIC", "true") == "true", "create the topic if missing, check it if it exists (KFKLEASE_CREATE_TOPIC)")
+		replicas    = flag.Int("replication-factor", envInt("KFKLEASE_REPLICATION_FACTOR", lease.DefaultReplicationFactor), "replication factor of a topic created by -create-topic; never lowered to fit the cluster (KFKLEASE_REPLICATION_FACTOR)")
+		minISR      = flag.Int("min-insync-replicas", envInt("KFKLEASE_MIN_INSYNC_REPLICAS", 0), "min.insync.replicas of a created topic; 0 for 2 with three or more replicas, otherwise 1 (KFKLEASE_MIN_INSYNC_REPLICAS)")
+		flushEvery  = flag.Bool("flush-every-record", env("KFKLEASE_FLUSH_EVERY_RECORD", "false") == "true", "create the topic with flush.messages=1: fsync every record before it is acknowledged (KFKLEASE_FLUSH_EVERY_RECORD)")
 		listen      = flag.String("listen", env("KFKLEASE_LISTEN", ":9090"), "gRPC listen address (KFKLEASE_LISTEN)")
 		httpListen  = flag.String("http-listen", env("KFKLEASE_HTTP_LISTEN", ":9091"), "HTTP listen address for /metrics, /status and /healthz; empty to disable (KFKLEASE_HTTP_LISTEN)")
 		logLevel    = flag.String("log-level", env("KFKLEASE_LOG_LEVEL", "info"), "debug, info, warn or error (KFKLEASE_LOG_LEVEL)")
@@ -103,6 +121,9 @@ func run() error {
 	if *brokers == "" || *topic == "" {
 		return errors.New("brokers and topic are required")
 	}
+	if *replicas < 1 || *replicas > math.MaxInt16 || *minISR < 0 {
+		return fmt.Errorf("replication factor %d or min insync replicas %d out of range", *replicas, *minISR)
+	}
 	topics := strings.Split(*topic, ",")
 	urls := make([]string, len(topics))
 	if *healthURL != "" {
@@ -120,9 +141,14 @@ func run() error {
 	base := lease.Config{
 		Brokers:     strings.Split(*brokers, ","),
 		CreateTopic: *createTopic,
-		Holder:      *holder,
-		TTL:         *ttl,
-		Margin:      *margin,
+		TopicSettings: lease.TopicSettings{
+			ReplicationFactor: int16(*replicas),
+			MinInsyncReplicas: *minISR,
+			FlushEveryRecord:  *flushEvery,
+		},
+		Holder: *holder,
+		TTL:    *ttl,
+		Margin: *margin,
 		Auth: lease.Auth{
 			TLS: lease.TLS{
 				Enabled: *tlsEnabled,
