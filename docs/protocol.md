@@ -79,6 +79,14 @@ and may even be accepted, but the writer no longer acts on that term.
 A candidate may claim whenever it likes. A premature claim is simply rejected
 by the fold; it costs a record, not safety.
 
+The same freedom covers giving up. With a health gate
+(`lease.Config.Health`), a holder whose workload has not been reported
+healthy for `FailAfter`, counted from the later of the start of its term
+and the last healthy report, drops its belief at once, writes a release
+when rule 2 lets it, and claims nothing for `Cooldown`. Dropping a belief
+early and claiming later are both on the safe side of rules 4 and 5; the
+fold does not change.
+
 ## The margin
 
 Two clocks can disagree with the broker's and stretch the belief past the
@@ -160,7 +168,16 @@ both the acknowledgement and the read-back, in either order; a record the
 client gave up on is never taken for the one in flight; a term that ended in
 the log ends the belief; nothing is written on an uncertain view; silence is
 measured only while fetches succeed; a hole makes the view uncertain; a
-release drops the belief before the record is written.
+release drops the belief before the record is written; the health gate
+counts from the start of the term, drops the belief when it fires, waits
+for the record in flight before releasing, and holds claims back for the
+cooldown.
+
+A third run of the simulation turns the health gate on, with workloads that
+go up and down every twenty TTLs or so: no overlap, no holder believing
+longer than `FailAfter` past its last healthy report or the start of its
+term, no claim within the cooldown, and the gate firing several times per
+run.
 
 Breaking a rule in `view.go` or `agent.go` (trusting a lone renew, reviving a
 term with a late renew, halving the silence period, taking the deadline from

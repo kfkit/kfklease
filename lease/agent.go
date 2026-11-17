@@ -36,6 +36,16 @@ type agent struct {
 	lastSend    time.Time
 	nextClaimAt time.Time
 
+	// The health gate, on the monotonic clock. heldSince is when the
+	// current term was acquired, lastHealthy the last time the workload was
+	// reported healthy. standbyUntil holds claims back after the gate
+	// released the lease; releaseDue is that release, waiting for its turn
+	// under the one-request-in-flight rule.
+	heldSince    time.Time
+	lastHealthy  time.Time
+	standbyUntil time.Time
+	releaseDue   bool
+
 	// Silence bookkeeping, all on the monotonic clock.
 	connected    bool
 	fetchedOnce  bool
@@ -196,6 +206,7 @@ func (a *agent) settle(now time.Time, out Outcome) {
 	case in.kind == Claim && out == Accepted:
 		a.epoch = in.offset
 		a.extendBelief(in.sentAt)
+		a.heldSince = now
 		a.log.Info("acquired", "epoch", a.epoch)
 	case in.kind == Claim:
 		s := a.view.State()
@@ -237,6 +248,40 @@ func (a *agent) brokerNow(now time.Time) time.Time {
 	return a.lastRecordBroker.Add(now.Sub(a.lastRecordAt))
 }
 
+// healthy reports that the workload was seen healthy at now.
+func (a *agent) healthy(now time.Time) {
+	if now.After(a.lastHealthy) {
+		a.lastHealthy = now
+	}
+}
+
+// unhealthyFor is how long the holder's workload has gone without a healthy
+// report, counted from the later of the start of the term and the last
+// report: a workload gets FailAfter to come up in a new term.
+func (a *agent) unhealthyFor(now time.Time) time.Duration {
+	since := a.heldSince
+	if a.lastHealthy.After(since) {
+		since = a.lastHealthy
+	}
+	return now.Sub(since)
+}
+
+// checkHealth applies the health gate: a holder whose workload has gone
+// unhealthy for FailAfter stops believing at once, owes the log a release,
+// and claims nothing for Cooldown.
+func (a *agent) checkHealth(now time.Time) {
+	gate := a.cfg.Health
+	if gate.FailAfter <= 0 || !a.believing(now) {
+		return
+	}
+	if d := a.unhealthyFor(now); d >= gate.FailAfter {
+		a.log.Warn("workload unhealthy, releasing", "epoch", a.epoch, "unhealthy_for", d, "cooldown", gate.Cooldown)
+		a.dropBelief()
+		a.standbyUntil = now.Add(gate.Cooldown)
+		a.releaseDue = true
+	}
+}
+
 // tick measures silence, expires the belief and decides what to write. The
 // returned record, if any, is to be produced now; the agent counts it as
 // sent at now.
@@ -245,6 +290,7 @@ func (a *agent) tick(now time.Time) (Record, bool) {
 		a.log.Warn("deadline passed without renewal", "epoch", a.epoch)
 		a.dropBelief()
 	}
+	a.checkHealth(now)
 
 	if a.connected && a.nextOffset >= a.highWater && !a.view.Certain() {
 		since := a.caughtUpAt
@@ -260,11 +306,16 @@ func (a *agent) tick(now time.Time) (Record, bool) {
 		return Record{}, false
 	}
 	switch {
+	case a.releaseDue:
+		// The belief is gone already; the record only lets the others
+		// take over without waiting for the term to run out.
+		a.releaseDue = false
+		return a.send(now, Release), true
 	case a.believing(now):
 		if now.Sub(a.lastSend) >= a.cfg.RenewEvery {
 			return a.send(now, Renew), true
 		}
-	case now.After(a.nextClaimAt) && !a.view.State().HeldAt(a.brokerNow(now)):
+	case now.After(a.nextClaimAt) && !now.Before(a.standbyUntil) && !a.view.State().HeldAt(a.brokerNow(now)):
 		return a.send(now, Claim), true
 	}
 	return Record{}, false
@@ -305,6 +356,9 @@ func (a *agent) status(now time.Time) (s Status, deadline time.Time, epoch int64
 	}
 	if a.believing(now) {
 		deadline = a.deadline
+	}
+	if now.Before(a.standbyUntil) {
+		s.CooldownUntil = a.standbyUntil
 	}
 	return s, deadline, a.epoch
 }

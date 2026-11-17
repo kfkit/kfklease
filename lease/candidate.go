@@ -46,6 +46,10 @@ type Config struct {
 	// RenewEvery is how often a holder renews. Zero means TTL / 3.
 	RenewEvery time.Duration
 
+	// Health is an optional gate on the workload's health, fed by
+	// Candidate.ReportHealthy. The zero value turns it off.
+	Health HealthGate
+
 	// Auth is how the client authenticates to the brokers: TLS, mTLS, SASL.
 	// The zero value is plaintext.
 	Auth Auth
@@ -56,6 +60,21 @@ type Config struct {
 	// protocol and Auth set: dial timeouts, other SASL mechanisms and the
 	// like.
 	ClientOpts []kgo.Opt
+}
+
+// HealthGate makes a holder give the lease up when its workload is not
+// healthy. A holder whose workload has not been reported healthy for
+// FailAfter, counted from the later of the start of its term and the last
+// healthy report, releases the lease and claims nothing for Cooldown.
+type HealthGate struct {
+	// FailAfter is how long a holder's workload may go without a healthy
+	// report. It is also the time a workload has to come up in a new term.
+	// Zero turns the gate off.
+	FailAfter time.Duration
+	// Cooldown is how long the participant stays out after such a release,
+	// so that the lease does not come straight back to a workload that
+	// cannot run here. Required with FailAfter.
+	Cooldown time.Duration
 }
 
 func (c Config) withDefaults() (Config, error) {
@@ -79,6 +98,12 @@ func (c Config) withDefaults() (Config, error) {
 	}
 	if c.RenewEvery == 0 {
 		c.RenewEvery = c.TTL / 3
+	}
+	if c.Health.FailAfter < 0 || c.Health.Cooldown < 0 {
+		return c, errors.New("lease: negative health fail-after or cooldown")
+	}
+	if c.Health.FailAfter > 0 && c.Health.Cooldown == 0 {
+		return c, errors.New("lease: a health gate needs a cooldown")
 	}
 	if c.Margin+c.RenewEvery >= c.TTL {
 		return c, fmt.Errorf("lease: margin %v + renew interval %v must stay below ttl %v", c.Margin, c.RenewEvery, c.TTL)
@@ -125,6 +150,11 @@ type Status struct {
 	// its own deadline.
 	Lease State
 	AsOf  time.Time
+
+	// CooldownUntil is when this participant may claim again after the
+	// health gate released the lease, on the local monotonic clock; zero
+	// unless it is waiting.
+	CooldownUntil time.Time
 }
 
 // Candidate takes part in a lease: it follows the log, claims the lease when
@@ -145,6 +175,9 @@ type Candidate struct {
 	// frozen process waking up) never reports a belief it has outlived.
 	deadline time.Time
 	epoch    int64
+
+	// healthyAt is the last ReportHealthy, for the loop to pick up.
+	healthyAt time.Time
 
 	// testCrash makes Run return at once, without a release, when closed.
 	testCrash <-chan struct{}
@@ -173,12 +206,31 @@ func (c *Candidate) Status() Status {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	s := c.status
-	if !c.deadline.IsZero() && time.Now().Before(c.deadline) {
+	now := time.Now()
+	if !c.deadline.IsZero() && now.Before(c.deadline) {
 		s.Holding = true
 		s.Epoch = c.epoch
 		s.Deadline = c.deadline
 	}
+	if !now.Before(s.CooldownUntil) {
+		s.CooldownUntil = time.Time{}
+	}
 	return s
+}
+
+// ReportHealthy tells the health gate that the workload was seen healthy
+// just now. Without Config.Health it does nothing.
+func (c *Candidate) ReportHealthy() {
+	now := time.Now()
+	c.mu.Lock()
+	c.healthyAt = now
+	c.mu.Unlock()
+}
+
+func (c *Candidate) lastHealthy() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.healthyAt
 }
 
 // Changed is signalled whenever Status changes. Signals coalesce: a receiver
@@ -354,6 +406,9 @@ func (r *run) loop(ctx context.Context) error {
 		default:
 		}
 
+		if t := r.c.lastHealthy(); !t.IsZero() {
+			r.a.healthy(t)
+		}
 		now := time.Now()
 		if rec, ok := r.a.tick(now); ok {
 			r.produce(ctx, rec)

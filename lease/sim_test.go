@@ -63,13 +63,23 @@ type simParams struct {
 	// runs at a rate drawn from [1-clientDrift, 1+clientDrift].
 	clientDrift float64
 	margin      time.Duration
+	// health turns the health gate on, with workloads that go up and down.
+	health bool
 }
+
+const (
+	simFailAfter = 3 * simTTL
+	simCooldown  = 5 * simTTL
+)
 
 func (p simParams) config(holder string) Config {
 	cfg, err := Config{
 		Brokers: []string{"fake"}, Topic: "fake", Holder: holder,
 		TTL: simTTL, Margin: max(p.margin, time.Nanosecond), RenewEvery: simTTL / 3,
 	}.withDefaults()
+	if p.health {
+		cfg.Health = HealthGate{FailAfter: simFailAfter, Cooldown: simCooldown}
+	}
 	if err != nil {
 		panic(err)
 	}
@@ -90,6 +100,58 @@ type simNode struct {
 	// compacted marks records a late joiner never sees: compaction removed
 	// them before it started, leaving holes in the offsets.
 	compacted map[int]bool
+
+	// The health gate, observed from outside on the node's clock:
+	// workloadUp is whether its workload would pass a probe, heldFrom and
+	// droppedAt when the node last started and stopped believing,
+	// lastReport its last healthy report, trippedAt when the gate last
+	// took the lease away.
+	workloadUp bool
+	believed   bool
+	heldFrom   time.Time
+	droppedAt  time.Time
+	lastReport time.Time
+	trippedAt  time.Time
+}
+
+// simStats counts what happened in one run.
+type simStats struct {
+	gateReleases int
+}
+
+// checkGate holds a node to the health gate after a tick at local time:
+// it believes only while its workload was healthy within FailAfter, counted
+// from the start of its term, and it claims nothing within the cooldown
+// after the gate took the lease away. Only the gate makes tick return a
+// release, and the belief went at the tick that tripped it, which may be
+// well before the release goes out (a record in flight, an uncertain view).
+func (n *simNode) checkGate(t *testing.T, seed uint64, local time.Time, rec Record, sent bool, st *simStats) {
+	t.Helper()
+	believing := n.a.believing(local)
+	if believing && !n.believed {
+		n.heldFrom = local
+	}
+	if !believing && n.believed {
+		n.droppedAt = local
+	}
+	n.believed = believing
+	since := n.heldFrom
+	if n.lastReport.After(since) {
+		since = n.lastReport
+	}
+	if believing && local.Sub(since) >= simFailAfter+simStep {
+		t.Fatalf("seed %d, t=%v: holder unhealthy for %v still believes", seed, local.Sub(t0), local.Sub(since))
+	}
+	if !sent {
+		return
+	}
+	switch {
+	case rec.Kind == Release:
+		n.trippedAt = n.droppedAt
+		st.gateReleases++
+	case rec.Kind == Claim && !n.trippedAt.IsZero() && local.Before(n.trippedAt.Add(simCooldown)):
+		t.Fatalf("seed %d, t=%v: claim %v after the gate tripped", seed, local.Sub(t0), local.Sub(n.trippedAt))
+	}
 }
 
 func simTime(ms int64) time.Time { return t0.Add(time.Duration(ms) * time.Millisecond) }
@@ -107,6 +169,11 @@ func simRate(rng *rand.Rand, p simParams) float64 {
 // runSim returns the log of one run and the real time of the first instant
 // at which two agents believed they held the lease, or zero.
 func runSim(t *testing.T, seed uint64, p simParams) (records []Record, overlapAt time.Time) {
+	records, overlapAt, _ = runSimStats(t, seed, p)
+	return records, overlapAt
+}
+
+func runSimStats(t *testing.T, seed uint64, p simParams) (records []Record, overlapAt time.Time, st simStats) {
 	t.Helper()
 	rng := rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
 	log := slog.New(slog.DiscardHandler)
@@ -185,6 +252,17 @@ func runSim(t *testing.T, seed uint64, p simParams) (records []Record, overlapAt
 				continue
 			}
 			local := n.local(now)
+			if p.health {
+				// Workloads come and go every twenty TTLs or so, and are
+				// probed every step: a report counts only while up.
+				if rng.Float64() < 0.0005 {
+					n.workloadUp = !n.workloadUp
+				}
+				if n.workloadUp {
+					n.a.healthy(local)
+					n.lastReport = local
+				}
+			}
 			if rng.Float64() < 0.001 {
 				n.partitionedUntil = now.Add(time.Duration(rng.Int64N(int64(2 * simTTL))))
 			}
@@ -196,7 +274,11 @@ func runSim(t *testing.T, seed uint64, p simParams) (records []Record, overlapAt
 			}
 			if now.Before(n.partitionedUntil) {
 				n.a.fetchFailed(errSimTimeout)
-				if _, ok := n.a.tick(local); ok {
+				rec, ok := n.a.tick(local)
+				if p.health {
+					n.checkGate(t, seed, local, rec, ok, &st)
+				}
+				if ok {
 					// Sent into the void; the client gives up after a ttl.
 					n.acks = append(n.acks, simAck{at: now.Add(simTTL), err: errSimTimeout})
 				}
@@ -225,6 +307,9 @@ func runSim(t *testing.T, seed uint64, p simParams) (records []Record, overlapAt
 				rec, ok = n.a.release(local)
 			} else {
 				rec, ok = n.a.tick(local)
+				if p.health {
+					n.checkGate(t, seed, local, rec, ok, &st)
+				}
 			}
 			if !ok {
 				continue
@@ -245,7 +330,7 @@ func runSim(t *testing.T, seed uint64, p simParams) (records []Record, overlapAt
 			wire = append(wire, &simMsg{from: n, landAt: now.Add(simStep + delay), rec: rec})
 		}
 	}
-	return records, overlapAt
+	return records, overlapAt, st
 }
 
 func TestSimulationSafetyAndAgreement(t *testing.T) {
@@ -351,5 +436,38 @@ func TestSimulationClockSkewNeedsMargin(t *testing.T) {
 				t.Fatalf("the imperfect clocks never caused an overlap: the model does not bite")
 			}
 		})
+	}
+}
+
+// The health gate on top of everything else: workloads that go down and
+// come back, holders that release because of it and stay out for the
+// cooldown. Safety still holds, an unhealthy holder lets go within
+// FailAfter (checkGate), and the gate actually fires.
+func TestSimulationHealthGate(t *testing.T) {
+	seeds := 100
+	if testing.Short() {
+		seeds = 20
+	}
+	var releases, terms int
+	for seed := uint64(1); seed <= uint64(seeds); seed++ {
+		records, overlapAt, st := runSimStats(t, seed, simParams{health: true})
+		if !overlapAt.IsZero() {
+			t.Fatalf("seed %d, t=%v: two agents believe they hold the lease", seed, overlapAt.Sub(t0))
+		}
+		releases += st.gateReleases
+		ref := NewViewFromStart(simTTL)
+		for _, r := range records {
+			out, err := ref.Apply(r)
+			if err != nil {
+				t.Fatalf("seed %d: %v", seed, err)
+			}
+			if out == Accepted && r.Kind == Claim {
+				terms++
+			}
+		}
+	}
+	t.Logf("%d runs: %d terms, %d releases by the health gate", seeds, terms, releases)
+	if releases < seeds*5 || terms < seeds*10 {
+		t.Fatalf("the gate is too tame to mean anything: %d releases, %d terms", releases, terms)
 	}
 }

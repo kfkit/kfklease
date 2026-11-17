@@ -23,6 +23,8 @@ func TestConfigDefaults(t *testing.T) {
 		{Brokers: []string{"b"}, Topic: "t"},
 		{Brokers: []string{"b"}, Topic: "t", TTL: time.Second, Partition: -1},
 		{Brokers: []string{"b"}, Topic: "t", TTL: time.Second, Margin: 600 * time.Millisecond, RenewEvery: 500 * time.Millisecond},
+		{Brokers: []string{"b"}, Topic: "t", TTL: time.Second, Health: HealthGate{FailAfter: time.Minute}},
+		{Brokers: []string{"b"}, Topic: "t", TTL: time.Second, Health: HealthGate{FailAfter: -time.Minute, Cooldown: time.Minute}},
 	}
 	for i, b := range bad {
 		if _, err := b.withDefaults(); err == nil {
@@ -48,5 +50,36 @@ func TestStatusHoldingExpiresWithoutTheLoop(t *testing.T) {
 	time.Sleep(60 * time.Millisecond)
 	if s := c.Status(); s.Holding || s.Epoch != 0 || !s.Certain {
 		t.Fatalf("after the deadline, with no loop running: %+v", s)
+	}
+}
+
+func TestStatusCooldownExpiresWithoutTheLoop(t *testing.T) {
+	c, err := NewCandidate(Config{Brokers: []string{"b:9092"}, Topic: "t", TTL: 10 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	until := time.Now().Add(50 * time.Millisecond)
+	c.setStatus(Status{Certain: true, CooldownUntil: until}, time.Time{}, -1)
+	if s := c.Status(); !s.CooldownUntil.Equal(until) || s.Holding {
+		t.Fatalf("during the cooldown: %+v", s)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if s := c.Status(); !s.CooldownUntil.IsZero() {
+		t.Fatalf("after the cooldown, with no loop running: %+v", s)
+	}
+}
+
+func TestReportHealthyReachesTheLoop(t *testing.T) {
+	c, err := NewCandidate(Config{Brokers: []string{"b:9092"}, Topic: "t", TTL: 10 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.lastHealthy().IsZero() {
+		t.Fatal("healthy before any report")
+	}
+	before := time.Now()
+	c.ReportHealthy()
+	if got := c.lastHealthy(); got.Before(before) {
+		t.Fatalf("last healthy %v, before the report at %v", got, before)
 	}
 }
