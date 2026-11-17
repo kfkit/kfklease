@@ -72,6 +72,10 @@ and this project adheres to
   `segment.ms` equal to `min.compaction.lag.ms`, so that a new participant
   does not read a week of renewals. Optional `flush.messages=1`
   (`flushEveryRecord`, `-flush-every-record`), off by default.
+- Metric `kfklease_lease_holder_info{holder,site}`: 1 for the holder the
+  log names, reported by every participant, so any cluster's scaler says
+  where the lease is. `site` is the holder id up to its last slash (the
+  chart's `holderPrefix`).
 - An existing lease topic is checked at start: fewer replicas than asked
   for, `min.insync.replicas` below the expected value,
   `unclean.leader.election.enable=true` or a `cleanup.policy` without

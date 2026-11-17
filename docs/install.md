@@ -329,6 +329,7 @@ serving [several](#several-leases-one-scaler) stay apart.
 | `kfklease_certain` | 1 when the scaler's view of the log can be trusted; 0 right after a start on a compacted topic, until it settles |
 | `kfklease_lease_held` | 1 when the log says someone holds the lease |
 | `kfklease_lease_as_of_seconds` | broker time of the last record seen |
+| `kfklease_lease_holder_info{holder,site}` | 1 for the holder the log names, on every participant, the standbys too; no series while nobody holds the lease or the view is not certain. `site` is the holder id up to its last slash, the `holderPrefix` under the chart |
 | `kfklease_transitions_total{to}` | handovers into (`holding`) and out of (`standby`) the lease |
 | `kfklease_health_cooldown_seconds` | seconds until this participant may claim again after the [health gate](#when-the-workload-cannot-run-here) gave the lease up; 0 otherwise |
 
@@ -336,7 +337,8 @@ Alerts worth having: `sum by (topic) (kfklease_holding) != 1` across the
 clusters for longer than a TTL (nobody, or more than one, holds it),
 `kfklease_certain == 0` for longer than two TTLs (the scaler cannot settle
 its view: check its connection to Kafka), and a rising
-`kfklease_transitions_total` (flapping).
+`kfklease_transitions_total` (flapping). Where the workload runs:
+`max by (topic, site) (kfklease_lease_holder_info)`.
 
 ## When the scaler is gone
 

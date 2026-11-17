@@ -139,6 +139,7 @@ The scaler serves HTTP on `:9091` (`service.httpPort`):
 - `/metrics`, Prometheus: `kfklease_holding`, `kfklease_epoch`,
   `kfklease_belief_remaining_seconds`, `kfklease_certain`,
   `kfklease_lease_held`, `kfklease_lease_as_of_seconds`,
+  `kfklease_lease_holder_info{holder,site}` (who holds it, as the log says),
   `kfklease_health_cooldown_seconds` and
   `kfklease_transitions_total{to="holding"|"standby"}`. The pod carries
   `prometheus.io/*` annotations; `metrics.serviceMonitor.enabled` adds a
