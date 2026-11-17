@@ -89,6 +89,7 @@ jobs:
           for c in k3s-a k3s-b; do
             kubectl --kubeconfig test/e2e/.out/$c/kubeconfig.yaml -n kfklease get pods,scaledobject || true
             kubectl --kubeconfig test/e2e/.out/$c/kubeconfig.yaml -n kfklease logs deploy/kfklease --tail=50 || true
+            kubectl --kubeconfig test/e2e/.out/$c/kubeconfig.yaml -n keda logs deploy/keda-operator --tail=30 || true
           done
       - if: always()
         run: docker compose -f test/e2e/compose.yaml down -v

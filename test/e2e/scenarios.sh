@@ -257,19 +257,46 @@ scenario_replicas() {
   echo "   ok: back to ${want} replica in ${t}s"
 }
 
+# scaler_service <cluster> on|off adds a selector term no pod has to the
+# scaler's Service, or takes it away. Off, the Service has no endpoint and
+# kube-proxy refuses new connections to it: what KEDA sees when the scaler
+# pod is gone. Waits until kube-proxy has the rule.
+scaler_service() {
+  local cluster=$1 t0
+  case "$2" in
+    off)
+      kc "$cluster" -n "$NS" patch service "$RELEASE" --type=merge \
+        -p '{"spec":{"selector":{"kfklease-e2e/scaler-down":"true"}}}' >/dev/null
+      t0=$(date +%s)
+      # Not a pipe into grep -q: with pipefail, an early exit is a failure.
+      until grep -qF "${NS}/${RELEASE}:grpc has no endpoints" \
+          <<<"$(docker compose exec -T "$cluster" iptables -t filter -S)"; do
+        (( $(date +%s) - t0 < 30 )) || { echo "FAILED: kube-proxy kept the scaler's endpoint" >&2; return 1; }
+        sleep 1
+      done
+      ;;
+    on)
+      kc "$cluster" -n "$NS" patch service "$RELEASE" --type=merge \
+        -p '{"spec":{"selector":{"kfklease-e2e/scaler-down":null}}}' >/dev/null
+      ;;
+  esac
+}
+
 scenario_scaler_down() {
   echo "== scaler-down: the holder's scaler is gone, its workload pods are not"
   local h o since
   h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
-  # KEDA first, so that it never hears the scaler's last word and only the
-  # fallback can stop the workload; then Kafka, so that the term runs out
-  # and the other cluster takes the lease, as when the scaler's node is
-  # lost. Without the fallback the holder's pod stays and this times out.
-  ./partition.sh cut "$h" scaler
+  # The scaler goes without a word, as with a lost node: KEDA can no longer
+  # reach it, it can no longer reach Kafka, and it is killed, which writes
+  # no release and resets KEDA's open connection to it. The kubelet's
+  # restart of the container reaches neither. Only the fallback can stop
+  # the holder's workload now; without it this times out.
+  scaler_service "$h" off
   ./partition.sh cut "$h"
+  docker compose exec -T "$h" sh -c 'k3s crictl stop --timeout 0 $(k3s crictl ps -q --name "^scaler$")' >/dev/null
   echo "   ${h} -> ${o}: $(transition "$h" "$o" $(( 3 * TTL ))) (ttl ${TTL}s)"
   ./partition.sh heal "$h"
-  ./partition.sh heal "$h" scaler
+  scaler_service "$h" on
   watch_exclusive $(( 2 * TTL ))
   [[ $(holder) == "$o" ]] || { echo "FAILED: lease moved back after the scaler returned" >&2; return 1; }
   heartbeats "$since"

@@ -31,8 +31,9 @@ and this project adheres to
   only a Deployment.
 - Stand: the `replicas` scenario, three workload pods where the lease is
   held, failed over by a partition.
-- Stand: the `scaler-down` scenario, KEDA cut off from the holder's scaler
-  and the holder cut off from Kafka; `partition.sh` takes a `scaler` target.
+- Stand: the `scaler-down` scenario: the holder's scaler loses its Service
+  endpoint and Kafka and is killed without a release, and its workload must
+  stop on its own.
 - Docs: "When the scaler is gone" in docs/install.md, with the bound on how
   soon the old cluster stops on its own.
 
