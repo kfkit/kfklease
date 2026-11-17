@@ -44,6 +44,20 @@ and this project adheres to
 - Metric `kfklease_health_cooldown_seconds`, field
   `health_cooldown_in_seconds` in `/status`, and `Status.CooldownUntil` in
   the library.
+- Several leases, one per topic, served by one scaler: chart value
+  `extraLeases`, one ScaledObject per lease; binary `-topic a,b,c`
+  (`KFKLEASE_TOPIC`) with `-health-url` taking one URL per topic. A
+  ScaledObject names its lease with `topic` in the trigger metadata, which
+  is required when the scaler serves more than one. `GET /status?topic=`
+  picks the lease, and `/status` carries a `topic` field. Library:
+  `scaler.Lease`, `scaler.NewLeases`, `scaler.NewHTTPLeases`.
+
+### Changed
+
+- The scaler's lease metrics carry a `topic` label
+  (`kfklease_holding{topic="orders"}`). Queries that select or sum without
+  naming labels work as before; an alert on `sum(kfklease_holding)` over
+  several leases should become `sum by (topic) (kfklease_holding)`.
 
 ### Fixed
 

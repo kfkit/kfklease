@@ -55,7 +55,7 @@ helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.3.0 \
 | Value | Meaning |
 |---|---|
 | `brokers` | bootstrap addresses, comma-separated |
-| `topic` | the lease. One lease per topic; a workload that needs its own lease needs its own topic and its own release |
+| `topic` | the lease. One lease per topic; more leases, each with its own workload, go in `extraLeases` (see [Several leases, one scaler](#several-leases-one-scaler)) |
 | `holderPrefix` | names the cluster in holder ids (`eu-west/<pod>`), in logs and on the topic. Defaults to the release name |
 | `ttl` | how long a term lasts without renewal, `10s` by default. The same for every participant of a lease |
 | `margin` | how much earlier than the term's end the holder stops believing, `ttl/5` by default; see [Choosing TTL and margin](#choosing-ttl-and-margin) |
@@ -85,12 +85,67 @@ curl http://kfklease.kfklease.svc:9091/status        # from inside the cluster
 The scaler pods of the standby clusters log `joined` and then nothing much
 until a takeover. That is correct.
 
+### Several leases, one scaler
+
+Workloads that fail over independently, three Kafka Connect clusters and a
+MirrorMaker 2, say, need a lease each, but not a scaler each. List the
+others under `extraLeases`; the scaler takes part in every lease, one per
+topic, and the chart writes one ScaledObject per lease:
+
+```yaml
+topic: connect-orders
+scaledObject:
+  targetRef:
+    apiVersion: kafka.strimzi.io/v1beta2
+    kind: KafkaConnect
+    name: orders
+  replicas: 3
+extraLeases:
+  - topic: connect-billing
+    scaledObject:
+      targetRef:
+        apiVersion: kafka.strimzi.io/v1beta2
+        kind: KafkaConnect
+        name: billing
+      replicas: 5
+    healthGate:
+      url: http://billing-connect-api:8083/
+  - topic: mm2-eu-us
+    scaledObject:
+      targetRef:
+        apiVersion: kafka.strimzi.io/v1beta2
+        kind: KafkaMirrorMaker2
+        name: eu-us
+```
+
+Each entry's `scaledObject` is merged over the top-level one, so
+`pollingInterval`, `cooldownPeriod`, `fallback`, `replicas` and the target's
+`kind` and `apiVersion` carry over unless the entry sets them; the target's
+`name` is the entry's own and required. `ttl`, `margin`, `holderPrefix`,
+`auth` and the [health gate](#when-the-workload-cannot-run-here) timings are
+the same for every lease; `healthGate.url` is per lease, and a lease without
+one has no gate. Topics must differ, and so must the targets.
+
+The leases are independent: each has its own terms, epochs and holder, and
+one cluster may hold some of them while another holds the rest. They share
+the scaler pod, though, so they share its fate: when it restarts or is gone,
+every lease it serves is released or runs out, and with `fallback` every
+workload it scales goes to zero. Workloads that must not move together
+belong in separate releases.
+
+Without the chart, give the binary the topics comma-separated
+(`-topic connect-orders,connect-billing` or `KFKLEASE_TOPIC`) and, for the
+health gate, the URLs in the same order with an empty entry for a lease
+without a gate (`-health-url ,http://billing-connect-api:8083/`).
+
 ### Your own ScaledObject
 
 With `scaledObject.enabled=false`, point a ScaledObject at the scaler
-yourself. The trigger is `external-push`; `topic` in the metadata is
-optional and only checked against the scaler's topic, which catches a
-ScaledObject aimed at the wrong release:
+yourself. The trigger is `external-push`; `topic` in the metadata
+names the lease. With one lease it is optional and only checked against the
+scaler's topic, which catches a ScaledObject aimed at the wrong release;
+with several it is required, and a topic the scaler does not serve is an
+error:
 
 ```yaml
 apiVersion: keda.sh/v1alpha1
@@ -201,6 +256,11 @@ The scaler exposes it at `GET /status` on port 9091:
 }
 ```
 
+It also carries the lease's `topic`. A scaler with
+[several leases](#several-leases-one-scaler) needs to be told which:
+`GET /status?topic=connect-billing`; without `topic` it answers 400 and
+names the topics it serves, and an unknown one is a 404.
+
 The pattern, in [examples/heartbeat](../examples/heartbeat):
 
 1. Before a write, ask `/status`. No `holding`, no write.
@@ -219,6 +279,9 @@ that cannot check before every write should check at least once per margin.
 `metrics.serviceMonitor.enabled=true` adds a ServiceMonitor for the
 Prometheus Operator.
 
+Every metric of a lease carries a `topic` label, so the leases of a scaler
+serving [several](#several-leases-one-scaler) stay apart.
+
 | Metric | Meaning |
 |---|---|
 | `kfklease_holding` | 1 while this participant believes it holds the lease |
@@ -230,8 +293,8 @@ Prometheus Operator.
 | `kfklease_transitions_total{to}` | handovers into (`holding`) and out of (`standby`) the lease |
 | `kfklease_health_cooldown_seconds` | seconds until this participant may claim again after the [health gate](#when-the-workload-cannot-run-here) gave the lease up; 0 otherwise |
 
-Alerts worth having: `sum(kfklease_holding) != 1` across the clusters of one
-lease for longer than a TTL (nobody, or more than one, holds it),
+Alerts worth having: `sum by (topic) (kfklease_holding) != 1` across the
+clusters for longer than a TTL (nobody, or more than one, holds it),
 `kfklease_certain == 0` for longer than two TTLs (the scaler cannot settle
 its view: check its connection to Kafka), and a rising
 `kfklease_transitions_total` (flapping).
@@ -365,9 +428,11 @@ rejects ones asking for more than the configured value.
 **Deleting the topic.** Don't, while anyone runs: the epoch is the offset,
 and a recreated topic starts from zero. Stop all scalers first.
 
-**Several workloads.** One lease per topic and one release per lease. The
-scaler serves any number of ScaledObjects that point at it, but they all
-follow the same lease.
+**Several workloads.** One lease per topic. Workloads that move together
+share a lease: any number of ScaledObjects may name the same topic.
+Workloads that move independently get a lease each, in one release with
+[`extraLeases`](#several-leases-one-scaler) or in a release each; separate
+releases also keep a scaler restart from touching the other leases.
 
 ## Troubleshooting
 

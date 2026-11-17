@@ -75,7 +75,9 @@ triggers:
 ```
 
 The chart installs the scaler, its service and that ScaledObject; one
-release per cluster. The scaler address in the ScaledObject follows the
+release per cluster. One scaler can serve several leases, one per topic,
+each with its own workload (`extraLeases`); a ScaledObject names its lease
+with `topic` in the trigger metadata. The scaler address in the ScaledObject follows the
 release name and namespace, so the same command works in every cluster with
 a different `holderPrefix`:
 
@@ -195,6 +197,7 @@ The end-to-end stand with two Kubernetes clusters is described in
 - [x] Failure-mode tests: crash, partition, freeze, broker restart
 - [x] N replicas of any scalable target; fail closed when the scaler is gone
 - [x] Optional health gate: fail over when the workload cannot run where the lease is held
+- [x] Several leases, one per topic, served by one scaler
 - [x] Failure-mode tests: clock skew and drift, in the simulation
 - [x] Example workload fencing by epoch; workload-level exclusion check on the stand
 - [x] Image and chart on GHCR, cosign-signed
