@@ -83,6 +83,28 @@ jobs:
             grep -qF "name: KFKLEASE_HEALTH_$name" <<<"$out" || { echo "missing: KFKLEASE_HEALTH_$name"; exit 1; }
           done
           grep -A1 'name: KFKLEASE_HEALTH_FAIL_AFTER' <<<"$out" | grep -qF 'value: "2m"' || { echo "failAfter not passed"; exit 1; }
+      - name: Several leases in one release, one ScaledObject each
+        run: |
+          t() { helm template t charts/kfklease --set brokers=k:9092 --set topic=a \
+                  --set scaledObject.targetRef.name=wa --set scaledObject.cooldownPeriod=7 "$@"; }
+          out=$(t --set 'extraLeases[0].topic=b' --set 'extraLeases[0].scaledObject.targetRef.name=wb' \
+                  --set 'extraLeases[0].scaledObject.targetRef.kind=KafkaConnect' \
+                  --set 'extraLeases[0].scaledObject.targetRef.apiVersion=kafka.strimzi.io/v1beta2' \
+                  --set 'extraLeases[0].scaledObject.replicas=3' --set 'extraLeases[0].healthGate.url=http://b:8083/' \
+                  --set 'extraLeases[1].topic=c' --set 'extraLeases[1].scaledObject.targetRef.name=wc')
+          echo "$out"
+          [ "$(grep -c '^kind: ScaledObject' <<<"$out")" = 3 ] || { echo "want 3 ScaledObjects"; exit 1; }
+          [ "$(grep -c '^  cooldownPeriod: 7' <<<"$out")" = 3 ] || { echo "top-level scaledObject not inherited"; exit 1; }
+          for want in 'value: "a,b,c"' 'value: ",http://b:8083/,"' 'topic: "b"' 'kind: KafkaConnect' 'minReplicaCount: 3'; do
+            grep -qF "$want" <<<"$out" || { echo "missing: $want"; exit 1; }
+          done
+          for bad in 'extraLeases[0].topic=a,extraLeases[0].scaledObject.targetRef.name=x' \
+                     'extraLeases[0].topic=b,extraLeases[0].scaledObject.targetRef.name=wa' \
+                     'extraLeases[0].topic=b' 'extraLeases[0].scaledObject.targetRef.name=x' 'topic=a\,b'; do
+            if t --set "$bad" >/dev/null; then
+              echo "rendered with $bad"; exit 1
+            fi
+          done
 
   # The two-cluster stand: k3s + KEDA twice and a Kafka broker, then the
   # failover scenarios. Slow, so it runs after the fast jobs pass.

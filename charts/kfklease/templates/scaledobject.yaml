@@ -1,15 +1,18 @@
-{{- if .Values.scaledObject.enabled }}
-{{- $so := .Values.scaledObject }}
-{{- if hasKey $so "target" }}{{ fail "scaledObject.target was renamed to scaledObject.targetRef.name" }}{{ end }}
-{{- if not $so.targetRef.name }}{{ fail "scaledObject.targetRef.name is required when scaledObject.enabled" }}{{ end }}
+{{- /* One ScaledObject per lease: the release's own (topic, scaledObject,
+healthGate.url) and every entry of extraLeases, whose scaledObject is
+merged over the top-level one. */ -}}
+{{- range $i, $l := include "kfklease.leases" . | fromYamlArray }}
+{{- $so := $l.scaledObject }}
+{{- if $so.enabled }}
 {{- $replicas := int $so.replicas }}
-{{- if lt $replicas 1 }}{{ fail "scaledObject.replicas must be at least 1" }}{{ end }}
+{{- if lt $replicas 1 }}{{ fail (printf "%sscaledObject.replicas must be at least 1" $l.pfx) }}{{ end }}
+---
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
   name: {{ $so.targetRef.name }}
   labels:
-    {{- include "kfklease.labels" . | nindent 4 }}
+    {{- include "kfklease.labels" $ | nindent 4 }}
 spec:
   scaleTargetRef:
     apiVersion: {{ $so.targetRef.apiVersion }}
@@ -37,6 +40,8 @@ spec:
   triggers:
     - type: external-push
       metadata:
-        scalerAddress: {{ printf "%s.%s.svc:%d" (include "kfklease.name" .) .Release.Namespace (int .Values.service.port) | quote }}
-        topic: {{ .Values.topic | quote }}
+        scalerAddress: {{ printf "%s.%s.svc:%d" (include "kfklease.name" $) $.Release.Namespace (int $.Values.service.port) | quote }}
+        # The lease of this workload, among those the scaler serves.
+        topic: {{ $l.topic | quote }}
+{{- end }}
 {{- end }}

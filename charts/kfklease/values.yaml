@@ -7,7 +7,7 @@ image:
 
 # The lease. brokers and topic are required.
 brokers: ""          # comma-separated bootstrap addresses
-topic: ""            # one lease per topic
+topic: ""            # one lease per topic; more with extraLeases
 ttl: 10s             # the same for every participant of the lease
 margin: ""           # empty for ttl/5
 createTopic: true    # create the topic with the settings the protocol needs
@@ -83,6 +83,24 @@ scaledObject:
   # with replicas 0; false keeps the replicas as they are on a scaler error.
   fallback:
     enabled: true
+
+# More leases served by the same scaler, one per topic, each with its own
+# workload. Every entry takes part in its own lease and gets its own
+# ScaledObject; its scaledObject is merged over the one above, so only what
+# differs needs saying. ttl, margin, holderPrefix, auth and the healthGate
+# timings are shared; healthGate.url is per lease, empty for no gate.
+#
+# extraLeases:
+#   - topic: mm2-eu-us
+#     scaledObject:
+#       targetRef:
+#         apiVersion: kafka.strimzi.io/v1beta2
+#         kind: KafkaMirrorMaker2
+#         name: eu-us
+#       replicas: 3
+#     healthGate:
+#       url: http://eu-us-mirrormaker2-api:8083/
+extraLeases: []
 
 service:
   port: 9090

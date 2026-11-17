@@ -6,6 +6,7 @@ package scaler
 import (
 	"context"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -149,5 +150,93 @@ func TestStreamPushesChangesAndHeartbeats(t *testing.T) {
 	src.set(false)
 	if recv() {
 		t.Fatal("after losing: want false")
+	}
+}
+
+func TestSeveralLeases(t *testing.T) {
+	a := &fakeSource{changed: make(chan struct{}, 1)}
+	b := &fakeSource{changed: make(chan struct{}, 1)}
+	srv, err := NewLeases([]Lease{{Topic: "connect-a", Source: a}, {Topic: "connect-b", Source: b}}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gs := grpc.NewServer()
+	srv.Register(gs)
+	go func() { _ = gs.Serve(lis) }()
+	t.Cleanup(gs.Stop)
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	cl := externalscaler.NewExternalScalerClient(conn)
+	ctx := context.Background()
+	ref := func(md map[string]string) *externalscaler.ScaledObjectRef {
+		return &externalscaler.ScaledObjectRef{Name: "x", ScalerMetadata: md}
+	}
+
+	a.set(true)
+	b.set(false)
+	for topic, want := range map[string]bool{"connect-a": true, "connect-b": false} {
+		r := ref(map[string]string{"topic": topic})
+		active, err := cl.IsActive(ctx, r)
+		if err != nil || active.GetResult() != want {
+			t.Fatalf("IsActive(%s) = %v, %v; want %v", topic, active.GetResult(), err, want)
+		}
+		m, err := cl.GetMetrics(ctx, &externalscaler.GetMetricsRequest{ScaledObjectRef: r, MetricName: MetricName})
+		if err != nil || m.GetMetricValues()[0].GetMetricValue() != map[bool]int64{true: 1}[want] {
+			t.Fatalf("GetMetrics(%s) = %v, %v", topic, m.GetMetricValues(), err)
+		}
+	}
+
+	// Each stream follows its own lease.
+	sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	stream, err := cl.StreamIsActive(sctx, ref(map[string]string{"topic": "connect-b"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, err := stream.Recv(); err != nil || r.GetResult() {
+		t.Fatalf("connect-b initial: %v %v", r.GetResult(), err)
+	}
+	b.set(true)
+	if r, err := stream.Recv(); err != nil || !r.GetResult() {
+		t.Fatalf("connect-b after acquiring: %v %v", r.GetResult(), err)
+	}
+
+	// With several leases a ScaledObject must name one, and one served here.
+	for _, md := range []map[string]string{nil, {"topic": "other"}, {"topic": ""}} {
+		_, err := cl.IsActive(ctx, ref(md))
+		if status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("metadata %v: err = %v, want InvalidArgument", md, err)
+		}
+		if md == nil && !strings.Contains(err.Error(), "name one by its topic") {
+			t.Fatalf("no topic named: %v, want a request to name one", err)
+		}
+		if _, err := cl.GetMetricSpec(ctx, ref(md)); status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("spec, metadata %v: err = %v, want InvalidArgument", md, err)
+		}
+	}
+}
+
+func TestNewLeasesRefuses(t *testing.T) {
+	src := &fakeSource{changed: make(chan struct{}, 1)}
+	for name, tc := range map[string]struct {
+		leases    []Lease
+		heartbeat time.Duration
+	}{
+		"none":            {nil, time.Second},
+		"no heartbeat":    {[]Lease{{Topic: "a", Source: src}}, 0},
+		"no source":       {[]Lease{{Topic: "a"}}, time.Second},
+		"duplicate topic": {[]Lease{{Topic: "a", Source: src}, {Topic: "a", Source: src}}, time.Second},
+		"empty topic":     {[]Lease{{Topic: "a", Source: src}, {Source: src}}, time.Second},
+	} {
+		if _, err := NewLeases(tc.leases, tc.heartbeat); err == nil {
+			t.Errorf("%s: no error", name)
+		}
 	}
 }
