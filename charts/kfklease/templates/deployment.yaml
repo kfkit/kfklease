@@ -2,6 +2,10 @@
 {{- if not .Values.topic }}{{ fail "topic is required" }}{{ end }}
 {{- $tls := .Values.auth.tls -}}
 {{- $sasl := .Values.auth.sasl -}}
+{{- $leases := include "kfklease.leases" . | fromYamlArray -}}
+{{- $topics := list -}}
+{{- $urls := list -}}
+{{- range $leases }}{{ $topics = append $topics .topic }}{{ $urls = append $urls .healthUrl }}{{ end -}}
 {{- if and $tls.enabled $tls.clientCert (not $tls.secretName) }}{{ fail "auth.tls.clientCert needs auth.tls.secretName" }}{{ end }}
 {{- if and $sasl.mechanism (not $sasl.secretName) }}{{ fail "auth.sasl.mechanism needs auth.sasl.secretName" }}{{ end }}
 apiVersion: apps/v1
@@ -44,8 +48,9 @@ spec:
           env:
             - name: KFKLEASE_BROKERS
               value: {{ .Values.brokers | quote }}
+            # One lease per topic, comma-separated.
             - name: KFKLEASE_TOPIC
-              value: {{ .Values.topic | quote }}
+              value: {{ join "," $topics | quote }}
             - name: KFKLEASE_TTL
               value: {{ .Values.ttl | quote }}
             {{- with .Values.margin }}
@@ -61,9 +66,10 @@ spec:
             - name: KFKLEASE_LOG_LEVEL
               value: {{ .Values.logLevel | quote }}
             {{- with .Values.healthGate }}
-            {{- if .url }}
+            {{- if compact $urls }}
+            # One per topic, in the same order; empty: no gate for that lease.
             - name: KFKLEASE_HEALTH_URL
-              value: {{ .url | quote }}
+              value: {{ join "," $urls | quote }}
             - name: KFKLEASE_HEALTH_INTERVAL
               value: {{ .interval | quote }}
             - name: KFKLEASE_HEALTH_TIMEOUT
