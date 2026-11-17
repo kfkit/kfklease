@@ -42,8 +42,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: helm lint charts/kfklease --set brokers=k:9092 --set topic=t --set scaledObject.target=w
-      - run: helm template t charts/kfklease --set brokers=k:9092 --set topic=t --set scaledObject.target=w > /dev/null
+      - run: helm lint charts/kfklease --set brokers=k:9092 --set topic=t --set scaledObject.targetRef.name=w
+      - run: helm template t charts/kfklease --set brokers=k:9092 --set topic=t --set scaledObject.targetRef.name=w > /dev/null
+      - name: N replicas of any scalable kind; the old value fails loudly
+        run: |
+          out=$(helm template t charts/kfklease --set brokers=k:9092 --set topic=t \
+            --set scaledObject.targetRef.apiVersion=kafka.strimzi.io/v1beta2 \
+            --set scaledObject.targetRef.kind=KafkaConnect --set scaledObject.targetRef.name=c \
+            --set scaledObject.replicas=3 -s templates/scaledobject.yaml)
+          echo "$out"
+          for want in 'apiVersion: kafka.strimzi.io/v1beta2' 'kind: KafkaConnect' 'idleReplicaCount: 0' \
+                      'minReplicaCount: 3' 'maxReplicaCount: 3'; do
+            grep -qF "$want" <<<"$out" || { echo "missing: $want"; exit 1; }
+          done
+          for bad in 'scaledObject.target=w' 'scaledObject.targetRef.name=w,scaledObject.replicas=0'; do
+            if helm template t charts/kfklease --set brokers=k:9092 --set topic=t --set "$bad" >/dev/null; then
+              echo "rendered with $bad"; exit 1
+            fi
+          done
 
   # The two-cluster stand: k3s + KEDA twice and a Kafka broker, then the
   # failover scenarios. Slow, so it runs after the fast jobs pass.

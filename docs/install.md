@@ -49,7 +49,7 @@ helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.3.0 \
   --set brokers=kafka-1:9092,kafka-2:9092 \
   --set topic=orders-singleton \
   --set holderPrefix=eu-west \
-  --set scaledObject.target=orders-worker
+  --set scaledObject.targetRef.name=orders-worker
 ```
 
 | Value | Meaning |
@@ -59,10 +59,12 @@ helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.3.0 \
 | `holderPrefix` | names the cluster in holder ids (`eu-west/<pod>`), in logs and on the topic. Defaults to the release name |
 | `ttl` | how long a term lasts without renewal, `10s` by default. The same for every participant of a lease |
 | `margin` | how much earlier than the term's end the holder stops believing, `ttl/5` by default; see [Choosing TTL and margin](#choosing-ttl-and-margin) |
-| `scaledObject.target` | the Deployment to scale, in the release namespace |
+| `scaledObject.targetRef.name` | the workload to scale, in the release namespace |
+| `scaledObject.targetRef.kind`, `.apiVersion` | its kind, `Deployment` and `apps/v1` by default: anything with a scale subresource, a StatefulSet or Strimzi's `KafkaConnect`, say |
+| `scaledObject.replicas` | replicas while this cluster holds the lease, 1 by default; zero otherwise |
 | `scaledObject.enabled` | `false` to write your own ScaledObject; see below |
 
-The workload itself is yours: a Deployment in the same namespace. Its
+The workload itself is yours, in the same namespace. Its
 replica count belongs to KEDA from now on, so leave `replicas` out or set
 it to 0. Keep `terminationGracePeriodSeconds` short: every second of it is
 a second the old and the new holder may overlap.
@@ -92,9 +94,12 @@ metadata:
   name: orders-worker
 spec:
   scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
     name: orders-worker
-  minReplicaCount: 0
-  maxReplicaCount: 1
+  idleReplicaCount: 0
+  minReplicaCount: 1   # N while holding
+  maxReplicaCount: 1   # the same N
   pollingInterval: 5
   cooldownPeriod: 0
   triggers:
@@ -104,8 +109,13 @@ spec:
         topic: orders-singleton
 ```
 
-`maxReplicaCount: 1` is the point. `cooldownPeriod: 0` because every
-second of cooldown is a second of overlap after a handover.
+The replica counts are the point. The scaler reports 1 of a target of 1
+while it holds and 0 otherwise; KEDA scales the target to
+`idleReplicaCount` while the metric is 0 and hands it to the HPA, which
+keeps it between `minReplicaCount` and `maxReplicaCount`, while it is 1.
+With both at N, that is N replicas in the holding cluster and none
+elsewhere. `cooldownPeriod: 0` because every second of cooldown is a second
+of overlap after a handover.
 
 ## Authentication
 

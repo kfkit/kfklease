@@ -47,12 +47,19 @@ auth:
 
 podAnnotations: {}
 
-# A ScaledObject that keeps a workload at one replica while this cluster
+# A ScaledObject that keeps a workload at `replicas` while this cluster
 # holds the lease and at zero otherwise. Disable it to write your own.
 scaledObject:
   enabled: true
-  # The Deployment to scale, in the release namespace.
-  target: ""
+  # What to scale, in the release namespace: anything with a scale
+  # subresource. name is required.
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment   # or StatefulSet, or a custom resource such as
+                       # Strimzi's KafkaConnect (kafka.strimzi.io/v1beta2)
+    name: ""
+  # Replicas while this cluster holds the lease.
+  replicas: 1
   pollingInterval: 5
   # Every second of cooldown is a second the old and the new holder may
   # overlap.

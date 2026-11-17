@@ -63,8 +63,9 @@ for range c.Changed() {
 
 `kfklease-scaler` runs one participant per cluster and serves it to KEDA as an
 [external scaler](https://keda.sh/docs/latest/scalers/external-push/). A
-ScaledObject with `maxReplicaCount: 1` then runs the workload where the lease
-is held and nowhere else:
+ScaledObject with `idleReplicaCount: 0` and `minReplicaCount` equal to
+`maxReplicaCount` then runs the workload where the lease is held and nowhere
+else, at one replica or at N:
 
 ```yaml
 triggers:
@@ -82,7 +83,7 @@ a different `holderPrefix`:
 helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.3.0 \
   -n kfklease --create-namespace \
   --set brokers=kafka:9092 --set topic=my-lease --set holderPrefix=eu-west \
-  --set scaledObject.target=my-singleton
+  --set scaledObject.targetRef.name=my-singleton
 ```
 
 The chart pulls `ghcr.io/kfkit/kfklease-scaler` at the same version:
