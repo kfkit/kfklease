@@ -15,7 +15,7 @@ runs a workload in one cluster at a time. The map:
 | `lease/agent.go` | the writer rules: when to claim, renew, release, believe. Pure, takes the clock as an argument | view |
 | `lease/candidate.go` | the Kafka client around the agent, and `Config`, `Status`, `Auth` | franz-go |
 | `lease/auth.go` | TLS, mTLS, SASL | franz-go |
-| `scaler/` | KEDA external-push gRPC server, HTTP `/metrics` and `/status` | lease |
+| `scaler/` | KEDA external-push gRPC server, HTTP `/metrics` and `/status`, the workload probe of the health gate | lease |
 | `cmd/kfklease-scaler` | the binary: flags with `KFKLEASE_*` fallbacks | scaler |
 | `charts/kfklease` | one release per cluster | |
 | `examples/heartbeat` | a workload that fences by epoch, and the report that checks it | scaler's `/status` |

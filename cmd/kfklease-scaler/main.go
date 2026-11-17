@@ -70,6 +70,12 @@ func run() error {
 		httpListen  = flag.String("http-listen", env("KFKLEASE_HTTP_LISTEN", ":9091"), "HTTP listen address for /metrics, /status and /healthz; empty to disable (KFKLEASE_HTTP_LISTEN)")
 		logLevel    = flag.String("log-level", env("KFKLEASE_LOG_LEVEL", "info"), "debug, info, warn or error (KFKLEASE_LOG_LEVEL)")
 
+		healthURL       = flag.String("health-url", env("KFKLEASE_HEALTH_URL", ""), "workload URL probed while holding; empty turns the health gate off (KFKLEASE_HEALTH_URL)")
+		healthInterval  = flag.Duration("health-interval", envDuration("KFKLEASE_HEALTH_INTERVAL", 10*time.Second), "time between workload probes (KFKLEASE_HEALTH_INTERVAL)")
+		healthTimeout   = flag.Duration("health-timeout", envDuration("KFKLEASE_HEALTH_TIMEOUT", 5*time.Second), "timeout of one workload probe (KFKLEASE_HEALTH_TIMEOUT)")
+		healthFailAfter = flag.Duration("health-fail-after", envDuration("KFKLEASE_HEALTH_FAIL_AFTER", 5*time.Minute), "release the lease when the workload has not passed a probe for this long, counted from the start of the term (KFKLEASE_HEALTH_FAIL_AFTER)")
+		healthCooldown  = flag.Duration("health-cooldown", envDuration("KFKLEASE_HEALTH_COOLDOWN", 10*time.Minute), "claim nothing for this long after such a release (KFKLEASE_HEALTH_COOLDOWN)")
+
 		tlsEnabled  = flag.Bool("tls", env("KFKLEASE_TLS", "false") == "true", "connect with TLS (KFKLEASE_TLS)")
 		tlsCA       = flag.String("tls-ca-file", env("KFKLEASE_TLS_CA_FILE", ""), "PEM file with the CA that signed the brokers' certificates, re-read on every connection (KFKLEASE_TLS_CA_FILE; or the PEM itself in KFKLEASE_TLS_CA)")
 		tlsCert     = flag.String("tls-cert-file", env("KFKLEASE_TLS_CERT_FILE", ""), "PEM client certificate for mTLS, re-read on every connection (KFKLEASE_TLS_CERT_FILE; or the PEM itself in KFKLEASE_TLS_CERT)")
@@ -96,6 +102,16 @@ func run() error {
 	if *brokers == "" || *topic == "" {
 		return errors.New("brokers and topic are required")
 	}
+	var gate lease.HealthGate
+	if *healthURL != "" {
+		if *healthInterval <= 0 || *healthTimeout <= 0 || *healthFailAfter <= 0 || *healthCooldown <= 0 {
+			return errors.New("health interval, timeout, fail-after and cooldown must be positive")
+		}
+		if *healthFailAfter < 2**healthInterval {
+			return fmt.Errorf("health fail-after %v must be at least two probe intervals (%v)", *healthFailAfter, *healthInterval)
+		}
+		gate = lease.HealthGate{FailAfter: *healthFailAfter, Cooldown: *healthCooldown}
+	}
 	cand, err := lease.NewCandidate(lease.Config{
 		Brokers:     strings.Split(*brokers, ","),
 		Topic:       *topic,
@@ -103,6 +119,7 @@ func run() error {
 		Holder:      *holder,
 		TTL:         *ttl,
 		Margin:      *margin,
+		Health:      gate,
 		Auth: lease.Auth{
 			TLS: lease.TLS{
 				Enabled: *tlsEnabled,
@@ -157,6 +174,12 @@ func run() error {
 			_ = hs2.Close()
 		}
 	}()
+
+	if *healthURL != "" {
+		p := scaler.Probe{URL: *healthURL, Interval: *healthInterval, Timeout: *healthTimeout, Log: log}
+		go p.Run(ctx, cand, cand.ReportHealthy)
+		log.Info("health gate on", "url", *healthURL, "fail_after", *healthFailAfter, "cooldown", *healthCooldown)
+	}
 
 	runErr := make(chan error, 1)
 	go func() { runErr <- cand.Run(ctx) }()
