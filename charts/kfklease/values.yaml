@@ -19,6 +19,19 @@ holderPrefix: ""
 
 logLevel: info
 
+# Optional: give the lease up when the workload cannot run here. While this
+# cluster holds the lease, the scaler GETs url every interval (200-399 is
+# healthy). When no probe has passed for failAfter, counted from the start
+# of the term, it releases the lease, so another cluster takes over at once,
+# and claims nothing for cooldown. failAfter is also the time the workload
+# gets to come up after a failover: leave it room. Empty url: off.
+healthGate:
+  url: ""            # e.g. http://my-connect-connect-api:8083/health
+  interval: 10s
+  timeout: 5s
+  failAfter: 5m
+  cooldown: 10m
+
 # Authentication to the brokers. The chart holds no secret itself: it points
 # at Kubernetes Secrets, whoever creates them (cert-manager, Strimzi,
 # External Secrets, kubectl).

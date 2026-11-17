@@ -228,6 +228,7 @@ Prometheus Operator.
 | `kfklease_lease_held` | 1 when the log says someone holds the lease |
 | `kfklease_lease_as_of_seconds` | broker time of the last record seen |
 | `kfklease_transitions_total{to}` | handovers into (`holding`) and out of (`standby`) the lease |
+| `kfklease_health_cooldown_seconds` | seconds until this participant may claim again after the [health gate](#when-the-workload-cannot-run-here) gave the lease up; 0 otherwise |
 
 Alerts worth having: `sum(kfklease_holding) != 1` across the clusters of one
 lease for longer than a TTL (nobody, or more than one, holds it),
@@ -271,6 +272,55 @@ scaler, and a lost node takes the scaler's endpoint away once Kubernetes
 marks the node not ready. And KEDA itself down in the old cluster stops
 nothing; that is the revived-cluster case in [Fencing by
 epoch](#fencing-by-epoch).
+
+## When the workload cannot run here
+
+The lease follows the scaler and its link to Kafka, not the workload. If
+the workload cannot run in the cluster that holds the lease (no nodes, an
+image that does not pull, a crash loop, its database unreachable from
+there), nothing fails over by itself. The health gate makes it:
+
+```yaml
+healthGate:
+  url: http://my-connect-connect-api:8083/health
+  interval: 10s     # time between probes
+  timeout: 5s       # per probe
+  failAfter: 5m
+  cooldown: 10m
+```
+
+While this cluster holds the lease, the scaler GETs `url`; a status from
+200 to 399 is healthy, as for a Kubernetes `httpGet` probe. When no probe
+has passed for `failAfter`, counted from the later of the start of the term
+and the last passing probe, the scaler stops believing it holds the lease,
+writes a release, and claims nothing for `cooldown`. KEDA scales the
+workload here to zero, and another cluster takes the lease at once, from
+the release, without waiting for the term to run out. The other cluster
+does not wait for this one's workload to stop: as on any handover, fence by
+epoch. Clusters that do not hold the lease do not probe; their workload is
+at zero.
+
+- **`failAfter`** is also the time a workload gets to come up after a
+  failover, since it counts from the start of the term: a Kafka Connect
+  cluster that needs three minutes to start its workers and rebalance needs
+  more than three minutes here, or the lease moves on before it ever ran.
+  The binary refuses a `failAfter` below two probe intervals.
+- **`cooldown`** keeps the lease from coming straight back to a cluster
+  whose workload just failed. A cluster in cooldown still follows the log;
+  if no one else can take the lease, nobody holds it until the cooldown is
+  over. With one participant the gate therefore stops the workload for the
+  cooldown and then tries again.
+- If every cluster's workload is broken, the lease goes round: each holder
+  keeps it for `failAfter`, then sits out `cooldown`. Make `cooldown` longer
+  than `failAfter` times the number of other clusters if a round trip
+  should leave a pause.
+- The probe only feeds the gate; the gate decides. A probe that hangs counts
+  as failing after `timeout`.
+
+`kfklease_health_cooldown_seconds` and `health_cooldown_in_seconds` in
+`/status` show a cluster that sits out; the scaler logs `workload probe
+failing` at the first failure and `workload unhealthy, releasing` when the
+gate fires. Without `url` (the default) there is no gate.
 
 ## Choosing TTL and margin
 

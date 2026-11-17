@@ -70,6 +70,19 @@ jobs:
           if so --set scaledObject.fallback.enabled=false | grep -q 'fallback:'; then
             echo "fallback rendered although disabled"; exit 1
           fi
+      - name: Health gate off by default, wired when a URL is set
+        run: |
+          dep() { helm template t charts/kfklease --set brokers=k:9092 --set topic=t \
+                    --set scaledObject.targetRef.name=w "$@" -s templates/deployment.yaml; }
+          if dep | grep -q KFKLEASE_HEALTH_; then
+            echo "health gate rendered without a URL"; exit 1
+          fi
+          out=$(dep --set healthGate.url=http://c:8083/health --set healthGate.failAfter=2m)
+          echo "$out"
+          for name in URL INTERVAL TIMEOUT FAIL_AFTER COOLDOWN; do
+            grep -qF "name: KFKLEASE_HEALTH_$name" <<<"$out" || { echo "missing: KFKLEASE_HEALTH_$name"; exit 1; }
+          done
+          grep -A1 'name: KFKLEASE_HEALTH_FAIL_AFTER' <<<"$out" | grep -qF 'value: "2m"' || { echo "failAfter not passed"; exit 1; }
 
   # The two-cluster stand: k3s + KEDA twice and a Kafka broker, then the
   # failover scenarios. Slow, so it runs after the fast jobs pass.

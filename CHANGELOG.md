@@ -36,6 +36,14 @@ and this project adheres to
   stop on its own.
 - Docs: "When the scaler is gone" in docs/install.md, with the bound on how
   soon the old cluster stops on its own.
+- Health gate, off by default: with `healthGate.url` (chart) or
+  `-health-url` / `KFKLEASE_HEALTH_URL` (binary), a holder whose workload
+  has not passed an HTTP probe for `failAfter` releases the lease and claims
+  nothing for `cooldown`. Library: `lease.Config.Health` and
+  `Candidate.ReportHealthy`; `scaler.Probe`.
+- Metric `kfklease_health_cooldown_seconds`, field
+  `health_cooldown_in_seconds` in `/status`, and `Status.CooldownUntil` in
+  the library.
 
 ### Fixed
 

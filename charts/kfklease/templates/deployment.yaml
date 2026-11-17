@@ -60,6 +60,20 @@ spec:
               value: {{ printf ":%d" (int .Values.service.httpPort) | quote }}
             - name: KFKLEASE_LOG_LEVEL
               value: {{ .Values.logLevel | quote }}
+            {{- with .Values.healthGate }}
+            {{- if .url }}
+            - name: KFKLEASE_HEALTH_URL
+              value: {{ .url | quote }}
+            - name: KFKLEASE_HEALTH_INTERVAL
+              value: {{ .interval | quote }}
+            - name: KFKLEASE_HEALTH_TIMEOUT
+              value: {{ .timeout | quote }}
+            - name: KFKLEASE_HEALTH_FAIL_AFTER
+              value: {{ .failAfter | quote }}
+            - name: KFKLEASE_HEALTH_COOLDOWN
+              value: {{ .cooldown | quote }}
+            {{- end }}
+            {{- end }}
             - name: POD_NAME
               valueFrom:
                 fieldRef:
