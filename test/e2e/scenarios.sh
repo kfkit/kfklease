@@ -212,7 +212,9 @@ scenario_broker() {
   wait_running "$h" 0 $(( 3 * TTL )) >/dev/null
   lost=$(( $(date +%s) - t0 ))
   sleep $(( 2 * TTL - lost > 0 ? 2 * TTL - lost : 0 ))
-  docker compose start kafka >/dev/null 2>&1
+  # Not `start kafka`: that also reruns the certs service, which issues a
+  # new CA the mounted client Secret does not trust, and mTLS stays broken.
+  docker compose up -d --no-deps --no-recreate kafka >/dev/null 2>&1
   until [[ -n $(holder) ]]; do
     (( $(date +%s) - t0 < 6 * TTL )) || { echo "FAILED: nobody took the lease after the broker came back" >&2; return 1; }
     sleep 1

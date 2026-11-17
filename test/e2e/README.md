@@ -76,7 +76,7 @@ is the heartbeat check, which sees every write.
 | Cluster dies               | `docker compose kill k3s-a`               |
 | Cluster freezes            | `docker compose pause k3s-a` / `unpause`  |
 | Cluster loses Kafka        | `./partition.sh cut k3s-a` / `heal k3s-a` |
-| Arbiter is down            | `docker compose stop kafka` / `start kafka` |
+| Arbiter is down            | `docker compose stop kafka` / `up -d --no-deps --no-recreate kafka` (`start` reruns the certs service and issues a new CA) |
 
 `partition.sh` drops packets to Kafka inside the node's network namespace, so
 connections hang and time out the way they do in a real partition. Do not use
