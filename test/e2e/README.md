@@ -41,7 +41,8 @@ docker compose down -v         # tear down, drop cluster state
 `deploy.sh` renders `charts/kfklease` (helm, or the `alpine/helm` image when
 helm is not installed) with holder prefix `<cluster>` and the `singleton`
 deployment from `manifests/` as the scale target: one replica while the
-cluster holds the lease, zero otherwise. `singleton` runs the heartbeat
+cluster holds the lease (`REPLICAS=3 ./deploy.sh ...` for three), zero
+otherwise. `singleton` runs the heartbeat
 example from `examples/`, built into `kfklease-heartbeat:dev` by
 `build-image.sh`.
 
@@ -60,6 +61,7 @@ TTL 10 s, `pollingInterval: 5`, `cooldownPeriod: 0`:
 | `partition` | holder's cluster cut off from Kafka            | holder's pod down at ~10–12 s, standby's up ~1 s later, no overlap |
 | `pause`     | holder's cluster frozen for 2 × TTL            | takeover ~10 s into the freeze; on wake-up the frozen pod goes within 1 s |
 | `broker`    | Kafka stopped for 2 × TTL                      | holder's pod down within a TTL; a holder again ~10 s after the broker is back |
+| `replicas`  | both clusters redeployed with `REPLICAS=3`, then the holder cut off from Kafka | holder at 3, standby at 0; after the cut the holder's pods all go before the standby's three run; back to 1 at the end |
 
 Takeover timing is TTL plus KEDA's reaction and pod start; the standby
 never claims before the term in the log runs out, and the old holder stops
@@ -74,7 +76,7 @@ is the heartbeat check, which sees every write.
 | Cluster dies               | `docker compose kill k3s-a`               |
 | Cluster freezes            | `docker compose pause k3s-a` / `unpause`  |
 | Cluster loses Kafka        | `./partition.sh cut k3s-a` / `heal k3s-a` |
-| Arbiter is down            | `docker compose stop kafka` / `start kafka` |
+| Arbiter is down            | `docker compose stop kafka` / `up -d --no-deps --no-recreate kafka` (`start` reruns the certs service and issues a new CA) |
 
 `partition.sh` drops packets to Kafka inside the node's network namespace, so
 connections hang and time out the way they do in a real partition. Do not use

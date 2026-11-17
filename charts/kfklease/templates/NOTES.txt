@@ -5,7 +5,7 @@ Watch it:
   kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "kfklease.name" . }} -f
 {{- if .Values.scaledObject.enabled }}
 
-Deployment {{ .Values.scaledObject.target }} runs one replica while this cluster
+{{ .Values.scaledObject.targetRef.kind }} {{ .Values.scaledObject.targetRef.name }} runs {{ .Values.scaledObject.replicas }} replica(s) while this cluster
 holds the lease and none otherwise:
-  kubectl -n {{ .Release.Namespace }} get scaledobject {{ .Values.scaledObject.target }}
+  kubectl -n {{ .Release.Namespace }} get scaledobject {{ .Values.scaledObject.targetRef.name }}
 {{- end }}

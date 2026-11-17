@@ -6,7 +6,7 @@
 # at once and how long nobody wrote.
 #
 #   ./scenarios.sh            # all
-#   ./scenarios.sh crash      # one: coldstart, crash, partition, pause, broker
+#   ./scenarios.sh crash      # one: coldstart, crash, partition, pause, broker, replicas
 #
 # Expects the stand to be up (./smoke.sh), the image built (./build-image.sh)
 # and the manifests deployed to both clusters (./deploy.sh k3s-a; ./deploy.sh k3s-b).
@@ -15,6 +15,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 # shellcheck source=lib.sh
 source ./lib.sh
+
+# The workload's replica count in the holding cluster; the replicas
+# scenario raises it for its duration.
+want=1
 
 # running <cluster> prints the number of Running, not terminating, singleton pods.
 running() {
@@ -41,8 +45,13 @@ wait_running() {
   done
 }
 
+# some <count> succeeds if a running() count is a number above zero.
+some() {
+  [[ $1 != 0 && $1 != "?" ]]
+}
+
 # transition <from> <to> <timeout> watches both clusters until <from> runs no
-# workload pod and <to> runs one, and prints how long each took from now and
+# workload pod and <to> runs $want, and prints how long each took from now and
 # how long both ran at once. Pods are polled every half second, so the
 # overlap is a lower bound.
 transition() {
@@ -51,7 +60,7 @@ transition() {
   while true; do
     now=$(python3 -c "import time; print(round(time.time() - $t0, 1))")
     [[ -n $down ]] || [[ $(running "$from") != 0 ]] || down=$now
-    [[ -n $up ]] || [[ $(running "$to") != 1 ]] || up=$now
+    [[ -n $up ]] || [[ $(running "$to") != "$want" ]] || up=$now
     if [[ -n $down && -n $up ]]; then
       python3 -c "print(f'down={$down}s up={$up}s overlap={max(0.0, round($down - $up, 1))}s')"
       return 0
@@ -67,7 +76,7 @@ transition() {
 # holder prints the cluster running the workload, or nothing.
 holder() {
   for c in "${CLUSTERS[@]}"; do
-    if [[ $(running "$c") == 1 ]]; then echo "$c"; return; fi
+    if some "$(running "$c")"; then echo "$c"; return; fi
   done
 }
 
@@ -75,7 +84,7 @@ holder() {
 watch_exclusive() {
   local until=$(( $(date +%s) + $1 ))
   while (( $(date +%s) < until )); do
-    if [[ $(running k3s-a) == 1 && $(running k3s-b) == 1 ]]; then
+    if some "$(running k3s-a)" && some "$(running k3s-b)"; then
       echo "FAILED: workload running in both clusters" >&2
       return 1
     fi
@@ -137,7 +146,7 @@ scenario_crash() {
   local h o t since
   h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
   docker compose kill "$h" >/dev/null 2>&1
-  t=$(wait_running "$o" 1 $(( 3 * TTL )))
+  t=$(wait_running "$o" "$want" $(( 3 * TTL )))
   echo "   ${o} took over ${t}s after ${h} died (ttl ${TTL}s)"
   docker compose up -d --wait "$h" >/dev/null 2>&1
   # The revived cluster still has the workload at one replica in its own
@@ -175,7 +184,7 @@ scenario_pause() {
   local h o t since
   h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
   docker compose pause "$h" >/dev/null 2>&1
-  t=$(wait_running "$o" 1 $(( 3 * TTL )))
+  t=$(wait_running "$o" "$want" $(( 3 * TTL )))
   echo "   ${o} took over ${t}s into the freeze"
   sleep $(( 2 * TTL - t > 0 ? 2 * TTL - t : 0 ))
   docker compose unpause "$h" >/dev/null 2>&1
@@ -203,7 +212,9 @@ scenario_broker() {
   wait_running "$h" 0 $(( 3 * TTL )) >/dev/null
   lost=$(( $(date +%s) - t0 ))
   sleep $(( 2 * TTL - lost > 0 ? 2 * TTL - lost : 0 ))
-  docker compose start kafka >/dev/null 2>&1
+  # Not `start kafka`: that also reruns the certs service, which issues a
+  # new CA the mounted client Secret does not trust, and mTLS stays broken.
+  docker compose up -d --no-deps --no-recreate kafka >/dev/null 2>&1
   until [[ -n $(holder) ]]; do
     (( $(date +%s) - t0 < 6 * TTL )) || { echo "FAILED: nobody took the lease after the broker came back" >&2; return 1; }
     sleep 1
@@ -215,8 +226,39 @@ scenario_broker() {
   echo "   ok"
 }
 
+# redeploy <replicas> renders the chart into both clusters with the
+# workload at <replicas> while holding.
+redeploy() {
+  local c
+  for c in "${CLUSTERS[@]}"; do
+    REPLICAS=$1 ./deploy.sh "$c" >/dev/null
+  done
+}
+
+scenario_replicas() {
+  echo "== replicas: N = 3 where the lease is held, 0 elsewhere, and a failover"
+  local h o t since
+  h=$(settle); since=$(now_rfc3339)
+  want=3
+  redeploy "$want"
+  t=$(wait_running "$h" "$want" $(( 6 * TTL )))
+  echo "   ${h} scaled to ${want} in ${t}s without moving the lease"
+  o=$(other "$h")
+  [[ $(running "$o") == 0 ]] || { echo "FAILED: standby is running the workload" >&2; return 1; }
+  ./partition.sh cut "$h"
+  echo "   ${h} -> ${o}: $(transition "$h" "$o" $(( 3 * TTL ))) (ttl ${TTL}s, ${want} replicas)"
+  ./partition.sh heal "$h"
+  watch_exclusive $(( 2 * TTL ))
+  [[ $(holder) == "$o" && $(running "$o") == "$want" ]] || { echo "FAILED: ${o} does not run ${want} replicas after the heal" >&2; return 1; }
+  heartbeats "$since"
+  want=1
+  redeploy "$want"
+  t=$(wait_running "$o" "$want" $(( 6 * TTL )))
+  echo "   ok: back to ${want} replica in ${t}s"
+}
+
 if (( $# == 0 )); then
-  set -- coldstart crash partition pause broker
+  set -- coldstart crash partition pause broker replicas
 fi
 for s in "$@"; do
   "scenario_$s"

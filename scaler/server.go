@@ -3,7 +3,8 @@
 
 // Package scaler exposes a lease to KEDA as an external scaler: the metric is
 // 1 while this participant holds the lease and 0 otherwise, so a ScaledObject
-// with maxReplicaCount 1 follows the lease.
+// with idleReplicaCount 0 and minReplicaCount = maxReplicaCount = N runs N
+// replicas where the lease is held and none elsewhere.
 package scaler
 
 import (
@@ -116,7 +117,8 @@ func (s *Server) StreamIsActive(ref *externalscaler.ScaledObjectRef, stream exte
 	}
 }
 
-// GetMetricSpec declares one metric with target 1: one replica while holding.
+// GetMetricSpec declares one metric with target 1: active while holding; the
+// replica count comes from the ScaledObject's minReplicaCount.
 func (s *Server) GetMetricSpec(_ context.Context, ref *externalscaler.ScaledObjectRef) (*externalscaler.GetMetricSpecResponse, error) {
 	if err := s.check(ref); err != nil {
 		return nil, err

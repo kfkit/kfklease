@@ -3,7 +3,8 @@
 
 // Command kfklease-scaler takes part in one lease and serves it to KEDA as an
 // external scaler. Run one per cluster; point a ScaledObject with
-// maxReplicaCount 1 at it, and the workload runs where the lease is held.
+// idleReplicaCount 0 and minReplicaCount = maxReplicaCount at it, and the
+// workload runs where the lease is held.
 package main
 
 import (
