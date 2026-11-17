@@ -6,7 +6,7 @@
 # at once and how long nobody wrote.
 #
 #   ./scenarios.sh            # all
-#   ./scenarios.sh crash      # one: coldstart, crash, partition, pause, broker, replicas
+#   ./scenarios.sh crash      # one: coldstart, crash, partition, pause, broker, replicas, scaler-down
 #
 # Expects the stand to be up (./smoke.sh), the image built (./build-image.sh)
 # and the manifests deployed to both clusters (./deploy.sh k3s-a; ./deploy.sh k3s-b).
@@ -257,10 +257,29 @@ scenario_replicas() {
   echo "   ok: back to ${want} replica in ${t}s"
 }
 
+scenario_scaler_down() {
+  echo "== scaler-down: the holder's scaler is gone, its workload pods are not"
+  local h o since
+  h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
+  # KEDA first, so that it never hears the scaler's last word and only the
+  # fallback can stop the workload; then Kafka, so that the term runs out
+  # and the other cluster takes the lease, as when the scaler's node is
+  # lost. Without the fallback the holder's pod stays and this times out.
+  ./partition.sh cut "$h" scaler
+  ./partition.sh cut "$h"
+  echo "   ${h} -> ${o}: $(transition "$h" "$o" $(( 3 * TTL ))) (ttl ${TTL}s)"
+  ./partition.sh heal "$h"
+  ./partition.sh heal "$h" scaler
+  watch_exclusive $(( 2 * TTL ))
+  [[ $(holder) == "$o" ]] || { echo "FAILED: lease moved back after the scaler returned" >&2; return 1; }
+  heartbeats "$since"
+  echo "   ok: ${h} stopped its workload without its scaler and stayed idle"
+}
+
 if (( $# == 0 )); then
-  set -- coldstart crash partition pause broker replicas
+  set -- coldstart crash partition pause broker replicas scaler-down
 fi
 for s in "$@"; do
-  "scenario_$s"
+  "scenario_${s//-/_}"
 done
 echo "all scenarios passed"
