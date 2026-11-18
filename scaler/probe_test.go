@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-func TestProbeReportsSuccessOnlyWhileHolding(t *testing.T) {
+func TestProbeReportsSuccessOnlyWhileTheSiteHolds(t *testing.T) {
 	var code atomic.Int32
 	code.Store(http.StatusOK)
 	var hits atomic.Int32
@@ -70,6 +70,11 @@ func TestProbeReportsSuccessOnlyWhileHolding(t *testing.T) {
 	code.Store(http.StatusNotModified)
 	before := healthy.Load()
 	waitUntil("a healthy report after recovery", func() bool { return healthy.Load() > before })
+
+	// Another replica of the site holds the lease: probing goes on.
+	src.setSibling(true)
+	h1 := hits.Load()
+	waitUntil("probes while the site holds", func() bool { return hits.Load() >= h1+2 })
 
 	// Lease given up: probing stops.
 	src.set(false)

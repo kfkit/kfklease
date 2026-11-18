@@ -89,7 +89,7 @@ func TestHTTPStatusAndMetrics(t *testing.T) {
 	// Holding epoch 7 with 8 seconds to go, the log agreeing.
 	asOf := time.Now()
 	src.setStatus(lease.Status{
-		Holding: true, Epoch: 7, Deadline: time.Now().Add(8 * time.Second),
+		Holding: true, Epoch: 7, Deadline: time.Now().Add(8 * time.Second), SiteHolding: true, SiteEpoch: 7,
 		Certain: true, Ready: true, Lease: lease.State{Holder: "k3s-a/pod", Epoch: 7, Expires: asOf.Add(10 * time.Second)}, AsOf: asOf,
 	})
 	waitFor(t, func() bool {
@@ -103,8 +103,11 @@ func TestHTTPStatusAndMetrics(t *testing.T) {
 	if !st.Holding || !st.Ready || st.Epoch != 7 || st.DeadlineIn < 7 || st.DeadlineIn > 8 || st.Lease == nil || st.Lease.Epoch != 7 {
 		t.Fatalf("holding status = %+v", st)
 	}
+	if !st.SiteHolding || st.SiteEpoch != 7 {
+		t.Fatalf("site in holding status = %+v", st)
+	}
 	_, body = get(t, srv, "/metrics")
-	if metric(t, body, "kfklease_holding") != "1" || metric(t, body, "kfklease_epoch") != "7" || metric(t, body, "kfklease_lease_held") != "1" {
+	if metric(t, body, "kfklease_holding") != "1" || metric(t, body, "kfklease_site_holding") != "1" || metric(t, body, "kfklease_epoch") != "7" || metric(t, body, "kfklease_lease_held") != "1" {
 		t.Fatalf("holding metrics:\n%s", body)
 	}
 	if metric(t, body, `kfklease_lease_holder_info{holder="k3s-a/pod",site="k3s-a"}`) != "1" {
@@ -265,6 +268,28 @@ func TestHTTPOneLeaseTopic(t *testing.T) {
 	}
 	_, body := get(t, srv, "/metrics")
 	if metric(t, body, `kfklease_holding{topic="orders"}`) != "0" {
+		t.Fatalf("metrics:\n%s", body)
+	}
+}
+
+// A replica of the site that does not hold the lease itself: /status and the
+// metrics say the site holds it, with the site's epoch, and that this
+// participant does not.
+func TestHTTPSiteHolding(t *testing.T) {
+	src := &fakeSource{changed: make(chan struct{}, 1)}
+	src.setSibling(true)
+	srv := httptest.NewServer(NewHTTP(src, "k3s-a/pod-2").Handler())
+	defer srv.Close()
+	_, body := get(t, srv, "/status")
+	var st StatusResponse
+	if err := json.Unmarshal([]byte(body), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Holding || !st.SiteHolding || st.SiteEpoch != 9 {
+		t.Fatalf("status = %+v, want the site's term 9 and not this participant's", st)
+	}
+	_, body = get(t, srv, "/metrics")
+	if metric(t, body, "kfklease_holding") != "0" || metric(t, body, "kfklease_site_holding") != "1" {
 		t.Fatalf("metrics:\n%s", body)
 	}
 }

@@ -49,14 +49,15 @@ func (f *fakeSource) setUnknown(unknown bool) {
 
 func (f *fakeSource) Changed() <-chan struct{} { return f.changed }
 
+// set makes the source the holder, or no participant of its site.
 func (f *fakeSource) set(holding bool) {
-	f.mu.Lock()
-	f.st = lease.Status{Holding: holding, Epoch: 7}
-	f.mu.Unlock()
-	select {
-	case f.changed <- struct{}{}:
-	default:
-	}
+	f.setStatus(lease.Status{Holding: holding, Epoch: 7, SiteHolding: holding, SiteEpoch: 7})
+}
+
+// setSibling makes another participant of the source's site the holder,
+// or nobody.
+func (f *fakeSource) setSibling(holding bool) {
+	f.setStatus(lease.Status{SiteHolding: holding, SiteEpoch: 9})
 }
 
 func serve(t *testing.T, src Source, heartbeat time.Duration) externalscaler.ExternalScalerClient {
@@ -92,8 +93,14 @@ func TestUnaryCalls(t *testing.T) {
 		t.Fatalf("spec: %v", got)
 	}
 
-	for _, holding := range []bool{false, true, false} {
-		src.set(holding)
+	// The holder, then a replica of the same site that is not: both tell
+	// KEDA that the site holds the lease.
+	for i, holding := range []bool{false, true, false, true, false} {
+		if i < 3 {
+			src.set(holding)
+		} else {
+			src.setSibling(holding)
+		}
 		active, err := cl.IsActive(ctx, ref)
 		if err != nil {
 			t.Fatal(err)

@@ -12,8 +12,8 @@ import (
 	"time"
 )
 
-// Probe checks the workload over HTTP while this participant holds the
-// lease and reports every success to the lease's health gate
+// Probe checks the workload over HTTP while this participant's site holds
+// the lease and reports every success to the lease's health gate
 // (lease.Config.Health). The gate, not the probe, decides when a run of
 // failures is long enough to give the lease up.
 type Probe struct {
@@ -28,15 +28,17 @@ type Probe struct {
 }
 
 // Run probes until ctx is done, calling healthy on every success. It probes
-// only while src holds the lease: elsewhere the workload is scaled to zero
-// and a failure means nothing.
+// only while src's site holds the lease (lease.Status.SiteHolding): elsewhere
+// the workload is scaled to zero and a failure means nothing. Every replica
+// of the site probes, so that none takes the lease over for a workload that
+// cannot run.
 func (p Probe) Run(ctx context.Context, src Source, healthy func()) {
 	cl := &http.Client{Timeout: p.Timeout}
 	ticker := time.NewTicker(p.Interval)
 	defer ticker.Stop()
 	failing := false
 	for {
-		if src.Status().Holding {
+		if src.Status().SiteHolding {
 			err := p.check(ctx, cl)
 			switch {
 			case err == nil:
