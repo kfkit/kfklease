@@ -2,9 +2,20 @@
 # Runs in the certs service: a CA, a broker certificate for the mTLS
 # listener (by IP on the kfk network and as localhost) and a client
 # certificate. Kafka reads the PEM files directly; the tests read them from
-# .out/certs. Regenerated on every stand start.
+# .out/certs. Kept while they are complete and valid for another day: the
+# service runs on every `up` of kafka, and a broker that is already running
+# keeps the CA it started with, so new certificates would break mTLS for
+# every client that reads them (the integration tests run twice, say).
 set -eu
 cd /certs
+if [ -s ca.crt ] && [ -s broker.pem ] && [ -s client.crt ] && [ -s client.key ] && [ -s jaas.conf ] \
+  && openssl verify -CAfile ca.crt broker.pem client.crt >/dev/null 2>&1 \
+  && openssl x509 -checkend 86400 -noout -in ca.crt >/dev/null \
+  && openssl x509 -checkend 86400 -noout -in broker.pem >/dev/null \
+  && openssl x509 -checkend 86400 -noout -in client.crt >/dev/null; then
+  echo "certificates and jaas.conf kept"
+  exit 0
+fi
 rm -f ./*.pem ./*.crt ./*.key ./*.csr
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 7 \
   -subj "/CN=kfklease e2e CA" -keyout ca.key -out ca.crt >/dev/null 2>&1

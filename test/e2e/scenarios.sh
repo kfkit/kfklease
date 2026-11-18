@@ -348,8 +348,8 @@ scenario_broker() {
   # outcome deterministic: the term runs out in the log.
   docker compose stop kafka >/dev/null 2>&1
   sleep $(( 2 * TTL ))
-  # Not `start kafka`: that also reruns the certs service, which issues a
-  # new CA the mounted client Secret does not trust, and mTLS stays broken.
+  # Not `start kafka`: that would rerun the certs service as well, and this
+  # is about Kafka alone.
   docker compose up -d --no-deps --no-recreate kafka >/dev/null 2>&1
   # Both sites see the same expired term of ${h}: its site claims at once,
   # the other one waits the takeover delay.
