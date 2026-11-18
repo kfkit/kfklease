@@ -78,7 +78,9 @@ func run() error {
 	var (
 		brokers     = flag.String("brokers", env("KFKLEASE_BROKERS", ""), "comma-separated bootstrap addresses (KFKLEASE_BROKERS)")
 		topic       = flag.String("topic", env("KFKLEASE_TOPIC", ""), "lease topic; comma-separated for several leases, one per topic (KFKLEASE_TOPIC)")
-		holder      = flag.String("holder", env("KFKLEASE_HOLDER", ""), "holder id, unique per process; empty for hostname/random (KFKLEASE_HOLDER)")
+		site        = flag.String("site", env("KFKLEASE_SITE", ""), "where this scaler runs, a cluster: the lease belongs to a site; empty for the holder id up to its last slash (KFKLEASE_SITE)")
+		holder      = flag.String("holder", env("KFKLEASE_HOLDER", ""), "holder id <site>/<name>, unique per process; empty for <site>/<hostname>-<random> (KFKLEASE_HOLDER)")
+		takeover    = flag.Duration("takeover-delay", envDuration("KFKLEASE_TAKEOVER_DELAY", 0), "wait this long after another site's term ended before claiming, so that its workload has stopped; 0 claims at once (KFKLEASE_TAKEOVER_DELAY)")
 		ttl         = flag.Duration("ttl", envDuration("KFKLEASE_TTL", 10*time.Second), "lease ttl, the same for all participants (KFKLEASE_TTL)")
 		margin      = flag.Duration("margin", envDuration("KFKLEASE_MARGIN", 0), "safety margin subtracted from the holder's deadline; 0 for ttl/5 (KFKLEASE_MARGIN)")
 		createTopic = flag.Bool("create-topic", env("KFKLEASE_CREATE_TOPIC", "true") == "true", "create the topic if missing, check it if it exists (KFKLEASE_CREATE_TOPIC)")
@@ -146,9 +148,11 @@ func run() error {
 			MinInsyncReplicas: *minISR,
 			FlushEveryRecord:  *flushEvery,
 		},
-		Holder: *holder,
-		TTL:    *ttl,
-		Margin: *margin,
+		Site:          *site,
+		Holder:        *holder,
+		TakeoverDelay: *takeover,
+		TTL:           *ttl,
+		Margin:        *margin,
 		Auth: lease.Auth{
 			TLS: lease.TLS{
 				Enabled: *tlsEnabled,
@@ -206,7 +210,7 @@ func run() error {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- gs.Serve(lis) }()
 	for _, l := range served {
-		log.Info("serving", "addr", lis.Addr().String(), "topic", l.Topic, "holder", l.Holder, "ttl", *ttl)
+		log.Info("serving", "addr", lis.Addr().String(), "topic", l.Topic, "holder", l.Holder, "site", lease.SiteOf(l.Holder), "ttl", *ttl, "takeover_delay", *takeover)
 	}
 
 	var hs2 *http.Server

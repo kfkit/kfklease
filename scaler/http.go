@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,6 +32,9 @@ type StatusResponse struct {
 	// 0 when not holding.
 	DeadlineIn float64 `json:"deadline_in_seconds"`
 	Certain    bool    `json:"certain"`
+	// Ready is whether the participant has known the lease state since it
+	// started; until then KEDA gets an error rather than "not holding".
+	Ready bool `json:"ready"`
 	// Lease is the state of the lease in the log, present when Certain.
 	Lease *LeaseResponse `json:"lease,omitempty"`
 	// AsOf is the broker time of the last record seen.
@@ -88,7 +90,7 @@ func NewHTTPLeases(ls []Lease) (*HTTP, error) {
 	}
 	h.descs = newDescs(h.labels)
 	h.descs.holderInfo = prometheus.NewDesc("kfklease_lease_holder_info",
-		"1 for the holder of the lease, as the log says as of the last record seen; no series while nobody holds it or the view is not certain. site is the holder id up to its last slash: the cluster under the chart.",
+		"1 for the holder of the lease, as the log says as of the last record seen; no series while nobody holds it or the view is not certain. site is the holder id up to its last slash: the chart's site.",
 		append(slices.Clone(h.labels), "holder", "site"), nil)
 	h.transitions = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "kfklease_transitions_total",
@@ -167,7 +169,7 @@ func (h *HTTP) status(w http.ResponseWriter, r *http.Request) {
 	}
 	s := l.Source.Status()
 	h.note(l.Topic)
-	resp := StatusResponse{Topic: l.Topic, Holder: l.Holder, Holding: s.Holding, Certain: s.Certain, AsOf: s.AsOf, CooldownIn: untilNow(s.CooldownUntil)}
+	resp := StatusResponse{Topic: l.Topic, Holder: l.Holder, Holding: s.Holding, Certain: s.Certain, Ready: s.Ready, AsOf: s.AsOf, CooldownIn: untilNow(s.CooldownUntil)}
 	if s.Holding {
 		resp.Epoch = s.Epoch
 		resp.DeadlineIn = untilNow(s.Deadline)
@@ -229,23 +231,13 @@ func (h *HTTP) Collect(ch chan<- prometheus.Metric) {
 		held := s.Certain && s.Lease.HeldAt(s.AsOf)
 		gauge(d.leaseHeld, b2f(held))
 		if held {
-			ch <- prometheus.MustNewConstMetric(d.holderInfo, prometheus.GaugeValue, 1, h.values(t, s.Lease.Holder, site(s.Lease.Holder))...)
+			ch <- prometheus.MustNewConstMetric(d.holderInfo, prometheus.GaugeValue, 1, h.values(t, s.Lease.Holder, lease.SiteOf(s.Lease.Holder))...)
 		}
 		gauge(d.cooldown, untilNow(s.CooldownUntil))
 		if !s.AsOf.IsZero() {
 			gauge(d.leaseAge, float64(s.AsOf.UnixMilli())/1000)
 		}
 	}
-}
-
-// site is the part of a holder id before its last slash: the chart's
-// holderPrefix, the library's hostname. Empty when there is no slash.
-func site(holder string) string {
-	i := strings.LastIndex(holder, "/")
-	if i < 0 {
-		return ""
-	}
-	return holder[:i]
 }
 
 // untilNow is the seconds left until t, or 0 when t is zero or past.

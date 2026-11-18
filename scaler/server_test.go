@@ -24,12 +24,27 @@ type fakeSource struct {
 	mu      sync.Mutex
 	st      lease.Status
 	changed chan struct{}
+	// unknown makes the source a participant that has not read the log
+	// yet; otherwise Status reports Ready.
+	unknown bool
 }
 
 func (f *fakeSource) Status() lease.Status {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.st
+	s := f.st
+	s.Ready = s.Ready || !f.unknown
+	return s
+}
+
+func (f *fakeSource) setUnknown(unknown bool) {
+	f.mu.Lock()
+	f.unknown = unknown
+	f.mu.Unlock()
+	select {
+	case f.changed <- struct{}{}:
+	default:
+	}
 }
 
 func (f *fakeSource) Changed() <-chan struct{} { return f.changed }
@@ -238,5 +253,54 @@ func TestNewLeasesRefuses(t *testing.T) {
 		if _, err := NewLeases(tc.leases, tc.heartbeat); err == nil {
 			t.Errorf("%s: no error", name)
 		}
+	}
+}
+
+// A scaler that just started does not know who holds the lease: it answers
+// with an error, pushes nothing, and answers once it knows.
+func TestNotReadyIsAnError(t *testing.T) {
+	src := &fakeSource{changed: make(chan struct{}, 1), unknown: true}
+	cl := serve(t, src, 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ref := &externalscaler.ScaledObjectRef{Name: "singleton"}
+
+	if _, err := cl.IsActive(ctx, ref); status.Code(err) != codes.Unavailable {
+		t.Fatalf("IsActive: err = %v, want Unavailable", err)
+	}
+	if _, err := cl.GetMetrics(ctx, &externalscaler.GetMetricsRequest{ScaledObjectRef: ref, MetricName: MetricName}); status.Code(err) != codes.Unavailable {
+		t.Fatalf("GetMetrics: err = %v, want Unavailable", err)
+	}
+	if _, err := cl.GetMetricSpec(ctx, ref); err != nil {
+		t.Fatalf("GetMetricSpec: %v", err)
+	}
+
+	stream, err := cl.StreamIsActive(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan bool, 4)
+	go func() {
+		for {
+			m, err := stream.Recv()
+			if err != nil {
+				close(got)
+				return
+			}
+			got <- m.GetResult()
+		}
+	}()
+	// Several heartbeats go by with nothing pushed.
+	select {
+	case v := <-got:
+		t.Fatalf("pushed %v while not ready", v)
+	case <-time.After(350 * time.Millisecond):
+	}
+	src.setUnknown(false)
+	if v := <-got; v {
+		t.Fatal("pushed true, want false")
+	}
+	if a, err := cl.IsActive(ctx, ref); err != nil || a.GetResult() {
+		t.Fatalf("IsActive = %v, %v; want false", a.GetResult(), err)
 	}
 }
