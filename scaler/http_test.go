@@ -148,9 +148,32 @@ func TestHTTPStatusAndMetrics(t *testing.T) {
 	if st.Holding || st.CooldownIn < 59 || st.CooldownIn > 60 {
 		t.Fatalf("cooldown status = %+v", st)
 	}
+	if metric(t, getBody(t, srv, "/metrics"), "kfklease_standby_mode") != "0" || st.Standby {
+		t.Fatalf("standby mode reported while off: %+v", st)
+	}
+
+	// Standby mode.
+	src.setStatus(lease.Status{Certain: true, Ready: true, AsOf: asOf, Standby: true})
+	_, body = get(t, srv, "/status")
+	if err := json.Unmarshal([]byte(body), &st); err != nil {
+		t.Fatal(err)
+	}
+	if !st.Standby || st.Holding {
+		t.Fatalf("standby status = %+v", st)
+	}
+	if v := metric(t, getBody(t, srv, "/metrics"), "kfklease_standby_mode"); v != "1" {
+		t.Fatalf("kfklease_standby_mode = %s", v)
+	}
 	if code, _ := get(t, srv, "/nope"); code != 404 {
 		t.Fatalf("unknown path: %d", code)
 	}
+}
+
+// getBody returns the body of a GET.
+func getBody(t *testing.T, srv *httptest.Server, path string) string {
+	t.Helper()
+	_, body := get(t, srv, path)
+	return body
 }
 
 func waitFor(t *testing.T, cond func() bool) {

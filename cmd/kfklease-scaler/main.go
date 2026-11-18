@@ -6,6 +6,12 @@
 // idleReplicaCount 0 and minReplicaCount = maxReplicaCount at it, naming its
 // lease by the topic in the trigger metadata, and the workload runs where
 // the lease is held.
+//
+//	kfklease-scaler [flags]          serve the leases to KEDA
+//	kfklease-scaler status [flags]   print the state of the leases and exit
+//
+// Every flag falls back to a KFKLEASE_* environment variable, so in a
+// scaler's pod `kfklease-scaler status` reads the leases that pod serves.
 package main
 
 import (
@@ -19,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -33,7 +40,12 @@ import (
 )
 
 func main() {
-	if err := run(); err != nil {
+	args := os.Args[1:]
+	cmd := run
+	if len(args) > 0 && args[0] == "status" {
+		cmd, args = status, args[1:]
+	}
+	if err := cmd(args); err != nil {
 		slog.Error("exiting", "err", err)
 		os.Exit(1)
 	}
@@ -74,59 +86,113 @@ func envInt(name string, def int) int {
 	return n
 }
 
-func run() error {
-	var (
-		brokers     = flag.String("brokers", env("KFKLEASE_BROKERS", ""), "comma-separated bootstrap addresses (KFKLEASE_BROKERS)")
-		topic       = flag.String("topic", env("KFKLEASE_TOPIC", ""), "lease topic; comma-separated for several leases, one per topic (KFKLEASE_TOPIC)")
-		site        = flag.String("site", env("KFKLEASE_SITE", ""), "where this scaler runs, a cluster: the lease belongs to a site; empty for the holder id up to its last slash (KFKLEASE_SITE)")
-		holder      = flag.String("holder", env("KFKLEASE_HOLDER", ""), "holder id <site>/<name>, unique per process; empty for <site>/<hostname>-<random> (KFKLEASE_HOLDER)")
-		takeover    = flag.Duration("takeover-delay", envDuration("KFKLEASE_TAKEOVER_DELAY", 0), "wait this long after another site's term ended before claiming, so that its workload has stopped; 0 claims at once (KFKLEASE_TAKEOVER_DELAY)")
-		ttl         = flag.Duration("ttl", envDuration("KFKLEASE_TTL", 10*time.Second), "lease ttl, the same for all participants (KFKLEASE_TTL)")
-		margin      = flag.Duration("margin", envDuration("KFKLEASE_MARGIN", 0), "safety margin subtracted from the holder's deadline; 0 for ttl/5 (KFKLEASE_MARGIN)")
-		createTopic = flag.Bool("create-topic", env("KFKLEASE_CREATE_TOPIC", "true") == "true", "create the topic if missing, check it if it exists (KFKLEASE_CREATE_TOPIC)")
-		replicas    = flag.Int("replication-factor", envInt("KFKLEASE_REPLICATION_FACTOR", lease.DefaultReplicationFactor), "replication factor of a topic created by -create-topic; never lowered to fit the cluster (KFKLEASE_REPLICATION_FACTOR)")
-		minISR      = flag.Int("min-insync-replicas", envInt("KFKLEASE_MIN_INSYNC_REPLICAS", 0), "min.insync.replicas of a created topic; 0 for 2 with three or more replicas, otherwise 1 (KFKLEASE_MIN_INSYNC_REPLICAS)")
-		flushEvery  = flag.Bool("flush-every-record", env("KFKLEASE_FLUSH_EVERY_RECORD", "false") == "true", "create the topic with flush.messages=1: fsync every record before it is acknowledged (KFKLEASE_FLUSH_EVERY_RECORD)")
-		listen      = flag.String("listen", env("KFKLEASE_LISTEN", ":9090"), "gRPC listen address (KFKLEASE_LISTEN)")
-		httpListen  = flag.String("http-listen", env("KFKLEASE_HTTP_LISTEN", ":9091"), "HTTP listen address for /metrics, /status and /healthz; empty to disable (KFKLEASE_HTTP_LISTEN)")
-		logLevel    = flag.String("log-level", env("KFKLEASE_LOG_LEVEL", "info"), "debug, info, warn or error (KFKLEASE_LOG_LEVEL)")
+// common are the flags of every command: the leases and how to reach them.
+type common struct {
+	brokers, topic, logLevel *string
+	ttl                      *time.Duration
 
-		healthURL       = flag.String("health-url", env("KFKLEASE_HEALTH_URL", ""), "workload URL probed while holding; empty turns the health gate off. With several topics, comma-separated in the same order, an empty entry for a lease without a gate (KFKLEASE_HEALTH_URL)")
-		healthInterval  = flag.Duration("health-interval", envDuration("KFKLEASE_HEALTH_INTERVAL", 10*time.Second), "time between workload probes (KFKLEASE_HEALTH_INTERVAL)")
-		healthTimeout   = flag.Duration("health-timeout", envDuration("KFKLEASE_HEALTH_TIMEOUT", 5*time.Second), "timeout of one workload probe (KFKLEASE_HEALTH_TIMEOUT)")
-		healthFailAfter = flag.Duration("health-fail-after", envDuration("KFKLEASE_HEALTH_FAIL_AFTER", 5*time.Minute), "release the lease when the workload has not passed a probe for this long, counted from the start of the term (KFKLEASE_HEALTH_FAIL_AFTER)")
-		healthCooldown  = flag.Duration("health-cooldown", envDuration("KFKLEASE_HEALTH_COOLDOWN", 10*time.Minute), "claim nothing for this long after such a release (KFKLEASE_HEALTH_COOLDOWN)")
+	tlsEnabled, tlsInsecure                                                   *bool
+	tlsCA, tlsCert, tlsKey, tlsServer                                         *string
+	saslMech, saslUser, saslUserF, saslPass, saslPassF, saslToken, saslTokenF *string
+}
 
-		tlsEnabled  = flag.Bool("tls", env("KFKLEASE_TLS", "false") == "true", "connect with TLS (KFKLEASE_TLS)")
-		tlsCA       = flag.String("tls-ca-file", env("KFKLEASE_TLS_CA_FILE", ""), "PEM file with the CA that signed the brokers' certificates, re-read on every connection (KFKLEASE_TLS_CA_FILE; or the PEM itself in KFKLEASE_TLS_CA)")
-		tlsCert     = flag.String("tls-cert-file", env("KFKLEASE_TLS_CERT_FILE", ""), "PEM client certificate for mTLS, re-read on every connection (KFKLEASE_TLS_CERT_FILE; or the PEM itself in KFKLEASE_TLS_CERT)")
-		tlsKey      = flag.String("tls-key-file", env("KFKLEASE_TLS_KEY_FILE", ""), "PEM client key for mTLS, re-read on every connection (KFKLEASE_TLS_KEY_FILE; or the PEM itself in KFKLEASE_TLS_KEY)")
-		tlsServer   = flag.String("tls-server-name", env("KFKLEASE_TLS_SERVER_NAME", ""), "name to verify the brokers' certificates against (KFKLEASE_TLS_SERVER_NAME)")
-		tlsInsecure = flag.Bool("tls-insecure-skip-verify", env("KFKLEASE_TLS_INSECURE_SKIP_VERIFY", "false") == "true", "skip certificate verification; test stands only (KFKLEASE_TLS_INSECURE_SKIP_VERIFY)")
-		saslMech    = flag.String("sasl-mechanism", env("KFKLEASE_SASL_MECHANISM", ""), "plain, scram-sha-256, scram-sha-512 or oauthbearer (KFKLEASE_SASL_MECHANISM)")
-		saslUser    = flag.String("sasl-username", env("KFKLEASE_SASL_USERNAME", ""), "SASL username (KFKLEASE_SASL_USERNAME)")
-		saslUserF   = flag.String("sasl-username-file", env("KFKLEASE_SASL_USERNAME_FILE", ""), "file with the SASL username, for secrets that hold both (KFKLEASE_SASL_USERNAME_FILE)")
-		saslPass    = flag.String("sasl-password", env("KFKLEASE_SASL_PASSWORD", ""), "SASL password; prefer the file (KFKLEASE_SASL_PASSWORD)")
-		saslPassF   = flag.String("sasl-password-file", env("KFKLEASE_SASL_PASSWORD_FILE", ""), "file with the SASL password, re-read on every authentication (KFKLEASE_SASL_PASSWORD_FILE)")
-		saslToken   = flag.String("sasl-token", env("KFKLEASE_SASL_TOKEN", ""), "OAUTHBEARER token; prefer the file (KFKLEASE_SASL_TOKEN)")
-		saslTokenF  = flag.String("sasl-token-file", env("KFKLEASE_SASL_TOKEN_FILE", ""), "file with the OAUTHBEARER token, re-read on every authentication (KFKLEASE_SASL_TOKEN_FILE)")
-	)
-	flag.Parse()
+func commonFlags(fs *flag.FlagSet) *common {
+	return &common{
+		brokers:  fs.String("brokers", env("KFKLEASE_BROKERS", ""), "comma-separated bootstrap addresses (KFKLEASE_BROKERS)"),
+		topic:    fs.String("topic", env("KFKLEASE_TOPIC", ""), "lease topic; comma-separated for several leases, one per topic (KFKLEASE_TOPIC)"),
+		ttl:      fs.Duration("ttl", envDuration("KFKLEASE_TTL", 10*time.Second), "lease ttl, the same for all participants (KFKLEASE_TTL)"),
+		logLevel: fs.String("log-level", env("KFKLEASE_LOG_LEVEL", "info"), "debug, info, warn or error (KFKLEASE_LOG_LEVEL)"),
 
+		tlsEnabled:  fs.Bool("tls", env("KFKLEASE_TLS", "false") == "true", "connect with TLS (KFKLEASE_TLS)"),
+		tlsCA:       fs.String("tls-ca-file", env("KFKLEASE_TLS_CA_FILE", ""), "PEM file with the CA that signed the brokers' certificates, re-read on every connection (KFKLEASE_TLS_CA_FILE; or the PEM itself in KFKLEASE_TLS_CA)"),
+		tlsCert:     fs.String("tls-cert-file", env("KFKLEASE_TLS_CERT_FILE", ""), "PEM client certificate for mTLS, re-read on every connection (KFKLEASE_TLS_CERT_FILE; or the PEM itself in KFKLEASE_TLS_CERT)"),
+		tlsKey:      fs.String("tls-key-file", env("KFKLEASE_TLS_KEY_FILE", ""), "PEM client key for mTLS, re-read on every connection (KFKLEASE_TLS_KEY_FILE; or the PEM itself in KFKLEASE_TLS_KEY)"),
+		tlsServer:   fs.String("tls-server-name", env("KFKLEASE_TLS_SERVER_NAME", ""), "name to verify the brokers' certificates against (KFKLEASE_TLS_SERVER_NAME)"),
+		tlsInsecure: fs.Bool("tls-insecure-skip-verify", env("KFKLEASE_TLS_INSECURE_SKIP_VERIFY", "false") == "true", "skip certificate verification; test stands only (KFKLEASE_TLS_INSECURE_SKIP_VERIFY)"),
+		saslMech:    fs.String("sasl-mechanism", env("KFKLEASE_SASL_MECHANISM", ""), "plain, scram-sha-256, scram-sha-512 or oauthbearer (KFKLEASE_SASL_MECHANISM)"),
+		saslUser:    fs.String("sasl-username", env("KFKLEASE_SASL_USERNAME", ""), "SASL username (KFKLEASE_SASL_USERNAME)"),
+		saslUserF:   fs.String("sasl-username-file", env("KFKLEASE_SASL_USERNAME_FILE", ""), "file with the SASL username, for secrets that hold both (KFKLEASE_SASL_USERNAME_FILE)"),
+		saslPass:    fs.String("sasl-password", env("KFKLEASE_SASL_PASSWORD", ""), "SASL password; prefer the file (KFKLEASE_SASL_PASSWORD)"),
+		saslPassF:   fs.String("sasl-password-file", env("KFKLEASE_SASL_PASSWORD_FILE", ""), "file with the SASL password, re-read on every authentication (KFKLEASE_SASL_PASSWORD_FILE)"),
+		saslToken:   fs.String("sasl-token", env("KFKLEASE_SASL_TOKEN", ""), "OAUTHBEARER token; prefer the file (KFKLEASE_SASL_TOKEN)"),
+		saslTokenF:  fs.String("sasl-token-file", env("KFKLEASE_SASL_TOKEN_FILE", ""), "file with the OAUTHBEARER token, re-read on every authentication (KFKLEASE_SASL_TOKEN_FILE)"),
+	}
+}
+
+// setup makes a JSON logger the default, checks the required flags and
+// returns the logger and the lease topics.
+func (c *common) setup() (*slog.Logger, []string, error) {
 	var level slog.Level
-	if err := level.UnmarshalText([]byte(*logLevel)); err != nil {
-		return fmt.Errorf("log level: %w", err)
+	if err := level.UnmarshalText([]byte(*c.logLevel)); err != nil {
+		return nil, nil, fmt.Errorf("log level: %w", err)
 	}
 	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(log)
+	if *c.brokers == "" || *c.topic == "" {
+		return nil, nil, errors.New("brokers and topic are required")
+	}
+	topics := strings.Split(*c.topic, ",")
+	if slices.Contains(topics, "") {
+		return nil, nil, fmt.Errorf("topic %q: empty entry", *c.topic)
+	}
+	return log, topics, nil
+}
 
-	if *brokers == "" || *topic == "" {
-		return errors.New("brokers and topic are required")
+// config is the lease configuration the common flags describe, without a
+// topic.
+func (c *common) config(log *slog.Logger) lease.Config {
+	return lease.Config{
+		Brokers: strings.Split(*c.brokers, ","),
+		TTL:     *c.ttl,
+		Auth: lease.Auth{
+			TLS: lease.TLS{
+				Enabled: *c.tlsEnabled,
+				CA:      os.Getenv("KFKLEASE_TLS_CA"), CAFile: *c.tlsCA,
+				Cert: os.Getenv("KFKLEASE_TLS_CERT"), CertFile: *c.tlsCert,
+				Key: os.Getenv("KFKLEASE_TLS_KEY"), KeyFile: *c.tlsKey,
+				ServerName: *c.tlsServer, InsecureSkipVerify: *c.tlsInsecure,
+			},
+			SASL: lease.SASL{
+				Mechanism: *c.saslMech, Username: *c.saslUser, UsernameFile: *c.saslUserF,
+				Password: *c.saslPass, PasswordFile: *c.saslPassF,
+				Token: *c.saslToken, TokenFile: *c.saslTokenF,
+			},
+		},
+		Logger: log,
+	}
+}
+
+func run(args []string) error {
+	fs := flag.NewFlagSet("kfklease-scaler", flag.ExitOnError)
+	c := commonFlags(fs)
+	var (
+		site        = fs.String("site", env("KFKLEASE_SITE", ""), "where this scaler runs, a cluster: the lease belongs to a site; empty for the holder id up to its last slash (KFKLEASE_SITE)")
+		holder      = fs.String("holder", env("KFKLEASE_HOLDER", ""), "holder id <site>/<name>, unique per process; empty for <site>/<hostname>-<random> (KFKLEASE_HOLDER)")
+		takeover    = fs.Duration("takeover-delay", envDuration("KFKLEASE_TAKEOVER_DELAY", 0), "wait this long after another site's term ended before claiming, so that its workload has stopped; 0 claims at once (KFKLEASE_TAKEOVER_DELAY)")
+		standby     = fs.Bool("standby", env("KFKLEASE_STANDBY", "false") == "true", "standby mode: follow the leases and never claim them, to take this site out for maintenance or move the workload away (KFKLEASE_STANDBY)")
+		margin      = fs.Duration("margin", envDuration("KFKLEASE_MARGIN", 0), "safety margin subtracted from the holder's deadline; 0 for ttl/5 (KFKLEASE_MARGIN)")
+		createTopic = fs.Bool("create-topic", env("KFKLEASE_CREATE_TOPIC", "true") == "true", "create the topic if missing, check it if it exists (KFKLEASE_CREATE_TOPIC)")
+		replicas    = fs.Int("replication-factor", envInt("KFKLEASE_REPLICATION_FACTOR", lease.DefaultReplicationFactor), "replication factor of a topic created by -create-topic; never lowered to fit the cluster (KFKLEASE_REPLICATION_FACTOR)")
+		minISR      = fs.Int("min-insync-replicas", envInt("KFKLEASE_MIN_INSYNC_REPLICAS", 0), "min.insync.replicas of a created topic; 0 for 2 with three or more replicas, otherwise 1 (KFKLEASE_MIN_INSYNC_REPLICAS)")
+		flushEvery  = fs.Bool("flush-every-record", env("KFKLEASE_FLUSH_EVERY_RECORD", "false") == "true", "create the topic with flush.messages=1: fsync every record before it is acknowledged (KFKLEASE_FLUSH_EVERY_RECORD)")
+		listen      = fs.String("listen", env("KFKLEASE_LISTEN", ":9090"), "gRPC listen address (KFKLEASE_LISTEN)")
+		httpListen  = fs.String("http-listen", env("KFKLEASE_HTTP_LISTEN", ":9091"), "HTTP listen address for /metrics, /status and /healthz; empty to disable (KFKLEASE_HTTP_LISTEN)")
+
+		healthURL       = fs.String("health-url", env("KFKLEASE_HEALTH_URL", ""), "workload URL probed while holding; empty turns the health gate off. With several topics, comma-separated in the same order, an empty entry for a lease without a gate (KFKLEASE_HEALTH_URL)")
+		healthInterval  = fs.Duration("health-interval", envDuration("KFKLEASE_HEALTH_INTERVAL", 10*time.Second), "time between workload probes (KFKLEASE_HEALTH_INTERVAL)")
+		healthTimeout   = fs.Duration("health-timeout", envDuration("KFKLEASE_HEALTH_TIMEOUT", 5*time.Second), "timeout of one workload probe (KFKLEASE_HEALTH_TIMEOUT)")
+		healthFailAfter = fs.Duration("health-fail-after", envDuration("KFKLEASE_HEALTH_FAIL_AFTER", 5*time.Minute), "release the lease when the workload has not passed a probe for this long, counted from the start of the term (KFKLEASE_HEALTH_FAIL_AFTER)")
+		healthCooldown  = fs.Duration("health-cooldown", envDuration("KFKLEASE_HEALTH_COOLDOWN", 10*time.Minute), "claim nothing for this long after such a release (KFKLEASE_HEALTH_COOLDOWN)")
+	)
+	_ = fs.Parse(args)
+
+	log, topics, err := c.setup()
+	if err != nil {
+		return err
 	}
 	if *replicas < 1 || *replicas > math.MaxInt16 || *minISR < 0 {
 		return fmt.Errorf("replication factor %d or min insync replicas %d out of range", *replicas, *minISR)
 	}
-	topics := strings.Split(*topic, ",")
 	urls := make([]string, len(topics))
 	if *healthURL != "" {
 		urls = strings.Split(*healthURL, ",")
@@ -140,43 +206,20 @@ func run() error {
 			return fmt.Errorf("health fail-after %v must be at least two probe intervals (%v)", *healthFailAfter, *healthInterval)
 		}
 	}
-	base := lease.Config{
-		Brokers:     strings.Split(*brokers, ","),
-		CreateTopic: *createTopic,
-		TopicSettings: lease.TopicSettings{
-			ReplicationFactor: int16(*replicas),
-			MinInsyncReplicas: *minISR,
-			FlushEveryRecord:  *flushEvery,
-		},
-		Site:          *site,
-		Holder:        *holder,
-		TakeoverDelay: *takeover,
-		TTL:           *ttl,
-		Margin:        *margin,
-		Auth: lease.Auth{
-			TLS: lease.TLS{
-				Enabled: *tlsEnabled,
-				CA:      os.Getenv("KFKLEASE_TLS_CA"), CAFile: *tlsCA,
-				Cert: os.Getenv("KFKLEASE_TLS_CERT"), CertFile: *tlsCert,
-				Key: os.Getenv("KFKLEASE_TLS_KEY"), KeyFile: *tlsKey,
-				ServerName: *tlsServer, InsecureSkipVerify: *tlsInsecure,
-			},
-			SASL: lease.SASL{
-				Mechanism: *saslMech, Username: *saslUser, UsernameFile: *saslUserF,
-				Password: *saslPass, PasswordFile: *saslPassF,
-				Token: *saslToken, TokenFile: *saslTokenF,
-			},
-		},
-		Logger: log,
+	base := c.config(log)
+	base.CreateTopic = *createTopic
+	base.TopicSettings = lease.TopicSettings{
+		ReplicationFactor: int16(*replicas),
+		MinInsyncReplicas: *minISR,
+		FlushEveryRecord:  *flushEvery,
 	}
+	base.Site, base.Holder, base.TakeoverDelay = *site, *holder, *takeover
+	base.Margin, base.Standby = *margin, *standby
 	// One candidate per lease, each with its own client: the leases are
 	// independent, and so is their traffic.
 	cands := make([]*lease.Candidate, len(topics))
 	served := make([]scaler.Lease, len(topics))
 	for i, t := range topics {
-		if t == "" {
-			return fmt.Errorf("topic %q: empty entry", *topic)
-		}
 		cfg := base
 		cfg.Topic = t
 		if urls[i] != "" {
@@ -189,7 +232,7 @@ func run() error {
 		cands[i] = cand
 		served[i] = scaler.Lease{Topic: t, Holder: cand.Holder(), Source: cand}
 	}
-	srv, err := scaler.NewLeases(served, *ttl)
+	srv, err := scaler.NewLeases(served, *c.ttl)
 	if err != nil {
 		return err
 	}
@@ -210,7 +253,7 @@ func run() error {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- gs.Serve(lis) }()
 	for _, l := range served {
-		log.Info("serving", "addr", lis.Addr().String(), "topic", l.Topic, "holder", l.Holder, "site", lease.SiteOf(l.Holder), "ttl", *ttl, "takeover_delay", *takeover)
+		log.Info("serving", "addr", lis.Addr().String(), "topic", l.Topic, "holder", l.Holder, "site", lease.SiteOf(l.Holder), "ttl", *c.ttl, "takeover_delay", *takeover, "standby", *standby)
 	}
 
 	var hs2 *http.Server
