@@ -151,5 +151,11 @@ and this project adheres to
 
 ### Fixed
 
+- A participant that starts on a log read from offset 0, which a compacted
+  topic usually is, reported `Ready` before it had read a record, so a
+  scaler that had just started could answer KEDA "not holding" for a
+  moment instead of an error. `Ready` now also waits until the log has
+  been read to its end.
+
 - Stand: the `broker` scenario brings Kafka back without reissuing the
   stand's CA, so an mTLS participant can reconnect after the outage.

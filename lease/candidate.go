@@ -192,8 +192,9 @@ type Status struct {
 	CooldownUntil time.Time
 
 	// Ready is whether this participant has known the state of the lease
-	// since it started: false until its view is first certain. Before that,
-	// not Holding means "do not know" rather than "another holds it".
+	// since it started: false until its view is first certain with the log
+	// read up to its end. Before that, not Holding means "do not know"
+	// rather than "another holds it".
 	Ready bool
 
 	// Standby is whether this participant is in standby: it follows the

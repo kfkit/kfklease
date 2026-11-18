@@ -139,7 +139,8 @@ Under the chart `D` is at least KEDA's `pollingInterval + cooldownPeriod`
 plus a margin for the workload to stop, and the cooldown is longer than a
 scaler restart, so a restarted scaler claims for its site again before KEDA
 gives the workload up. A new scaler answers KEDA with an error, not with "not
-holding", until its view has been certain once (`Status.Ready`).
+holding", until its view has been certain once, with the log read to its
+end (`Status.Ready`).
 
 ## The margin
 

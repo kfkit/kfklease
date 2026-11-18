@@ -466,9 +466,22 @@ func TestAgentTakeoverDelay(t *testing.T) {
 func TestAgentReadyOnceCertain(t *testing.T) {
 	ready := func(h *agentHarness) bool { s, _, _ := h.a.status(at(0)); return s.Ready }
 	if h := newHarness(t, 0); !ready(h) {
-		t.Fatal("not ready on a log read from its start")
+		t.Fatal("not ready on an empty log")
 	}
-	h := newHarness(t, 40)
+	// A log read from its start is certain at once, but says nothing until
+	// it has been read to its end.
+	h := newHarness(t, 0)
+	h.land(at(0), Record{Kind: Claim, Holder: "other", TTL: agTTL})
+	h.land(at(1), Record{Kind: Renew, Holder: "other", Epoch: 0, TTL: agTTL})
+	h.a = newAgent(h.a.cfg, slog.New(slog.DiscardHandler), 0, int64(len(h.log)), at(1.1))
+	if ready(h) {
+		t.Fatal("ready before reading a log with records in it")
+	}
+	h.read(at(1.2))
+	if !ready(h) {
+		t.Fatal("not ready on a log read to its end")
+	}
+	h = newHarness(t, 40)
 	h.read(at(0))
 	if ready(h) {
 		t.Fatal("ready before the view was ever certain")

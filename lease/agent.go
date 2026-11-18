@@ -47,8 +47,9 @@ type agent struct {
 	cooldownUntil time.Time
 	releaseDue    bool
 
-	// ready is set once the view has been certain: from then on the agent
-	// knows who holds the lease, or knew it last.
+	// ready is set once the view has been certain with the log read up to
+	// its end offset: from then on the agent knows who holds the lease, or
+	// knew it last.
 	ready bool
 
 	// standby: follow the log, never claim, release a term held.
@@ -99,7 +100,7 @@ func newAgent(cfg Config, log *slog.Logger, start, end int64, now time.Time) *ag
 		// Nothing was ever deleted, so the reader sees everything. Holes
 		// left by compaction are caught record by record.
 		a.view = NewViewFromStart(cfg.TTL)
-		a.ready = true
+		a.noteReady()
 	}
 	return a
 }
@@ -130,6 +131,14 @@ func (a *agent) fetched(now time.Time, highWater int64) {
 	}
 	a.fetchedOnce = true
 	a.highWater = max(a.highWater, highWater)
+	a.noteReady()
+}
+
+// noteReady sets ready once the view is certain and has caught up with the
+// log. A view of the whole history is certain before it has read a single
+// record, and knows nothing yet.
+func (a *agent) noteReady() {
+	a.ready = a.ready || (a.view.Certain() && a.nextOffset >= a.highWater)
 }
 
 // record applies the next record of the log: its offset, its broker
@@ -162,7 +171,7 @@ func (a *agent) record(now time.Time, offset int64, ts time.Time, value []byte) 
 	}
 	a.log.Debug("record", "offset", rec.Offset, "kind", rec.Kind, "by", rec.Holder, "epoch", rec.Epoch, "outcome", out)
 
-	a.ready = a.ready || a.view.Certain()
+	a.noteReady()
 	if rec.Holder == a.cfg.Holder {
 		early := rec.Kind == Claim && out == Accepted && wasCertain && ts.Before(a.takeoverFrom(before))
 		a.ownRecord(now, rec.Offset, rec.Kind, verdict{out, early})
