@@ -38,6 +38,14 @@ site: ""
 takeoverDelay: 0
 takeoverMargin: 30   # seconds; cover the workload's terminationGracePeriodSeconds
 
+# Standby mode: this cluster follows the leases and never claims them, so
+# its workload stays at zero. For maintenance, or to move the workload to
+# another cluster on purpose: setting it on the holding cluster restarts the
+# scaler, whose pod releases on its way out, and another cluster takes over
+# after its takeoverDelay. Set it back to false to let the cluster claim
+# again; nothing moves back on its own.
+standby: false
+
 logLevel: info
 
 # Optional: give the lease up when the workload cannot run here. While this

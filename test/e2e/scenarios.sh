@@ -6,7 +6,7 @@
 # at once and how long nobody wrote.
 #
 #   ./scenarios.sh            # all
-#   ./scenarios.sh crash      # one: coldstart, restart, crash, partition, pause, broker, replicas, scaler-down
+#   ./scenarios.sh crash      # one: coldstart, restart, crash, partition, pause, broker, replicas, scaler-down, standby
 #
 # Expects the stand to be up (./smoke.sh), the image built (./build-image.sh)
 # and the manifests deployed to both clusters (./deploy.sh k3s-a; ./deploy.sh k3s-b).
@@ -372,8 +372,37 @@ scenario_scaler_down() {
   echo "   ok: ${h} stopped its workload without its scaler and stayed idle"
 }
 
+# lease_status prints `kfklease-scaler status` for the lease, read from
+# outside both clusters.
+lease_status() {
+  docker run --rm --network "${COMPOSE_PROJECT}_kfk" kfklease-scaler:dev status \
+    -brokers "$KAFKA_ADDR:$KAFKA_PORT" -topic "$TOPIC" -ttl "${TTL}s" -log-level warn
+}
+
+scenario_standby() {
+  echo "== standby: put the holder's cluster in standby; the workload moves, and stays moved"
+  local h o since st site
+  h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
+  # The scaler restarts in standby; its predecessor releases on the way out.
+  STANDBY=true ./deploy.sh "$h" >/dev/null
+  [[ $(status_get "$h" 'r["standby"]') == True ]] || fail "the scaler of ${h} is not in standby" || return
+  echo "   ${h} -> ${o}: $(transition "$h" "$o" "$TAKEOVER") (takeover delay ${TAKEOVER_DELAY}s)"
+  st=$(lease_status) || fail "status command failed" || return
+  echo "   status: ${st}"
+  site=$(python3 -c 'import sys, json; r = json.loads(sys.argv[1]); print(r["site"] if r["held"] else "")' "$st")
+  [[ $site == "$o" ]] || fail "status names site '${site}', want ${o}" || return
+  watch_exclusive $(( 2 * TTL ))
+  # Out of standby, the cluster claims again by the usual rules: the lease
+  # is held, so nothing moves back.
+  ./deploy.sh "$h" >/dev/null
+  watch_exclusive $(( 2 * TTL ))
+  [[ $(holder) == "$o" && $(running "$h") == 0 ]] || fail "the workload moved back to ${h}" || return
+  heartbeats "$since"
+  echo "   ok: ${o} holds, ${h} back out of standby and idle"
+}
+
 if (( $# == 0 )); then
-  set -- coldstart restart crash partition pause broker replicas scaler-down
+  set -- coldstart restart crash partition pause broker replicas scaler-down standby
 fi
 for s in "$@"; do
   "scenario_${s//-/_}"
