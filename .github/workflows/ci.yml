@@ -134,6 +134,26 @@ jobs:
             echo "'$bad': $err"
           done
           grep -q 'replaced by site' <<<"$(t --set holderPrefix=eu --set site=eu 2>&1)" || { echo "holderPrefix error does not name site"; exit 1; }
+      - name: Two scaler replicas per site, rolled one at a time, kept by a PodDisruptionBudget
+        run: |
+          t() { helm template t charts/kfklease --set site=s --set brokers=k:9092 --set topic=t \
+                  --set scaledObject.targetRef.name=w "$@"; }
+          out=$(t)
+          echo "$out"
+          for want in '  replicas: 2' '    type: RollingUpdate' '      maxSurge: 1' '      maxUnavailable: 0' \
+                      '              service: ready' 'kind: PodDisruptionBudget' '  minAvailable: 1' \
+                      '        podAntiAffinity:' '                topologyKey: kubernetes.io/hostname'; do
+            grep -qxF "$want" <<<"$out" || { echo "missing: $want"; exit 1; }
+          done
+          grep -qF 'Recreate' <<<"$out" && { echo "still Recreate"; exit 1; }
+          out=$(t --set replicaCount=1 --set 'affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key=k' \
+                  --set 'affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].operator=Exists')
+          grep -qxF '  replicas: 1' <<<"$out" || { echo "replicaCount not passed"; exit 1; }
+          grep -qF 'kind: PodDisruptionBudget' <<<"$out" && { echo "PodDisruptionBudget with one replica blocks every drain"; exit 1; }
+          grep -qF 'podAntiAffinity' <<<"$out" && { echo "default anti-affinity next to the given affinity"; exit 1; }
+          grep -qF 'nodeAffinity:' <<<"$out" || { echo "affinity not passed"; exit 1; }
+          grep -qF 'kind: PodDisruptionBudget' <<<"$(t --set podDisruptionBudget.enabled=false)" && { echo "PodDisruptionBudget rendered although disabled"; exit 1; }
+          if t --set replicaCount=0 >/dev/null; then echo "rendered with replicaCount=0"; exit 1; fi
       - name: Standby mode off by default
         run: |
           dep() { helm template t charts/kfklease --set site=s --set brokers=k:9092 --set topic=t \
@@ -181,7 +201,7 @@ jobs:
           docker compose -f test/e2e/compose.yaml ps -a
           for c in k3s-a k3s-b; do
             kubectl --kubeconfig test/e2e/.out/$c/kubeconfig.yaml -n kfklease get pods,scaledobject || true
-            kubectl --kubeconfig test/e2e/.out/$c/kubeconfig.yaml -n kfklease logs deploy/kfklease --tail=50 || true
+            kubectl --kubeconfig test/e2e/.out/$c/kubeconfig.yaml -n kfklease logs -l app.kubernetes.io/name=kfklease --prefix --tail=50 || true
             kubectl --kubeconfig test/e2e/.out/$c/kubeconfig.yaml -n keda logs deploy/keda-operator --tail=30 || true
           done
       - if: always()

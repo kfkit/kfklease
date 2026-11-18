@@ -18,6 +18,7 @@ its KEDA polling, its cooldown and the workload's stop. */ -}}
 {{- if lt $delay $bound }}{{ fail (printf "takeoverDelay %d is below pollingInterval + cooldownPeriod + takeoverMargin = %d: another site would start the workload before this one has stopped it" $delay $bound) }}{{ end -}}
 {{- if and $tls.enabled $tls.clientCert (not $tls.secretName) }}{{ fail "auth.tls.clientCert needs auth.tls.secretName" }}{{ end }}
 {{- if and $sasl.mechanism (not $sasl.secretName) }}{{ fail "auth.sasl.mechanism needs auth.sasl.secretName" }}{{ end }}
+{{- if lt (int .Values.replicaCount) 1 }}{{ fail "replicaCount must be at least 1" }}{{ end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -25,11 +26,17 @@ metadata:
   labels:
     {{- include "kfklease.labels" . | nindent 4 }}
 spec:
-  # One participant per cluster. Recreate, not RollingUpdate: two pods of
-  # the same release would be two candidates for the same lease.
-  replicas: 1
+  # Every pod takes part in the lease for the site and answers KEDA for it:
+  # one holds and renews, the others read its term from the log and take
+  # over at once when it ends. Losing one pod neither blinds KEDA nor moves
+  # the workload. A rolling update starts a new pod before it stops an old
+  # one, and waits until the new one knows the lease state (readiness).
+  replicas: {{ .Values.replicaCount }}
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       {{- include "kfklease.selectorLabels" . | nindent 6 }}
@@ -187,9 +194,13 @@ spec:
               containerPort: {{ .Values.service.port }}
             - name: http
               containerPort: {{ .Values.service.httpPort }}
+          # Ready once the scaler knows the state of every lease it serves;
+          # until then it would answer KEDA with an error.
           readinessProbe:
             grpc:
               port: {{ .Values.service.port }}
+              service: ready
+            periodSeconds: 2
           livenessProbe:
             grpc:
               port: {{ .Values.service.port }}
@@ -218,7 +229,18 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
       affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- if .Values.affinity }}
+        {{- toYaml .Values.affinity | nindent 8 }}
+        {{- else }}
+        # The replicas on different nodes where there are several: a lost
+        # node then takes one of them, not all.
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "kfklease.selectorLabels" . | nindent 20 }}
+        {{- end }}

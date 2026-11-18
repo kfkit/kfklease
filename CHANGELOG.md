@@ -60,6 +60,22 @@ and this project adheres to
   workload to zero only after `cooldownPeriod` of such errors; without a
   fallback it keeps the replicas. A ScaledObject of your own should have a
   `cooldownPeriod` longer than a scaler restart.
+- Chart: two scaler pods per cluster by default (`replicaCount: 2`), where
+  there was one, updated with `RollingUpdate` (one new pod at a time, none
+  stopped before its successor is ready) where they were recreated, with a
+  PodDisruptionBudget of `minAvailable: 1` and a preferred anti-affinity
+  that spreads them over nodes. Every pod takes part in the lease for the
+  site and answers KEDA for it. A cluster now runs twice the scaler pods,
+  a drain waits for the second pod rather than evicting the only one, and
+  an empty `affinity` is no longer empty in the pod. To keep one pod, set
+  `replicaCount: 1`; the PodDisruptionBudget is then not rendered.
+- Scaler: KEDA is told whether the scaler's *site* holds the lease
+  (`lease.Status.SiteHolding`), where it was told whether this scaler pod
+  holds it. With one scaler per site the answers are the same. A workload
+  that fences by epoch behind the scaler's Service, as the heartbeat
+  example does, must read `site_holding` and `site_epoch` from `/status`
+  rather than `holding` and `epoch`, which are true on one pod of the site
+  only. The health probe likewise runs on every pod while the site holds.
 
 ### Added
 
@@ -139,7 +155,29 @@ and this project adheres to
   that the workload moves without overlap and that `status` names the new
   site, and that nothing moves back once standby is off.
 
+- Scaler replicas per site: every participant of a site that does not hold
+  the lease believes its site does while it reads the holder's renewals
+  fresh from the log, for the term less the margin, and needs a takeover
+  delay to do so. Library: `lease.Status.SiteHolding`, `SiteEpoch`,
+  `SiteDeadline`; `site_holding` and `site_epoch` in `/status`; the metric
+  `kfklease_site_holding`. Chart: `replicaCount`, `podDisruptionBudget`.
+- The scaler's readiness: a gRPC health service `ready` that serves once
+  the scaler knows the state of every lease, which the chart's readiness
+  probe asks for. A stopping scaler stops answering KEDA before it
+  releases.
+- Stand: the `holder-pod` scenario deletes the scaler pod that holds the
+  lease, and the `bad-image` scenario upgrades a cluster's scaler to an
+  image that does not pull; in both the workload keeps its pods and the
+  other cluster never starts. `deploy.sh` takes `IMAGE_TAG` and `WAIT`.
+
 ### Changed
+
+- The health gate counts per site: a participant whose site holds the
+  lease and whose workload has not passed a probe for `failAfter` claims
+  nothing for `cooldown`, holder or not, and a term that follows another of
+  the same site within a TTL continues the time the gate counts from. A
+  release by the gate therefore moves the lease to another site rather than
+  to another scaler pod of the same one.
 
 - Metric `kfklease_lease_holder_info`: the `site` of a holder id without a
   slash is the holder id itself, where it was empty.

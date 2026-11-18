@@ -39,7 +39,7 @@ docker compose down -v         # tear down, drop cluster state
 ```
 
 `deploy.sh` renders `charts/kfklease` (helm, or the `alpine/helm` image when
-helm is not installed) with site `<cluster>`, `cooldownPeriod` 30 s and
+helm is not installed) with site `<cluster>`, the chart's two scaler pods, `cooldownPeriod` 30 s and
 `takeoverMargin` 5 s (so a takeover delay of 40 s), and the `singleton`
 deployment from `manifests/` as the scale target: one replica while the
 cluster holds the lease (`REPLICAS=3 ./deploy.sh ...` for three), zero
@@ -60,7 +60,9 @@ with TTL 10 s, `pollingInterval: 5`, `cooldownPeriod: 30`, `takeoverDelay`
 | Scenario    | What happens                                   | Result                                   |
 |-------------|------------------------------------------------|------------------------------------------|
 | `coldstart` | both clusters start                            | one holder within 1 s, standby idle      |
-| `restart`   | the holder's scaler pod is deleted             | the new pod holds a new epoch for the same site within seconds; the workload's pod UIDs are the same 40 s later and the other cluster never starts |
+| `restart`   | every scaler pod of the holder's cluster is deleted | a new pod holds a new epoch for the same site within seconds; the workload's pod UIDs are the same 40 s later and the other cluster never starts |
+| `holder-pod` | the scaler pod that holds the lease is deleted, the other scaler pod of its cluster stays | the other pod holds a new epoch for the same site within seconds; the workload's pod UIDs are the same 40 s later and the other cluster never starts |
+| `bad-image` | the holder's cluster is upgraded to a scaler image tag that does not pull (`IMAGE_TAG=does-not-exist`) | the new pod waits in `ErrImageNeverPull`, the two old pods stay ready and keep the site; the workload's pod UIDs are the same 40 s later and the other cluster never starts; then rolled back |
 | `crash`     | `docker compose kill` the holder's cluster     | takeover after TTL + the takeover delay; the revived cluster restarts its stale pod until its KEDA is back, then stays idle |
 | `partition` | holder's cluster cut off from Kafka            | holder's pod down after its deadline + the cooldown, standby's up after TTL + the delay, no overlap |
 | `pause`     | holder's cluster frozen                        | takeover after TTL + the delay into the freeze; on wake-up the frozen pod goes |

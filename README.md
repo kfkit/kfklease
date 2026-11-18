@@ -103,12 +103,18 @@ while the new pod reads the log, and another site waits `takeoverDelay`
 (by default `pollingInterval + cooldownPeriod + takeoverMargin`, 95 s)
 after the end of a foreign term before it claims, so the old site's
 workload is down by then. A Kafka outage ends with the lease where it was.
+Each cluster runs two scaler pods by default (`replicaCount`): one holds
+the term, every one answers KEDA for the site, and losing one, or an
+upgrade to an image that does not pull, moves nothing.
 
 Upgrading from 0.3.0: `holderPrefix` is now `site`, which is required
 (`--set site=eu-west`); `scaledObject.target` is now
 `scaledObject.targetRef.name` (`--set scaledObject.targetRef.name=my-singleton`);
 the old values fail the render. `cooldownPeriod` is now 60 s and a
-failover waits `takeoverDelay`. See [CHANGELOG.md](CHANGELOG.md).
+failover waits `takeoverDelay`. Two scaler pods run per cluster
+(`replicaCount: 2`, `RollingUpdate`, a PodDisruptionBudget), and KEDA is
+told whether the site holds the lease; a workload that reads `/status`
+fences on `site_holding` and `site_epoch`. See [CHANGELOG.md](CHANGELOG.md).
 
 The chart pulls `ghcr.io/kfkit/kfklease-scaler` at the same version:
 linux/amd64 and linux/arm64, signed with cosign. The digest and the verify
@@ -194,8 +200,8 @@ pod); see
 ### Fencing by epoch
 
 [examples/heartbeat](examples/heartbeat) is a workload that does it: before
-every write it asks the scaler's `/status` and writes only while `holding`
-is true, tagging the record with the epoch; its `report` mode is the
+every write it asks the scaler's `/status` and writes only while
+`site_holding` is true, tagging the record with `site_epoch`; its `report` mode is the
 consumer side, which rejects a record whose epoch is below one it has
 already seen. The e2e stand runs it as the workload and, after every
 scenario, checks by the broker's clock that no two epochs ever wrote at
@@ -231,7 +237,8 @@ The end-to-end stand with two Kubernetes clusters is described in
 - [x] Several leases, one per topic, served by one scaler
 - [x] The lease belongs to a site: a scaler restart or a Kafka outage leaves the workload in place
 - [x] Standby mode and a `status` command
-- [ ] A handover that skips the takeover delay; scaler replicas per site
+- [x] Scaler replicas per site
+- [ ] A handover that skips the takeover delay
 - [x] Failure-mode tests: clock skew and drift, in the simulation
 - [x] Example workload fencing by epoch; workload-level exclusion check on the stand
 - [x] Image and chart on GHCR, cosign-signed

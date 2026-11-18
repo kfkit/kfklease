@@ -48,6 +48,19 @@ standby: false
 
 logLevel: info
 
+# Scaler pods per cluster. Every one takes part in the lease for the site
+# and answers KEDA for it: one holds the term and renews it, the others read
+# it from the log and say "my site holds" while the term is valid, and take
+# over at once when it ends. Losing one pod (a node, an eviction, an image
+# that does not pull in an upgrade) then neither blinds KEDA nor moves the
+# workload. Spread over nodes by default (affinity); 1 is the old single pod.
+replicaCount: 2
+# Keeps a voluntary disruption (a drain) from taking every scaler pod of the
+# cluster at once. Rendered only with more than one replica.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
 # Optional: give the lease up when the workload cannot run here. While this
 # cluster holds the lease, the scaler GETs url every interval (200-399 is
 # healthy). When no probe has passed for failAfter, counted from the start
@@ -170,4 +183,5 @@ resources:
 
 nodeSelector: {}
 tolerations: []
+# Empty: a preferred anti-affinity that spreads the scaler pods over nodes.
 affinity: {}

@@ -64,6 +64,8 @@ helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.3.0 \
 | `site` | required: names the cluster. The lease belongs to it; holder ids are `<site>/<pod>`, in logs and on the topic |
 | `takeoverDelay` | seconds a cluster waits after another site's term ended before it claims; `0` (the default) derives `pollingInterval + cooldownPeriod + takeoverMargin` of the slowest ScaledObject, 95 s with the defaults, and a value below that fails the render |
 | `takeoverMargin` | seconds the old site's workload gets to stop once its KEDA scales it to zero, `30` by default: cover its `terminationGracePeriodSeconds` |
+| `replicaCount` | scaler pods per cluster, `2` by default. One holds the term, every one answers KEDA for the site; see [Scaler replicas](#scaler-replicas) |
+| `podDisruptionBudget.enabled`, `.minAvailable` | `true` and `1` by default: a drain never takes the last scaler pod of the cluster. Rendered only with more than one replica |
 | `standby` | `false` by default; `true` keeps this cluster out of every lease of the release: it follows them and never claims. See [Standby and the status command](#standby-and-the-status-command) |
 | `ttl` | how long a term lasts without renewal, `10s` by default. The same for every participant of a lease |
 | `margin` | how much earlier than the term's end the holder stops believing, `ttl/5` by default; see [Choosing TTL and margin](#choosing-ttl-and-margin) |
@@ -76,6 +78,7 @@ helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.3.0 \
 | `scaledObject.enabled` | `false` to write your own ScaledObject; see below |
 | `imagePullSecrets`, `podLabels`, `priorityClassName` | for the scaler pod, empty by default |
 | `podSecurityContext`, `securityContext` | the pod's and the container's, empty by default. The image runs as nonroot and writes nothing, so the restricted Pod Security Standard fits; `values.yaml` has an example |
+| `affinity` | empty by default, which spreads the scaler pods over nodes with a preferred anti-affinity; anything set replaces that |
 
 Upgrading from 0.3.0: `holderPrefix` is replaced by `site`, which is
 required, and `scaledObject.target` is renamed to
@@ -85,7 +88,11 @@ is 60 s where it was 0, and a failover to another cluster waits
 `takeoverDelay` (95 s by default) after the old term ends. A new topic gets
 three replicas where it used to get the broker's
 `default.replication.factor`: on a Kafka cluster with fewer than three
-brokers, set `replicationFactor` to the number of brokers.
+brokers, set `replicationFactor` to the number of brokers. The scaler runs
+two pods per cluster where it ran one, rolled one at a time
+(`RollingUpdate`) where it was recreated, with a PodDisruptionBudget;
+`replicaCount: 1` keeps one pod, which a drain or an upgrade then takes
+away before its successor is up.
 
 The workload itself is yours, in the same namespace. Its
 replica count belongs to KEDA from now on, so leave `replicas` out or set
@@ -97,7 +104,7 @@ Check:
 
 ```bash
 kubectl -n kfklease get scaledobject orders-worker   # ACTIVE True in one cluster, False in the others
-kubectl -n kfklease logs deploy/kfklease             # "acquired" in one cluster
+kubectl -n kfklease logs -l app.kubernetes.io/name=kfklease --prefix  # "acquired" in one pod of one cluster
 curl http://kfklease.kfklease.svc:9091/status        # from inside the cluster
 ```
 
@@ -137,6 +144,34 @@ and refuses a smaller one. The price is the failover time: TTL plus
 `takeoverDelay` plus the pod start, about 1 min 50 s with the defaults.
 Lower `cooldownPeriod` for a faster failover if your scaler restarts are
 fast; the delay follows.
+
+### Scaler replicas
+
+The chart runs `replicaCount` scaler pods per cluster, two by default, and
+every one of them takes part in the lease for the site. One holds the term
+and renews it. The others read its renewals from the log and answer KEDA
+"my site holds" while the term is valid, counted from the moment they read
+the renewal, for the TTL less the margin; a pod cut off from Kafka sees no
+more renewals and stops saying so when the term runs out. When the holder
+goes (its pod deleted, its node lost, a drain), it releases if it can, and
+another pod of the site claims at once, the term being its site's. KEDA,
+behind the scaler's Service, gets the same answer from every ready pod, so
+losing one neither blinds KEDA nor moves the workload. The rules are in
+[docs/protocol.md](protocol.md#several-participants-per-site).
+
+- A pod is ready once it knows the state of every lease it serves; until
+  then it would answer KEDA with an error, so the Service sends KEDA
+  elsewhere.
+- An upgrade starts a new pod before it stops an old one and waits for it
+  to be ready. An upgrade to an image that does not pull stops there, with
+  the old pods still answering.
+- A PodDisruptionBudget with `minAvailable: 1` keeps a drain from taking
+  every scaler pod of the cluster at once, and the pods prefer different
+  nodes.
+- A stopping pod stops answering KEDA before it releases, so KEDA has asked
+  another pod by the time the term moves.
+- The health gate probes from every pod while the site holds the lease;
+  when the workload cannot run, none of them takes the term over for it.
 
 ### The lease topic
 
@@ -342,6 +377,8 @@ The scaler exposes it at `GET /status` on port 9091:
   "holding": true,
   "epoch": 1842,
   "deadline_in_seconds": 7.3,
+  "site_holding": true,
+  "site_epoch": 1842,
   "certain": true,
   "lease": {"holder": "eu-west/kfklease-7d9c4-x2k8p", "epoch": 1842, "expires": "2026-09-24T10:15:32Z"},
   "as_of": "2026-09-24T10:15:22Z",
@@ -356,14 +393,17 @@ names the topics it serves, and an unknown one is a 404.
 
 The pattern, in [examples/heartbeat](../examples/heartbeat):
 
-1. Before a write, ask `/status`. No `holding`, no write.
-2. Send the epoch with the write.
+1. Before a write, ask `/status`. No `site_holding`, no write. The
+   Service sends the request to any scaler pod of the cluster, and
+   `holding` is true on one of them only; `site_holding` is true on every
+   one while the site holds the lease.
+2. Send the epoch with the write: `site_epoch`.
 3. On the receiving side, reject anything with an epoch below the highest
    one seen. That is where exclusion actually happens: an instance that
    outlived its term can still send, but nothing it sends is accepted.
 
-`holding` is a belief with a deadline (`deadline_in_seconds`), so a workload
-that cannot check before every write should check at least once per margin.
+`site_holding` is a belief with a deadline, so a workload that cannot check
+before every write should check at least once per margin.
 
 ## Metrics
 
@@ -378,6 +418,7 @@ serving [several](#several-leases-one-scaler) stay apart.
 | Metric | Meaning |
 |---|---|
 | `kfklease_holding` | 1 while this participant believes it holds the lease |
+| `kfklease_site_holding` | 1 while this participant believes its site holds the lease: what it tells KEDA. 1 on every scaler pod of the holding cluster |
 | `kfklease_epoch` | the held term's epoch; -1 when not holding |
 | `kfklease_belief_remaining_seconds` | seconds until the belief expires unless renewed |
 | `kfklease_certain` | 1 when the scaler's view of the log can be trusted; 0 right after a start on a compacted topic, until it settles |
@@ -390,6 +431,8 @@ serving [several](#several-leases-one-scaler) stay apart.
 
 Alerts worth having: `sum by (topic) (kfklease_holding) != 1` across the
 clusters for longer than a TTL (nobody, or more than one, holds it),
+`kfklease_site_holding` that differs between the pods of one cluster for
+longer than a TTL (one of them is cut off from Kafka),
 `kfklease_certain == 0` for longer than two TTLs (the scaler cannot settle
 its view: check its connection to Kafka), and a rising
 `kfklease_transitions_total` (flapping). Where the workload runs:
@@ -397,7 +440,10 @@ its view: check its connection to Kafka), and a rising
 
 ## When the scaler is gone
 
-The scaler is one pod per cluster. If it is gone while the workload's pods
+With [several scaler pods](#scaler-replicas) per cluster, losing one is
+nothing: another answers KEDA and takes the term over. This section is about
+losing all of them, or the only one with `replicaCount: 1`. If the scaler
+is gone while the workload's pods
 live (its node is lost, it is Pending, its image does not pull), it neither
 renews the lease nor tells KEDA to stop: the term runs out, another cluster
 takes the lease and starts the workload. Without a fallback, KEDA marks
@@ -501,12 +547,14 @@ value, and the fold rejects records that ask for more.
 
 ## Operations
 
-**Upgrading the chart.** `helm upgrade` with the same values; the
-Deployment's strategy is Recreate, so the old pod releases the lease as it
-stops and the new one claims it for the site at once. The workload stays,
-as long as the new pod is up within `cooldownPeriod`; another cluster would
-wait `takeoverDelay`. The same holds for a node drain, an OOM kill or a
-restart by reloader.
+**Upgrading the chart.** `helm upgrade` with the same values. The pods are
+replaced one at a time, each new one ready before an old one stops, and a
+holder that stops releases the lease to another pod of its site at once
+(see [Scaler replicas](#scaler-replicas)). The workload stays; another
+cluster would wait `takeoverDelay`. The same holds for a node drain, an OOM
+kill or a restart by reloader. With `replicaCount: 1` the one pod is
+replaced, and the workload stays as long as the new pod is up within
+`cooldownPeriod`.
 
 **Rotating credentials.** TLS files: nothing to do, the next connection
 uses the new files. SASL environment: restart the pod (reloader does it).
