@@ -27,8 +27,12 @@ type Config struct {
 	// Partition of the lease within Topic. Zero is fine for a one-partition
 	// topic.
 	Partition int32
-	// CreateTopic makes Run create Topic with EnsureTopic if it is missing.
+	// CreateTopic makes Run create Topic with EnsureTopic if it is missing,
+	// and check it and log what falls short of TopicSettings if it exists.
 	CreateTopic bool
+	// TopicSettings are the replication and durability settings of a topic
+	// CreateTopic creates. The zero value is three replicas, two in sync.
+	TopicSettings TopicSettings
 
 	// Holder identifies this participant in the log. It must be unique per
 	// process incarnation: a restarted process must not inherit the term of
@@ -77,7 +81,7 @@ type HealthGate struct {
 	Cooldown time.Duration
 }
 
-func (c Config) withDefaults() (Config, error) {
+func (c Config) withDefaults() (_ Config, err error) {
 	if len(c.Brokers) == 0 {
 		return c, errors.New("lease: no brokers")
 	}
@@ -107,6 +111,9 @@ func (c Config) withDefaults() (Config, error) {
 	}
 	if c.Margin+c.RenewEvery >= c.TTL {
 		return c, fmt.Errorf("lease: margin %v + renew interval %v must stay below ttl %v", c.Margin, c.RenewEvery, c.TTL)
+	}
+	if c.TopicSettings, err = c.TopicSettings.withDefaults(); err != nil {
+		return c, err
 	}
 	if c.Holder == "" {
 		host, _ := os.Hostname()
@@ -287,8 +294,12 @@ func (c *Candidate) Run(ctx context.Context) error {
 	defer cl.Close()
 
 	if cfg.CreateTopic {
-		if err := EnsureTopic(ctx, cl, cfg.Topic, cfg.TTL); err != nil {
+		warnings, err := EnsureTopic(ctx, cl, cfg.Topic, cfg.TTL, cfg.TopicSettings)
+		if err != nil {
 			return err
+		}
+		for _, w := range warnings {
+			c.log.Warn("existing lease topic falls short", "problem", w)
 		}
 	}
 

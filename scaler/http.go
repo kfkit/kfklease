@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -86,6 +87,9 @@ func NewHTTPLeases(ls []Lease) (*HTTP, error) {
 		h.labels = []string{"topic"}
 	}
 	h.descs = newDescs(h.labels)
+	h.descs.holderInfo = prometheus.NewDesc("kfklease_lease_holder_info",
+		"1 for the holder of the lease, as the log says as of the last record seen; no series while nobody holds it or the view is not certain. site is the holder id up to its last slash: the cluster under the chart.",
+		append(slices.Clone(h.labels), "holder", "site"), nil)
 	h.transitions = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "kfklease_transitions_total",
 		Help: "Times this participant started (to=\"holding\") or stopped (to=\"standby\") holding the lease.",
@@ -180,6 +184,7 @@ func (h *HTTP) status(w http.ResponseWriter, r *http.Request) {
 // always current and there is nothing to keep in sync.
 type descs struct {
 	holding, epoch, deadline, certain, leaseHeld, leaseAge, cooldown *prometheus.Desc
+	holderInfo                                                       *prometheus.Desc
 }
 
 func newDescs(labels []string) descs {
@@ -198,7 +203,7 @@ func newDescs(labels []string) descs {
 // Describe implements prometheus.Collector.
 func (h *HTTP) Describe(ch chan<- *prometheus.Desc) {
 	d := h.descs
-	for _, x := range []*prometheus.Desc{d.holding, d.epoch, d.deadline, d.certain, d.leaseHeld, d.leaseAge, d.cooldown} {
+	for _, x := range []*prometheus.Desc{d.holding, d.epoch, d.deadline, d.certain, d.leaseHeld, d.leaseAge, d.cooldown, d.holderInfo} {
 		ch <- x
 	}
 }
@@ -221,12 +226,26 @@ func (h *HTTP) Collect(ch chan<- prometheus.Metric) {
 		gauge(d.epoch, epoch)
 		gauge(d.deadline, remaining)
 		gauge(d.certain, b2f(s.Certain))
-		gauge(d.leaseHeld, b2f(s.Certain && s.Lease.HeldAt(s.AsOf)))
+		held := s.Certain && s.Lease.HeldAt(s.AsOf)
+		gauge(d.leaseHeld, b2f(held))
+		if held {
+			ch <- prometheus.MustNewConstMetric(d.holderInfo, prometheus.GaugeValue, 1, h.values(t, s.Lease.Holder, site(s.Lease.Holder))...)
+		}
 		gauge(d.cooldown, untilNow(s.CooldownUntil))
 		if !s.AsOf.IsZero() {
 			gauge(d.leaseAge, float64(s.AsOf.UnixMilli())/1000)
 		}
 	}
+}
+
+// site is the part of a holder id before its last slash: the chart's
+// holderPrefix, the library's hostname. Empty when there is no slash.
+func site(holder string) string {
+	i := strings.LastIndex(holder, "/")
+	if i < 0 {
+		return ""
+	}
+	return holder[:i]
 }
 
 // untilNow is the seconds left until t, or 0 when t is zero or past.

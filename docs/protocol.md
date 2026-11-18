@@ -22,7 +22,15 @@ partition's total order does the job of the missing compare-and-swap.
 - `message.timestamp.type=LogAppendTime`. The only clock in the protocol is
   the broker's. Client wall clocks are never compared with anything.
 - `cleanup.policy=compact`, with `min.compaction.lag.ms` well above the TTL so
-  that the recent past is always complete.
+  that the recent past is always complete, and `segment.ms` equal to it, so
+  that the active segment, which is never compacted, does not hold a week of
+  renewals.
+- Replicated, with `min.insync.replicas` above one and
+  `unclean.leader.election.enable=false`: the epoch is the offset of the
+  accepted claim, and an acknowledged record must not be lost or replaced by
+  a different one at the same offset. `EnsureTopic` creates the topic so
+  (three replicas, two in sync, by default) and warns about an existing
+  topic that is not.
 
 Broker timestamps may step backwards when the partition leader changes. The
 fold clamps them to be monotone. A new leader whose clock runs *ahead* by δ

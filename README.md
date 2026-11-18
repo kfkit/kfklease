@@ -59,6 +59,14 @@ for range c.Changed() {
 }
 ```
 
+`CreateTopic` creates a missing topic as a lease log: compacted,
+`LogAppendTime`, three replicas with `min.insync.replicas=2` and unclean
+leader election off (`Config.TopicSettings`; the chart's
+`replicationFactor`, `minInsyncReplicas` and `flushEveryRecord`). A Kafka
+cluster with fewer than three brokers needs `ReplicationFactor` set to its
+size. An existing topic is checked and never altered; see
+[The lease topic](docs/install.md#the-lease-topic).
+
 ### KEDA
 
 `kfklease-scaler` runs one participant per cluster and serves it to KEDA as an
@@ -131,6 +139,7 @@ The scaler serves HTTP on `:9091` (`service.httpPort`):
 - `/metrics`, Prometheus: `kfklease_holding`, `kfklease_epoch`,
   `kfklease_belief_remaining_seconds`, `kfklease_certain`,
   `kfklease_lease_held`, `kfklease_lease_as_of_seconds`,
+  `kfklease_lease_holder_info{holder,site}` (who holds it, as the log says),
   `kfklease_health_cooldown_seconds` and
   `kfklease_transitions_total{to="holding"|"standby"}`. The pod carries
   `prometheus.io/*` annotations; `metrics.serviceMonitor.enabled` adds a

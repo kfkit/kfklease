@@ -12,6 +12,16 @@ ttl: 10s             # the same for every participant of the lease
 margin: ""           # empty for ttl/5
 createTopic: true    # create the topic with the settings the protocol needs
 
+# How createTopic creates the topic. An existing topic is never altered; the
+# scaler checks it at start and logs a warning for each setting that falls
+# short of these.
+replicationFactor: 3     # needs as many brokers; never lowered to fit
+minInsyncReplicas: 0     # 0: 2 with three or more replicas, otherwise 1
+# flush.messages=1: every record is fsynced before it is acknowledged, which
+# protects the tail of the log when all replicas go down at once. Costs a
+# little renewal latency; the Kafka documentation relies on replication.
+flushEveryRecord: false
+
 # Holder ids are "<holderPrefix>/<pod name>". Empty means the release name.
 # Use something that names the cluster, so that logs and the lease topic
 # say where the workload runs.
@@ -59,6 +69,20 @@ auth:
     tokenKey: token         # oauthbearer
 
 podAnnotations: {}
+# Extra labels on the scaler pod, next to the chart's own.
+podLabels: {}
+
+# The image is pulled with these, e.g. [{name: regcred}].
+imagePullSecrets: []
+priorityClassName: ""
+# The pod's and the container's securityContext. The image runs as
+# nonroot (65532) and needs no writable filesystem, so the restricted Pod
+# Security Standard fits, e.g.:
+#   podSecurityContext: {runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+#   securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true,
+#                     capabilities: {drop: [ALL]}}
+podSecurityContext: {}
+securityContext: {}
 
 # A ScaledObject that keeps a workload at `replicas` while this cluster
 # holds the lease and at zero otherwise. Disable it to write your own.

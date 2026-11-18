@@ -50,6 +50,14 @@ func metric(t *testing.T, body, name string) string {
 	return m[1]
 }
 
+// noMetric fails if body has any series of the metric name.
+func noMetric(t *testing.T, body, name string) {
+	t.Helper()
+	if regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(name) + `[{ ]`).MatchString(body) {
+		t.Fatalf("unexpected %s in:\n%s", name, body)
+	}
+}
+
 func TestHTTPStatusAndMetrics(t *testing.T) {
 	src := &fakeSource{changed: make(chan struct{}, 1)}
 	h := NewHTTP(src, "k3s-a/pod")
@@ -76,6 +84,7 @@ func TestHTTPStatusAndMetrics(t *testing.T) {
 	if metric(t, body, "kfklease_holding") != "0" || metric(t, body, "kfklease_epoch") != "-1" || metric(t, body, "kfklease_certain") != "0" {
 		t.Fatalf("standby metrics:\n%s", body)
 	}
+	noMetric(t, body, "kfklease_lease_holder_info") // not certain
 
 	// Holding epoch 7 with 8 seconds to go, the log agreeing.
 	asOf := time.Now()
@@ -98,6 +107,9 @@ func TestHTTPStatusAndMetrics(t *testing.T) {
 	if metric(t, body, "kfklease_holding") != "1" || metric(t, body, "kfklease_epoch") != "7" || metric(t, body, "kfklease_lease_held") != "1" {
 		t.Fatalf("holding metrics:\n%s", body)
 	}
+	if metric(t, body, `kfklease_lease_holder_info{holder="k3s-a/pod",site="k3s-a"}`) != "1" {
+		t.Fatalf("holder info:\n%s", body)
+	}
 	if v := metric(t, body, "kfklease_belief_remaining_seconds"); !strings.HasPrefix(v, "7.") {
 		t.Fatalf("remaining = %s", v)
 	}
@@ -112,6 +124,11 @@ func TestHTTPStatusAndMetrics(t *testing.T) {
 	if metric(t, body, "kfklease_holding") != "0" || metric(t, body, "kfklease_lease_held") != "1" || metric(t, body, "kfklease_belief_remaining_seconds") != "0" {
 		t.Fatalf("lost metrics:\n%s", body)
 	}
+	// Every participant reports the holder the log names, a foreign one
+	// too, and only that one.
+	if metric(t, body, `kfklease_lease_holder_info{holder="other",site=""}`) != "1" || strings.Count(body, "\nkfklease_lease_holder_info{") != 1 {
+		t.Fatalf("holder info after losing it:\n%s", body)
+	}
 	if metric(t, body, "kfklease_health_cooldown_seconds") != "0" {
 		t.Fatalf("cooldown without a gate:\n%s", body)
 	}
@@ -122,6 +139,7 @@ func TestHTTPStatusAndMetrics(t *testing.T) {
 	if v := metric(t, body, "kfklease_health_cooldown_seconds"); !strings.HasPrefix(v, "59.") {
 		t.Fatalf("cooldown = %s", v)
 	}
+	noMetric(t, body, "kfklease_lease_holder_info") // released: nobody holds it
 	_, body = get(t, srv, "/status")
 	if err := json.Unmarshal([]byte(body), &st); err != nil {
 		t.Fatal(err)
@@ -167,16 +185,21 @@ func TestHTTPSeveralLeases(t *testing.T) {
 	})
 	_, body := get(t, srv, "/metrics")
 	for name, want := range map[string]string{
-		`kfklease_holding{topic="connect-a"}`:                        "0",
-		`kfklease_epoch{topic="connect-a"}`:                          "-1",
-		`kfklease_holding{topic="connect-b"}`:                        "1",
-		`kfklease_epoch{topic="connect-b"}`:                          "42",
-		`kfklease_lease_held{topic="connect-b"}`:                     "1",
-		`kfklease_transitions_total{to="holding",topic="connect-a"}`: "0",
+		`kfklease_holding{topic="connect-a"}`:                                           "0",
+		`kfklease_epoch{topic="connect-a"}`:                                             "-1",
+		`kfklease_holding{topic="connect-b"}`:                                           "1",
+		`kfklease_epoch{topic="connect-b"}`:                                             "42",
+		`kfklease_lease_held{topic="connect-b"}`:                                        "1",
+		`kfklease_transitions_total{to="holding",topic="connect-a"}`:                    "0",
+		`kfklease_lease_holder_info{holder="k3s-a/pod",site="k3s-a",topic="connect-b"}`: "1",
 	} {
 		if got := metric(t, body, name); got != want {
 			t.Errorf("%s = %s, want %s", name, got, want)
 		}
+	}
+
+	if strings.Contains(body, `kfklease_lease_holder_info{holder="k3s-a/pod",site="k3s-a",topic="connect-a"}`) {
+		t.Errorf("holder info for connect-a, which nobody holds:\n%s", body)
 	}
 
 	for topic, holding := range map[string]bool{"connect-a": false, "connect-b": true} {

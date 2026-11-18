@@ -36,7 +36,8 @@ single writer fences by epoch; see [Fencing](#fencing-by-epoch).
 - [KEDA](https://keda.sh) 2.x in every cluster.
 - Helm 3.8 or later (OCI registries).
 - A topic, or the right to create one: `createTopic: true` (the default)
-  creates it with the settings the protocol needs.
+  creates it with the settings the protocol needs and three replicas, so
+  the Kafka cluster needs three brokers; see [The lease topic](#the-lease-topic).
 
 ## Install
 
@@ -59,15 +60,21 @@ helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.3.0 \
 | `holderPrefix` | names the cluster in holder ids (`eu-west/<pod>`), in logs and on the topic. Defaults to the release name |
 | `ttl` | how long a term lasts without renewal, `10s` by default. The same for every participant of a lease |
 | `margin` | how much earlier than the term's end the holder stops believing, `ttl/5` by default; see [Choosing TTL and margin](#choosing-ttl-and-margin) |
+| `replicationFactor` | replicas of the topic `createTopic` creates, `3` by default. A cluster with fewer brokers fails the creation; see [The lease topic](#the-lease-topic) |
 | `scaledObject.targetRef.name` | the workload to scale, in the release namespace |
 | `scaledObject.targetRef.kind`, `.apiVersion` | its kind, `Deployment` and `apps/v1` by default: anything with a scale subresource, a StatefulSet or Strimzi's `KafkaConnect`, say |
 | `scaledObject.replicas` | replicas while this cluster holds the lease, 1 by default; zero otherwise |
 | `scaledObject.fallback.enabled` | `true` by default: when KEDA cannot reach the scaler, scale the workload to zero instead of leaving it running; see [When the scaler is gone](#when-the-scaler-is-gone) |
 | `scaledObject.enabled` | `false` to write your own ScaledObject; see below |
+| `imagePullSecrets`, `podLabels`, `priorityClassName` | for the scaler pod, empty by default |
+| `podSecurityContext`, `securityContext` | the pod's and the container's, empty by default. The image runs as nonroot and writes nothing, so the restricted Pod Security Standard fits; `values.yaml` has an example |
 
 Upgrading from 0.3.0: `scaledObject.target` is renamed to
 `scaledObject.targetRef.name`; a release that still sets the old value
-fails to render with a message that names the new one.
+fails to render with a message that names the new one. A new topic gets
+three replicas where it used to get the broker's
+`default.replication.factor`: on a Kafka cluster with fewer than three
+brokers, set `replicationFactor` to the number of brokers.
 
 The workload itself is yours, in the same namespace. Its
 replica count belongs to KEDA from now on, so leave `replicas` out or set
@@ -84,6 +91,40 @@ curl http://kfklease.kfklease.svc:9091/status        # from inside the cluster
 
 The scaler pods of the standby clusters log `joined` and then nothing much
 until a takeover. That is correct.
+
+### The lease topic
+
+With `createTopic: true` the scaler creates a missing topic with settings
+chosen for a lease log, not the broker's defaults:
+
+| Setting | Value | Why |
+|---|---|---|
+| partitions | 1 | one lease per topic |
+| `message.timestamp.type` | `LogAppendTime` | the broker's clock is the only one the protocol uses |
+| `cleanup.policy` | `compact` | the latest record is all a participant needs |
+| `min.compaction.lag.ms` | `max(100 × ttl, 1h)` | the recent past stays complete |
+| `segment.ms` | the same | the active segment is never compacted; with the default of seven days every new participant reads a week of renewals |
+| replication factor | `replicationFactor`, 3 | with one replica, losing a broker loses the lease |
+| `min.insync.replicas` | `minInsyncReplicas`; by default 2 with three or more replicas, otherwise 1 | the scaler writes with `acks=all`: an acknowledged record is on that many brokers |
+| `unclean.leader.election.enable` | `false`, set on the topic | the epoch is the offset of the accepted claim; after an unclean election the same offset can hold a different record |
+| `flush.messages` | `1` with `flushEveryRecord: true`; unset by default | every record is fsynced before it is acknowledged, which protects the tail of the log when all replicas go down at once |
+
+A cluster with fewer brokers than `replicationFactor` fails the creation
+with an error that names `replicationFactor`; nothing lowers it on its
+own. `flushEveryRecord` goes against the Kafka documentation, which relies
+on replication instead; at one record every few seconds it costs latency,
+not throughput: on the one-broker stand a produce with `acks=all` took
+0.9–1.3 ms at the median without it and 1.5–1.9 ms with it.
+
+An existing topic is never altered. At start the scaler checks it: no
+`LogAppendTime` stops it, as before; fewer replicas than
+`replicationFactor`, `min.insync.replicas` below the value above,
+`unclean.leader.election.enable=true` or a `cleanup.policy` without
+`compact` are logged as warnings (`existing lease topic falls short`).
+Fix them with `kafka-configs.sh --alter` or a partition reassignment; the
+checks need `DescribeConfigs` and `Describe` on the topic. Change
+`min.insync.replicas` on a topic with Eligible Leader Replicas only if you
+mean it: it clears the topic's ELR state.
 
 ### Several leases, one scaler
 
@@ -290,6 +331,7 @@ serving [several](#several-leases-one-scaler) stay apart.
 | `kfklease_certain` | 1 when the scaler's view of the log can be trusted; 0 right after a start on a compacted topic, until it settles |
 | `kfklease_lease_held` | 1 when the log says someone holds the lease |
 | `kfklease_lease_as_of_seconds` | broker time of the last record seen |
+| `kfklease_lease_holder_info{holder,site}` | 1 for the holder the log names, on every participant, the standbys too; no series while nobody holds the lease or the view is not certain. `site` is the holder id up to its last slash, the `holderPrefix` under the chart |
 | `kfklease_transitions_total{to}` | handovers into (`holding`) and out of (`standby`) the lease |
 | `kfklease_health_cooldown_seconds` | seconds until this participant may claim again after the [health gate](#when-the-workload-cannot-run-here) gave the lease up; 0 otherwise |
 
@@ -297,7 +339,8 @@ Alerts worth having: `sum by (topic) (kfklease_holding) != 1` across the
 clusters for longer than a TTL (nobody, or more than one, holds it),
 `kfklease_certain == 0` for longer than two TTLs (the scaler cannot settle
 its view: check its connection to Kafka), and a rising
-`kfklease_transitions_total` (flapping).
+`kfklease_transitions_total` (flapping). Where the workload runs:
+`max by (topic, site) (kfklease_lease_holder_info)`.
 
 ## When the scaler is gone
 
@@ -441,6 +484,8 @@ releases also keep a scaler restart from touching the other leases.
 | ScaledObject shows `READY False`, KEDA logs `connection refused` to the scaler | the scaler pod is not up, or `scalerAddress` names the wrong Service or namespace. With the fallback the workload is at zero in this cluster until the scaler answers |
 | Scaler logs `topic ... does not use LogAppendTime` | the topic exists with `message.timestamp.type=CreateTime`. Set it to `LogAppendTime`, or let `createTopic` create a new one |
 | Scaler logs `partition not ready` a few times at start | a freshly created topic; it settles within seconds |
+| Scaler exits with `replicationFactor 3, but the cluster has 1 brokers` | the Kafka cluster has fewer brokers than the topic asks for. Set `replicationFactor` to the number of brokers |
+| Scaler logs `existing lease topic falls short` | the topic was made with other settings; see [The lease topic](#the-lease-topic) |
 | `kfklease_certain` stays 0 | the scaler is not reading the log: check `fetch failed` in its logs, the brokers, the auth |
 | Every cluster is standby, `kfklease_lease_held` is 1 | someone else holds the lease: a scaler you forgot, or a previous pod still releasing. Wait one TTL |
 | `acquired` and `no longer holder` alternate | renewals are not landing in time: the broker is slow or the link is flaky. Raise the TTL, or look at the broker |
