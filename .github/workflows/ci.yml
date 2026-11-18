@@ -42,11 +42,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: helm lint charts/kfklease --set brokers=k:9092 --set topic=t --set scaledObject.targetRef.name=w
-      - run: helm template t charts/kfklease --set brokers=k:9092 --set topic=t --set scaledObject.targetRef.name=w > /dev/null
+      - run: helm lint charts/kfklease --set site=s --set brokers=k:9092 --set topic=t --set scaledObject.targetRef.name=w
+      - run: helm template t charts/kfklease --set site=s --set brokers=k:9092 --set topic=t --set scaledObject.targetRef.name=w > /dev/null
       - name: N replicas of any scalable kind; the old value fails loudly
         run: |
-          out=$(helm template t charts/kfklease --set brokers=k:9092 --set topic=t \
+          out=$(helm template t charts/kfklease --set site=s --set brokers=k:9092 --set topic=t \
             --set scaledObject.targetRef.apiVersion=kafka.strimzi.io/v1beta2 \
             --set scaledObject.targetRef.kind=KafkaConnect --set scaledObject.targetRef.name=c \
             --set scaledObject.replicas=3 -s templates/scaledobject.yaml)
@@ -56,13 +56,13 @@ jobs:
             grep -qF "$want" <<<"$out" || { echo "missing: $want"; exit 1; }
           done
           for bad in 'scaledObject.target=w' 'scaledObject.targetRef.name=w,scaledObject.replicas=0'; do
-            if helm template t charts/kfklease --set brokers=k:9092 --set topic=t --set "$bad" >/dev/null; then
+            if helm template t charts/kfklease --set site=s --set brokers=k:9092 --set topic=t --set "$bad" >/dev/null; then
               echo "rendered with $bad"; exit 1
             fi
           done
       - name: Fail closed by default, a fallback to zero replicas
         run: |
-          so() { helm template t charts/kfklease --set brokers=k:9092 --set topic=t \
+          so() { helm template t charts/kfklease --set site=s --set brokers=k:9092 --set topic=t \
                    --set scaledObject.targetRef.name=w "$@" -s templates/scaledobject.yaml; }
           out=$(so)
           echo "$out"
@@ -72,7 +72,7 @@ jobs:
           fi
       - name: Health gate off by default, wired when a URL is set
         run: |
-          dep() { helm template t charts/kfklease --set brokers=k:9092 --set topic=t \
+          dep() { helm template t charts/kfklease --set site=s --set brokers=k:9092 --set topic=t \
                     --set scaledObject.targetRef.name=w "$@" -s templates/deployment.yaml; }
           if dep | grep -q KFKLEASE_HEALTH_; then
             echo "health gate rendered without a URL"; exit 1
@@ -85,7 +85,7 @@ jobs:
           grep -A1 'name: KFKLEASE_HEALTH_FAIL_AFTER' <<<"$out" | grep -qF 'value: "2m"' || { echo "failAfter not passed"; exit 1; }
       - name: Topic settings for a lease log, three replicas by default
         run: |
-          dep() { helm template t charts/kfklease --set brokers=k:9092 --set topic=t \
+          dep() { helm template t charts/kfklease --set site=s --set brokers=k:9092 --set topic=t \
                     --set scaledObject.targetRef.name=w "$@" -s templates/deployment.yaml; }
           val() { grep -A1 "name: $1\$" <<<"$out" | grep -qF "value: \"$2\"" || { echo "$1 is not $2"; exit 1; }; }
           out=$(dep)
@@ -95,7 +95,7 @@ jobs:
           val KFKLEASE_REPLICATION_FACTOR 1; val KFKLEASE_MIN_INSYNC_REPLICAS 1; val KFKLEASE_FLUSH_EVERY_RECORD true
       - name: Pod settings render where Kubernetes reads them
         run: |
-          dep() { helm template t charts/kfklease --set brokers=k:9092 --set topic=t \
+          dep() { helm template t charts/kfklease --set site=s --set brokers=k:9092 --set topic=t \
                     --set scaledObject.targetRef.name=w "$@" -s templates/deployment.yaml; }
           for bad in imagePullSecrets priorityClassName securityContext; do
             if dep | grep -q "$bad"; then echo "$bad rendered by default"; exit 1; fi
@@ -111,9 +111,32 @@ jobs:
                       '          securityContext:' '            readOnlyRootFilesystem: true'; do
             grep -qxF "$want" <<<"$out" || { echo "missing: $want"; exit 1; }
           done
+      - name: The lease belongs to a site, with a takeover delay that covers KEDA's cooldown
+        run: |
+          t() { helm template t charts/kfklease --set brokers=k:9092 --set topic=t \
+                  --set scaledObject.targetRef.name=w "$@"; }
+          val() { grep -A1 "name: $1\$" <<<"$out" | grep -qF "value: \"$2\"" || { echo "$1 is not $2"; exit 1; }; }
+          out=$(t --set site=eu-west)
+          echo "$out"
+          val KFKLEASE_SITE eu-west; val KFKLEASE_HOLDER 'eu-west/$(POD_NAME)'
+          # 5 s polling + 60 s cooldown + 30 s margin.
+          val KFKLEASE_TAKEOVER_DELAY 95s
+          grep -qx '  cooldownPeriod: 60' <<<"$out" || { echo "cooldownPeriod is not 60"; exit 1; }
+          out=$(t --set site=eu --set takeoverDelay=120); val KFKLEASE_TAKEOVER_DELAY 120s
+          # The slowest ScaledObject of the release sets the bound.
+          out=$(t --set site=eu --set 'extraLeases[0].topic=b' --set 'extraLeases[0].scaledObject.targetRef.name=wb' \
+                  --set 'extraLeases[0].scaledObject.cooldownPeriod=100')
+          val KFKLEASE_TAKEOVER_DELAY 135s
+          for bad in '' 'site=eu,holderPrefix=eu' 'site=eu,takeoverDelay=94' 'site=eu,takeoverDelay=-1'; do
+            if err=$(t ${bad:+--set "$bad"} 2>&1 >/dev/null); then
+              echo "rendered with '$bad'"; exit 1
+            fi
+            echo "'$bad': $err"
+          done
+          grep -q 'replaced by site' <<<"$(t --set holderPrefix=eu --set site=eu 2>&1)" || { echo "holderPrefix error does not name site"; exit 1; }
       - name: Several leases in one release, one ScaledObject each
         run: |
-          t() { helm template t charts/kfklease --set brokers=k:9092 --set topic=a \
+          t() { helm template t charts/kfklease --set site=s --set brokers=k:9092 --set topic=a \
                   --set scaledObject.targetRef.name=wa --set scaledObject.cooldownPeriod=7 "$@"; }
           out=$(t --set 'extraLeases[0].topic=b' --set 'extraLeases[0].scaledObject.targetRef.name=wb' \
                   --set 'extraLeases[0].scaledObject.targetRef.kind=KafkaConnect' \

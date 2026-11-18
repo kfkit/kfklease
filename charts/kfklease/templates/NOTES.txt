@@ -1,5 +1,5 @@
 {{ include "kfklease.name" . }} takes part in the lease on topic {{ .Values.topic }}
-as "{{ .Values.holderPrefix | default .Release.Name }}/<pod>".
+for site {{ .Values.site }}, as "{{ .Values.site }}/<pod>".
 
 Watch it:
   kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "kfklease.name" . }} -f

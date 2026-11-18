@@ -1,3 +1,5 @@
+{{- if hasKey .Values "holderPrefix" }}{{ fail "holderPrefix was replaced by site: set site to this cluster's name; holder ids are <site>/<pod name>" }}{{ end }}
+{{- if not .Values.site }}{{ fail "site is required: name this cluster, e.g. --set site=eu-west" }}{{ end }}
 {{- if not .Values.brokers }}{{ fail "brokers is required" }}{{ end }}
 {{- if not .Values.topic }}{{ fail "topic is required" }}{{ end }}
 {{- $tls := .Values.auth.tls -}}
@@ -6,6 +8,14 @@
 {{- $topics := list -}}
 {{- $urls := list -}}
 {{- range $leases }}{{ $topics = append $topics .topic }}{{ $urls = append $urls .healthUrl }}{{ end -}}
+{{- /* The takeover delay covers the slowest ScaledObject of the release:
+its KEDA polling, its cooldown and the workload's stop. */ -}}
+{{- $bound := 0 -}}
+{{- range $leases }}{{ $b := add (int .scaledObject.pollingInterval) (int .scaledObject.cooldownPeriod) (int $.Values.takeoverMargin) }}{{ if gt (int $b) $bound }}{{ $bound = int $b }}{{ end }}{{ end -}}
+{{- $delay := int .Values.takeoverDelay -}}
+{{- if lt $delay 0 }}{{ fail "takeoverDelay must not be negative" }}{{ end -}}
+{{- if eq $delay 0 }}{{ $delay = $bound }}{{ end -}}
+{{- if lt $delay $bound }}{{ fail (printf "takeoverDelay %d is below pollingInterval + cooldownPeriod + takeoverMargin = %d: another site would start the workload before this one has stopped it" $delay $bound) }}{{ end -}}
 {{- if and $tls.enabled $tls.clientCert (not $tls.secretName) }}{{ fail "auth.tls.clientCert needs auth.tls.secretName" }}{{ end }}
 {{- if and $sasl.mechanism (not $sasl.secretName) }}{{ fail "auth.sasl.mechanism needs auth.sasl.secretName" }}{{ end }}
 apiVersion: apps/v1
@@ -108,9 +118,14 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            # Unique per process incarnation: a new pod gets a new name.
+            # The lease belongs to the site; the holder id is unique per
+            # process incarnation: a new pod gets a new name.
+            - name: KFKLEASE_SITE
+              value: {{ .Values.site | quote }}
             - name: KFKLEASE_HOLDER
-              value: {{ printf "%s/$(POD_NAME)" (.Values.holderPrefix | default .Release.Name) | quote }}
+              value: {{ printf "%s/$(POD_NAME)" .Values.site | quote }}
+            - name: KFKLEASE_TAKEOVER_DELAY
+              value: {{ printf "%ds" $delay | quote }}
             {{- if $tls.enabled }}
             - name: KFKLEASE_TLS
               value: "true"
