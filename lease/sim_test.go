@@ -68,6 +68,9 @@ type simParams struct {
 	health bool
 	// sites puts the nodes in two sites, with a takeover delay.
 	sites bool
+	// standby switches nodes in and out of standby every twenty TTLs or
+	// so.
+	standby bool
 }
 
 const (
@@ -123,11 +126,33 @@ type simNode struct {
 	droppedAt  time.Time
 	lastReport time.Time
 	trippedAt  time.Time
+
+	standby bool
 }
 
 // simStats counts what happened in one run.
 type simStats struct {
 	gateReleases int
+	// standbyReleases are releases sent in standby.
+	standbyReleases int
+}
+
+// checkStandby holds a node in standby to its rules after a tick at local
+// time: it does not believe and does not claim.
+func (n *simNode) checkStandby(t *testing.T, seed uint64, local time.Time, rec Record, sent bool, st *simStats) {
+	t.Helper()
+	if !n.standby {
+		return
+	}
+	if n.a.believing(local) {
+		t.Fatalf("seed %d, t=%v: %s believes in standby", seed, local.Sub(t0), n.a.cfg.Holder)
+	}
+	switch {
+	case sent && rec.Kind == Claim:
+		t.Fatalf("seed %d, t=%v: %s claims in standby", seed, local.Sub(t0), n.a.cfg.Holder)
+	case sent && rec.Kind == Release:
+		st.standbyReleases++
+	}
 }
 
 // checkGate holds a node to the health gate after a tick at local time:
@@ -247,6 +272,7 @@ func runSimStats(t *testing.T, seed uint64, p simParams) (records []Record, over
 				n.rate = simRate(rng, p)
 				start := max(0, len(records)-rng.IntN(30))
 				n.a = newAgent(p.config(i), log, int64(start), int64(len(records)), n.local(now))
+				n.a.setStandby(n.local(now), n.standby)
 				n.pos = start
 				n.compacted = make(map[int]bool)
 				for j := start; j < len(records); j++ {
@@ -274,6 +300,10 @@ func runSimStats(t *testing.T, seed uint64, p simParams) (records []Record, over
 					n.lastReport = local
 				}
 			}
+			if p.standby && rng.Float64() < 0.0005 {
+				n.standby = !n.standby
+				n.a.setStandby(local, n.standby)
+			}
 			if rng.Float64() < 0.001 {
 				n.partitionedUntil = now.Add(time.Duration(rng.Int64N(int64(2 * simTTL))))
 			}
@@ -289,6 +319,7 @@ func runSimStats(t *testing.T, seed uint64, p simParams) (records []Record, over
 				if p.health {
 					n.checkGate(t, seed, local, rec, ok, &st)
 				}
+				n.checkStandby(t, seed, local, rec, ok, &st)
 				if ok {
 					// Sent into the void; the client gives up after a ttl.
 					n.acks = append(n.acks, simAck{at: now.Add(simTTL), err: errSimTimeout})
@@ -321,6 +352,7 @@ func runSimStats(t *testing.T, seed uint64, p simParams) (records []Record, over
 				if p.health {
 					n.checkGate(t, seed, local, rec, ok, &st)
 				}
+				n.checkStandby(t, seed, local, rec, ok, &st)
 			}
 			if !ok {
 				continue
@@ -535,5 +567,37 @@ func TestSimulationSites(t *testing.T) {
 		seeds, sameSite, crossSite, minCross, early)
 	if sameSite < seeds*5 || crossSite < seeds {
 		t.Fatalf("too tame to mean anything: %d same-site takeovers, %d cross-site", sameSite, crossSite)
+	}
+}
+
+// Standby: nodes in two sites switch standby on and off. Safety holds, a
+// node in standby never believes and never claims, and standby does give
+// terms up.
+func TestSimulationStandby(t *testing.T) {
+	seeds := 100
+	if testing.Short() {
+		seeds = 20
+	}
+	var releases, terms int
+	for seed := uint64(1); seed <= uint64(seeds); seed++ {
+		records, overlapAt, st := runSimStats(t, seed, simParams{sites: true, standby: true})
+		if !overlapAt.IsZero() {
+			t.Fatalf("seed %d, t=%v: two agents believe they hold the lease", seed, overlapAt.Sub(t0))
+		}
+		releases += st.standbyReleases
+		ref := NewViewFromStart(simTTL)
+		for _, r := range records {
+			out, err := ref.Apply(r)
+			if err != nil {
+				t.Fatalf("seed %d: %v", seed, err)
+			}
+			if out == Accepted && r.Kind == Claim {
+				terms++
+			}
+		}
+	}
+	t.Logf("%d runs: %d terms, %d releases in standby", seeds, terms, releases)
+	if releases < seeds || terms < seeds*5 {
+		t.Fatalf("too tame to mean anything: %d releases in standby, %d terms", releases, terms)
 	}
 }

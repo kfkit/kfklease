@@ -289,3 +289,85 @@ func TestIntegrationHealthGate(t *testing.T) {
 	}
 	waitFor(t, 2*itTTL, "a holds again after the cooldown", func() bool { a.ReportHealthy(); return a.Status().Holding })
 }
+
+func TestIntegrationStandby(t *testing.T) {
+	topic := randomTopic(t)
+	a := start(t, topic, "a")
+	waitFor(t, itTTL, "a holds", func() bool { return a.Status().Holding })
+	b := start(t, topic, "b")
+	waitFor(t, itTTL, "b is certain", func() bool { return b.Status().Certain })
+
+	// Standby on the holder: it stops holding at once and b takes over
+	// from the release, not from the term running out.
+	t0 := time.Now()
+	a.SetStandby(true)
+	if a.Status().Holding {
+		t.Fatal("a still holding right after SetStandby")
+	}
+	waitFor(t, itTTL, "b takes over", func() bool { return b.Status().Holding })
+	took := time.Since(t0)
+	t.Logf("b holding %v after a went to standby", took)
+	if took > itTTL-itMargin {
+		t.Fatalf("b took over after %v: waited for the term instead of the release", took)
+	}
+
+	// b stops and releases. a, in standby, leaves the lease free.
+	b.stop(t)
+	until := time.Now().Add(2 * itTTL)
+	for time.Now().Before(until) {
+		if a.Status().Holding {
+			t.Fatal("a claimed in standby")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if s := a.Status(); !s.Standby || !s.Certain || s.Lease.HeldAt(s.AsOf) {
+		t.Fatalf("a in standby: %+v", s)
+	}
+	a.SetStandby(false)
+	waitFor(t, itTTL, "a holds after standby", func() bool { return a.Status().Holding })
+}
+
+func TestIntegrationInspect(t *testing.T) {
+	topic := randomTopic(t)
+	a := start(t, topic, "eu/a")
+	waitFor(t, itTTL, "a holds", func() bool { return a.Status().Holding })
+	time.Sleep(itTTL / 2) // renewals in the log
+	cfg := Config{Brokers: brokers(t), Topic: topic, TTL: itTTL, Logger: slog.New(slog.DiscardHandler)}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*itTTL)
+	defer cancel()
+	t0 := time.Now()
+	s, err := Inspect(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("held lease inspected in %v: %+v", time.Since(t0), s.Lease)
+	if want := a.Status().Epoch; !s.Lease.HeldAt(s.AsOf) || s.Lease.Holder != "eu/a" || s.Lease.Epoch != want || s.Holding {
+		t.Fatalf("inspected %+v as of %v, want eu/a holding epoch %d", s.Lease, s.AsOf, want)
+	}
+
+	// Released: free, and the last holder is still named.
+	a.stop(t)
+	if s, err = Inspect(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if s.Lease.HeldAt(s.AsOf) || s.Lease.Last != "eu/a" {
+		t.Fatalf("after the release: %+v", s.Lease)
+	}
+
+	// The second look was at a free lease, and claimed nothing.
+	if s, err = Inspect(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if s.Lease.HeldAt(s.AsOf) || s.Lease.Last != "eu/a" {
+		t.Fatalf("after two looks: %+v", s.Lease)
+	}
+
+	// A topic that does not exist is an error, not a hang.
+	cfg.Topic = randomTopic(t)
+	short, cancel2 := context.WithTimeout(context.Background(), 2*itTTL)
+	defer cancel2()
+	if _, err := Inspect(short, cfg); err == nil {
+		t.Fatal("inspected a missing topic")
+	}
+}

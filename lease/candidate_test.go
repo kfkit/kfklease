@@ -93,12 +93,47 @@ func TestReportHealthyReachesTheLoop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !c.lastHealthy().IsZero() {
+	if got, _ := c.loopInputs(); !got.IsZero() {
 		t.Fatal("healthy before any report")
 	}
 	before := time.Now()
 	c.ReportHealthy()
-	if got := c.lastHealthy(); got.Before(before) {
+	if got, _ := c.loopInputs(); got.Before(before) {
 		t.Fatalf("last healthy %v, before the report at %v", got, before)
+	}
+}
+
+// SetStandby takes effect on Status at once, before the loop has seen it:
+// a scaler must not report holding for one more poll.
+func TestSetStandbyHidesHoldingAtOnce(t *testing.T) {
+	c, err := NewCandidate(Config{Brokers: []string{"b:9092"}, Topic: "t", TTL: 10 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.setStatus(Status{Certain: true, Ready: true}, time.Now().Add(time.Minute), 3)
+	<-c.Changed()
+	c.SetStandby(true)
+	select {
+	case <-c.Changed():
+	default:
+		t.Fatal("no change signal")
+	}
+	if s := c.Status(); s.Holding || !s.Standby {
+		t.Fatalf("in standby: %+v", s)
+	}
+	if _, standby := c.loopInputs(); !standby {
+		t.Fatal("the loop does not see standby")
+	}
+	c.SetStandby(false)
+	if s := c.Status(); s.Standby {
+		t.Fatalf("standby off: %+v", s)
+	}
+
+	c, err = NewCandidate(Config{Brokers: []string{"b:9092"}, Topic: "t", TTL: 10 * time.Second, Standby: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := c.Status(); !s.Standby {
+		t.Fatalf("Config.Standby: %+v", s)
 	}
 }
