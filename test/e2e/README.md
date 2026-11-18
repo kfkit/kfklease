@@ -14,7 +14,9 @@ k3s-b   k3s + KEDA,          172.30.0.12        (API: https://127.0.0.1:6444)
 
 The `certs` service writes a CA, the broker certificate, a client
 certificate and the broker's `jaas.conf` (PLAIN user `kfklease`) to
-`.out/certs` on every start. The integration tests use all three listeners;
+`.out/certs`, and keeps them on later starts while they verify against the
+CA and stay valid for another day: a running broker keeps the CA it started
+with. The integration tests use all three listeners;
 on the stand, `deploy.sh` connects k3s-a over mTLS from a mounted Secret
 and k3s-b over SASL PLAIN with username and password from a Secret as
 environment variables, so the two clusters share the lease across both
@@ -87,7 +89,7 @@ is the heartbeat check, which sees every write.
 | Cluster freezes            | `docker compose pause k3s-a` / `unpause`  |
 | Cluster loses Kafka        | `./partition.sh cut k3s-a` / `heal k3s-a` |
 | Scaler gone, no release    | `docker compose exec k3s-a sh -c 'crictl stop --timeout 0 $(crictl ps -q --name "^scaler$")'` |
-| Arbiter is down            | `docker compose stop kafka` / `up -d --no-deps --no-recreate kafka` (`start` reruns the certs service and issues a new CA) |
+| Arbiter is down            | `docker compose stop kafka` / `up -d --no-deps --no-recreate kafka` (`start` would rerun the certs service as well) |
 
 `partition.sh` drops packets to Kafka inside the node's network namespace, so
 connections hang and time out the way they do in a real partition. Do not use

@@ -18,6 +18,7 @@ integration:
 lint:
 	test -z "$$(gofmt -l .)"
 	$(GO) vet ./...
+	test/e2e/selftest.sh
 
 image:
 	docker build -t kfklease-scaler:dev .
