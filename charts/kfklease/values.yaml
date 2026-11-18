@@ -20,7 +20,8 @@ minInsyncReplicas: 0     # 0: 2 with three or more replicas, otherwise 1
 # flush.messages=1: every record is fsynced before it is acknowledged, which
 # protects the tail of the log when all replicas go down at once. Costs a
 # little renewal latency; the Kafka documentation relies on replication.
-flushEveryRecord: false
+# false leaves flush.messages to the broker.
+flushEveryRecord: true
 
 # Required: where this release runs, one name per cluster (eu-west, say).
 # The lease belongs to the site, not to the scaler pod: holder ids are

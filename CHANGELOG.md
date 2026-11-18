@@ -121,8 +121,8 @@ and this project adheres to
   `min.insync.replicas` 2 with three or more replicas (`minInsyncReplicas`,
   `-min-insync-replicas`), `unclean.leader.election.enable=false`, and
   `segment.ms` equal to `min.compaction.lag.ms`, so that a new participant
-  does not read a week of renewals. Optional `flush.messages=1`
-  (`flushEveryRecord`, `-flush-every-record`), off by default.
+  does not read a week of renewals, and `flush.messages=1`
+  (`flushEveryRecord`, `-flush-every-record`), on by default; see Changed.
 - The handover: a cluster put in standby stops its workload at once and
   tells the others when it is gone, so another cluster takes over about a
   TTL after the release rather than after `takeoverDelay`. The scaler sets
@@ -197,6 +197,15 @@ and this project adheres to
   other cluster never starts. `deploy.sh` takes `IMAGE_TAG` and `WAIT`.
 
 ### Changed
+
+- A lease topic created by the chart or the binary gets `flush.messages=1`
+  by default (`flushEveryRecord: true`, `-flush-every-record=true`): every
+  record is fsynced before it is acknowledged. A renewal takes about half a
+  millisecond longer at the median. Existing topics are not altered. To
+  leave `flush.messages` to the broker, set `flushEveryRecord: false`
+  (chart) or `-flush-every-record=false` / `KFKLEASE_FLUSH_EVERY_RECORD=false`
+  (binary). The library's `TopicSettings.FlushEveryRecord` stays off unless
+  set.
 
 - The health gate counts per site: a participant whose site holds the
   lease and whose workload has not passed a probe for `failAfter` claims
