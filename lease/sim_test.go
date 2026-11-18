@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"math/rand/v2"
 	"slices"
 	"testing"
@@ -65,16 +66,26 @@ type simParams struct {
 	margin      time.Duration
 	// health turns the health gate on, with workloads that go up and down.
 	health bool
+	// sites puts the nodes in two sites, with a takeover delay.
+	sites bool
 }
 
 const (
 	simFailAfter = 3 * simTTL
 	simCooldown  = 5 * simTTL
+	simDelay     = 3 * simTTL
 )
 
-func (p simParams) config(holder string) Config {
+// config is node i's: holder "n<i>", or "s<i%2>/n<i>" with sites.
+func (p simParams) config(i int) Config {
+	holder := fmt.Sprintf("n%d", i)
+	var delay time.Duration
+	if p.sites {
+		holder = fmt.Sprintf("s%d/%s", i%2, holder)
+		delay = simDelay
+	}
 	cfg, err := Config{
-		Brokers: []string{"fake"}, Topic: "fake", Holder: holder,
+		Brokers: []string{"fake"}, Topic: "fake", Holder: holder, TakeoverDelay: delay,
 		TTL: simTTL, Margin: max(p.margin, time.Nanosecond), RenewEvery: simTTL / 3,
 	}.withDefaults()
 	if p.health {
@@ -181,7 +192,7 @@ func runSimStats(t *testing.T, seed uint64, p simParams) (records []Record, over
 	var nodes []*simNode
 	for i := range 3 {
 		n := &simNode{rate: simRate(rng, p)}
-		n.a = newAgent(p.config(fmt.Sprintf("n%d", i)), log, 0, 0, n.local(simTime(0)))
+		n.a = newAgent(p.config(i), log, 0, 0, n.local(simTime(0)))
 		nodes = append(nodes, n)
 	}
 	// The partition leader's clock: an offset that changes with the leader.
@@ -235,7 +246,7 @@ func runSimStats(t *testing.T, seed uint64, p simParams) (records []Record, over
 				// holes.
 				n.rate = simRate(rng, p)
 				start := max(0, len(records)-rng.IntN(30))
-				n.a = newAgent(p.config(fmt.Sprintf("n%d", i)), log, int64(start), int64(len(records)), n.local(now))
+				n.a = newAgent(p.config(i), log, int64(start), int64(len(records)), n.local(now))
 				n.pos = start
 				n.compacted = make(map[int]bool)
 				for j := start; j < len(records); j++ {
@@ -469,5 +480,60 @@ func TestSimulationHealthGate(t *testing.T) {
 	t.Logf("%d runs: %d terms, %d releases by the health gate", seeds, terms, releases)
 	if releases < seeds*5 || terms < seeds*10 {
 		t.Fatalf("the gate is too tame to mean anything: %d releases, %d terms", releases, terms)
+	}
+}
+
+// Sites: two of them, a takeover delay, and everything else as above. Safety
+// still holds; a site never holds the lease within the delay after the end
+// of another site's term, by the broker's clock: a claim that lands that
+// early (sent in time, landed late) is released and never renewed; and a
+// site's own nodes do take over within it, after a release or a term that
+// ran out.
+func TestSimulationSites(t *testing.T) {
+	seeds := 100
+	if testing.Short() {
+		seeds = 20
+	}
+	var sameSite, crossSite, early int
+	minCross := time.Duration(math.MaxInt64)
+	for seed := uint64(1); seed <= uint64(seeds); seed++ {
+		records, overlapAt := runSim(t, seed, simParams{sites: true})
+		if !overlapAt.IsZero() {
+			t.Fatalf("seed %d, t=%v: two agents believe they hold the lease", seed, overlapAt.Sub(t0))
+		}
+		ref := NewViewFromStart(simTTL)
+		earlyTerms := map[int64]bool{}
+		for _, r := range records {
+			prev := ref.State()
+			out, err := ref.Apply(r)
+			if err != nil {
+				t.Fatalf("seed %d: %v", seed, err)
+			}
+			if out == Accepted && r.Kind == Renew && earlyTerms[r.Epoch] {
+				t.Fatalf("seed %d, offset %d: %s renewed term %d, which started within the takeover delay", seed, r.Offset, r.Holder, r.Epoch)
+			}
+			if out != Accepted || r.Kind != Claim || prev.Expires.IsZero() {
+				continue
+			}
+			gap := r.Timestamp.Sub(prev.Expires)
+			if SiteOf(prev.Last) == SiteOf(r.Holder) {
+				if gap < simDelay {
+					sameSite++
+				}
+				continue
+			}
+			if gap < simDelay {
+				earlyTerms[r.Offset] = true
+				early++
+				continue
+			}
+			crossSite++
+			minCross = min(minCross, gap)
+		}
+	}
+	t.Logf("%d runs: %d takeovers by the same site within the delay, %d by another site, the earliest %v after the end; %d claims landed early and were given up",
+		seeds, sameSite, crossSite, minCross, early)
+	if sameSite < seeds*5 || crossSite < seeds {
+		t.Fatalf("too tame to mean anything: %d same-site takeovers, %d cross-site", sameSite, crossSite)
 	}
 }

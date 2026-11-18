@@ -300,3 +300,52 @@ func TestValueRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+func TestSiteOf(t *testing.T) {
+	for holder, want := range map[string]string{
+		"eu-west/kfklease-7d9f": "eu-west",
+		"a/b/pod":               "a/b",
+		"solo":                  "solo",
+		"":                      "",
+	} {
+		if got := SiteOf(holder); got != want {
+			t.Errorf("SiteOf(%q) = %q, want %q", holder, got, want)
+		}
+	}
+}
+
+// The view keeps the holder of the latest term after it ends, and how late
+// an unknown term can have ended: what the takeover delay counts from.
+func TestLastTermAfterItEnds(t *testing.T) {
+	v := NewViewFromStart(testTTL)
+	apply(t, v, []step{{claim(0, 0, "eu/a"), Accepted}, {release(1, 1, "eu/a", 0), Accepted}})
+	if s := v.State(); s.Holder != "" || s.Last != "eu/a" || !s.Expires.Equal(at(1)) {
+		t.Fatalf("after release: %+v", s)
+	}
+
+	// Silence between two records: the unknown term ended by the first
+	// record plus a ttl.
+	v = NewView(testTTL)
+	apply(t, v, []step{{renew(5, 1, "eu/a", 0), Pending}, {release(6, 12, "eu/a", 0), Rejected}})
+	if s := v.State(); !v.Certain() || s.Last != "" || !s.Expires.Equal(at(11)) {
+		t.Fatalf("after silence: %+v", s)
+	}
+	apply(t, v, []step{{claim(7, 13, "us/b"), Accepted}})
+	if s := v.State(); s.Holder != "us/b" || s.Last != "us/b" {
+		t.Fatalf("after a claim: %+v", s)
+	}
+
+	// Silence at the end of the log.
+	v = NewView(testTTL)
+	apply(t, v, []step{{renew(5, 1, "eu/a", 0), Pending}})
+	v.Quiet(testTTL)
+	if s := v.State(); !v.Certain() || s.Last != "" || !s.Expires.Equal(at(11)) {
+		t.Fatalf("after quiet: %+v", s)
+	}
+	// Nothing seen at all: no term is known to have existed.
+	v = NewView(testTTL)
+	v.Quiet(testTTL)
+	if s := v.State(); !s.Expires.IsZero() {
+		t.Fatalf("quiet on an empty log: %+v", s)
+	}
+}

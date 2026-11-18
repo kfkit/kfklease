@@ -22,8 +22,15 @@ type State struct {
 	// Epoch is the offset of the claim that started the current term. It
 	// grows with every new term and serves as a fencing token.
 	Epoch int64
-	// Expires is on the broker's clock, like every timestamp in the protocol.
+	// Expires is on the broker's clock, like every timestamp in the protocol:
+	// when the current term ends unless renewed, or when the latest term
+	// ended (by expiry or release). For a lease proven free by silence it is
+	// the latest moment the unknown term before it can have ended; zero
+	// when no term is known to have existed.
 	Expires time.Time
+	// Last is the holder of the latest term, kept after the term ended;
+	// empty when the view does not know it, as after silence.
+	Last string
 }
 
 // HeldAt reports whether the lease is held at broker time t.
@@ -140,13 +147,20 @@ func (v *View) Quiet(d time.Duration) bool {
 	if d < v.ttl {
 		return false
 	}
-	v.setFree()
+	var endBy time.Time
+	if v.seen {
+		endBy = v.clock.Add(v.ttl)
+	}
+	v.setFree(endBy)
 	return true
 }
 
-func (v *View) setFree() {
+// setFree settles the view on a free lease after silence. endBy is the
+// latest moment the term before the silence, unknown to an uncertain view,
+// can have ended.
+func (v *View) setFree(endBy time.Time) {
 	if !v.certain {
-		v.state = State{Epoch: -1}
+		v.state = State{Epoch: -1, Expires: endBy}
 	}
 	v.state.Holder = ""
 	v.certain = true
@@ -177,7 +191,7 @@ func (v *View) Apply(r Record) (Outcome, error) {
 	// Silence between two consecutive records: whatever term there was, it
 	// got no renewal for a whole TTL.
 	if !v.certain && hadPrev && r.Timestamp.Sub(prev) >= v.ttl {
-		v.setFree()
+		v.setFree(prev.Add(v.ttl))
 	}
 
 	if v.certain {
@@ -198,7 +212,7 @@ func (v *View) applyUncertain(r Record) Outcome {
 			}
 			// p is proven valid, so the state right after it is known.
 			// Replay everything seen since.
-			v.state = State{Holder: holder, Epoch: epoch, Expires: p.Timestamp.Add(p.TTL)}
+			v.state = State{Holder: holder, Epoch: epoch, Expires: p.Timestamp.Add(p.TTL), Last: holder}
 			v.certain = true
 			rest := v.pending[i+1:]
 			v.pending = nil
@@ -241,7 +255,7 @@ func (v *View) fold(r Record) Outcome {
 		if held {
 			return Rejected
 		}
-		v.state = State{Holder: r.Holder, Epoch: r.Offset, Expires: r.Timestamp.Add(r.TTL)}
+		v.state = State{Holder: r.Holder, Epoch: r.Offset, Expires: r.Timestamp.Add(r.TTL), Last: r.Holder}
 	case Renew:
 		if !held || v.state.Holder != r.Holder || v.state.Epoch != r.Epoch {
 			return Rejected
