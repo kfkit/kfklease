@@ -7,6 +7,8 @@ and this project adheres to
 
 ## Unreleased
 
+## [0.4.0] - 2026-11-18
+
 ### Breaking
 
 - Chart: `scaledObject.target` is renamed to `scaledObject.targetRef.name`.
