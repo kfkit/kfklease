@@ -150,7 +150,7 @@ The scaler serves HTTP on `:9091` (`service.httpPort`):
   `kfklease_belief_remaining_seconds`, `kfklease_certain`,
   `kfklease_lease_held`, `kfklease_lease_as_of_seconds`,
   `kfklease_lease_holder_info{holder,site}` (who holds it, as the log says),
-  `kfklease_health_cooldown_seconds` and
+  `kfklease_health_cooldown_seconds`, `kfklease_standby_mode` and
   `kfklease_transitions_total{to="holding"|"standby"}`. The pod carries
   `prometheus.io/*` annotations; `metrics.serviceMonitor.enabled` adds a
   ServiceMonitor for the Prometheus Operator.
@@ -163,7 +163,7 @@ The scaler serves HTTP on `:9091` (`service.httpPort`):
 The binary is configured by flags or environment: `KFKLEASE_BROKERS`,
 `KFKLEASE_TOPIC`, `KFKLEASE_TTL`, `KFKLEASE_SITE`, `KFKLEASE_HOLDER`
 (`<site>/<name>`, unique per process; the chart uses the pod name),
-`KFKLEASE_TAKEOVER_DELAY`. The two-cluster stand the chart is tested on is in
+`KFKLEASE_TAKEOVER_DELAY`, `KFKLEASE_STANDBY`. The two-cluster stand the chart is tested on is in
 [test/e2e](test/e2e).
 
 KEDA gives failover, not mutual exclusion: the old pod may still be
@@ -182,6 +182,14 @@ Kafka Connect REST API, say): a holder whose workload has not passed a
 probe for `healthGate.failAfter` releases the lease and sits out
 `healthGate.cooldown`; see
 [docs/install.md](docs/install.md#when-the-workload-cannot-run-here).
+
+To take a cluster out, or move the workload on purpose, set `standby: true`
+on its release: its scaler never claims, a holder releases, and another
+cluster takes over after its takeover delay. `kfklease-scaler status`
+prints who holds each lease, read from the topic, from anywhere that
+reaches Kafka (`kubectl exec deploy/kfklease -- /app status` in a scaler's
+pod); see
+[docs/install.md](docs/install.md#standby-and-the-status-command).
 
 ### Fencing by epoch
 
@@ -222,7 +230,8 @@ The end-to-end stand with two Kubernetes clusters is described in
 - [x] Optional health gate: fail over when the workload cannot run where the lease is held
 - [x] Several leases, one per topic, served by one scaler
 - [x] The lease belongs to a site: a scaler restart or a Kafka outage leaves the workload in place
-- [ ] Standby mode and a `status` command; scaler replicas per site
+- [x] Standby mode and a `status` command
+- [ ] A handover that skips the takeover delay; scaler replicas per site
 - [x] Failure-mode tests: clock skew and drift, in the simulation
 - [x] Example workload fencing by epoch; workload-level exclusion check on the stand
 - [x] Image and chart on GHCR, cosign-signed

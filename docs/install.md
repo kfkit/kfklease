@@ -64,6 +64,7 @@ helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.3.0 \
 | `site` | required: names the cluster. The lease belongs to it; holder ids are `<site>/<pod>`, in logs and on the topic |
 | `takeoverDelay` | seconds a cluster waits after another site's term ended before it claims; `0` (the default) derives `pollingInterval + cooldownPeriod + takeoverMargin` of the slowest ScaledObject, 95 s with the defaults, and a value below that fails the render |
 | `takeoverMargin` | seconds the old site's workload gets to stop once its KEDA scales it to zero, `30` by default: cover its `terminationGracePeriodSeconds` |
+| `standby` | `false` by default; `true` keeps this cluster out of every lease of the release: it follows them and never claims. See [Standby and the status command](#standby-and-the-status-command) |
 | `ttl` | how long a term lasts without renewal, `10s` by default. The same for every participant of a lease |
 | `margin` | how much earlier than the term's end the holder stops believing, `ttl/5` by default; see [Choosing TTL and margin](#choosing-ttl-and-margin) |
 | `replicationFactor` | replicas of the topic `createTopic` creates, `3` by default. A cluster with fewer brokers fails the creation; see [The lease topic](#the-lease-topic) |
@@ -343,7 +344,8 @@ The scaler exposes it at `GET /status` on port 9091:
   "deadline_in_seconds": 7.3,
   "certain": true,
   "lease": {"holder": "eu-west/kfklease-7d9c4-x2k8p", "epoch": 1842, "expires": "2026-09-24T10:15:32Z"},
-  "as_of": "2026-09-24T10:15:22Z"
+  "as_of": "2026-09-24T10:15:22Z",
+  "standby": false
 }
 ```
 
@@ -384,6 +386,7 @@ serving [several](#several-leases-one-scaler) stay apart.
 | `kfklease_lease_holder_info{holder,site}` | 1 for the holder the log names, on every participant, the standbys too; no series while nobody holds the lease or the view is not certain. `site` is the holder id up to its last slash, the chart's `site` |
 | `kfklease_transitions_total{to}` | handovers into (`holding`) and out of (`standby`) the lease |
 | `kfklease_health_cooldown_seconds` | seconds until this participant may claim again after the [health gate](#when-the-workload-cannot-run-here) gave the lease up; 0 otherwise |
+| `kfklease_standby_mode` | 1 while this participant is in [standby mode](#standby-and-the-status-command): it never claims |
 
 Alerts worth having: `sum by (topic) (kfklease_holding) != 1` across the
 clusters for longer than a TTL (nobody, or more than one, holds it),
@@ -525,11 +528,60 @@ rejects ones asking for more than the configured value.
 **Deleting the topic.** Don't, while anyone runs: the epoch is the offset,
 and a recreated topic starts from zero. Stop all scalers first.
 
+**Taking a cluster out, moving the workload on purpose.** Set `standby`
+on that cluster's release; see [Standby and the status
+command](#standby-and-the-status-command).
+
 **Several workloads.** One lease per topic. Workloads that move together
 share a lease: any number of ScaledObjects may name the same topic.
 Workloads that move independently get a lease each, in one release with
 [`extraLeases`](#several-leases-one-scaler) or in a release each; separate
 releases also keep a scaler restart from touching the other leases.
+
+### Standby and the status command
+
+`standby: true` takes a cluster out of its leases: its scaler follows the
+log, answers KEDA "not holding" and never claims, so the cluster's workload
+stays at zero. Use it for maintenance, or to move the workload to another
+cluster on purpose:
+
+```bash
+helm upgrade kfklease oci://ghcr.io/kfkit/charts/kfklease -n kfklease --version <installed> --reuse-values --set standby=true
+```
+
+On the holding cluster this restarts the scaler, whose pod releases the
+lease on its way out. The cluster's KEDA scales the workload to zero after
+`cooldownPeriod`, and another cluster claims `takeoverDelay` after the
+release, so the old pods are gone before the new ones start: about
+`takeoverDelay` plus the pod start, 1 min 40 s or so with the defaults.
+With no other cluster out of standby, nobody holds the lease.
+
+`standby: false` lets the cluster claim again by the usual rules. Nothing
+moves back on its own: while another cluster holds the lease, it stays
+there. To move it back, put that cluster in standby.
+
+The library has the same switch at run time: `Candidate.SetStandby`, or
+`Config.Standby` to start in it. A participant in standby that holds the
+lease stops believing at once and writes a release.
+
+**Who holds the lease**, from anywhere that reaches Kafka, without taking
+part in it:
+
+```bash
+kubectl -n kfklease exec deploy/kfklease -- /app status
+```
+
+```json
+{"topic":"orders-singleton","held":true,"holder":"eu-west/kfklease-7d9c4-x2k8p","site":"eu-west","epoch":1842,"expires":"2026-09-24T10:15:32Z","last_holder":"eu-west/kfklease-7d9c4-x2k8p","as_of":"2026-09-24T10:15:22Z"}
+```
+
+In the scaler's pod it reads the brokers, topics, TTL and credentials from
+the pod's `KFKLEASE_*` environment; elsewhere give them as flags
+(`kfklease-scaler status -h`). One line per lease, in the order of the
+topics; timestamps are the broker's. A lease nobody has written to for a
+while takes a TTL of silence to prove free, so `status` may wait that long;
+it gives up after `-wait` (3 × TTL by default) and exits non-zero. It never
+writes to the topic.
 
 ## Troubleshooting
 

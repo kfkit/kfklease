@@ -103,6 +103,14 @@ when rule 2 lets it, and claims nothing for `Cooldown`. Dropping a belief
 early and claiming later are both on the safe side of rules 4 and 5; the
 fold does not change.
 
+Standby (`lease.Config.Standby`, `Candidate.SetStandby`) is the same
+freedom without a clock: a participant in standby never claims, and one
+that holds the lease when standby is switched on drops its belief at once
+and writes a release when rule 2 lets it. A claim of its own that lands
+after the switch is never believed and is released. `lease.Inspect` reads a
+lease this way, as a participant in standby that stops once its view is
+certain, and so never writes.
+
 ### Sites
 
 The same freedom carries the lease from a process to a site. A holder id
@@ -234,12 +242,21 @@ rules 6 to 8 down one case at a time: a release and an expiry by either
 site, a holder known only through silence, a log whose history is gone, a
 reader behind the end offset, a claim that landed early.
 
+A fifth run, with sites, switches nodes in and out of standby every twenty
+TTLs or so: no overlap, no node in standby believing or claiming, and
+standby releasing terms in every run on average. `agent_test.go` pins down
+that standby never claims, releases a term held, waits for the record in
+flight before releasing, and never believes a claim that lands after the
+switch.
+
 Breaking a rule in `view.go` or `agent.go` (trusting a lone renew, reviving a
 term with a late renew, halving the silence period, taking the deadline from
 the acknowledgement time, believing on the acknowledgement alone, matching own
 records by kind instead of offset, ignoring holes, claiming without looking,
 dropping the takeover delay, the own-site exemption, the end-offset check,
-the wait on a log without history or the release of an early claim) fails
+the wait on a log without history, the release of an early claim, a claim
+in standby, a term kept in standby or a claim in flight believed in
+standby) fails
 at least one of these tests; that was checked by mutation, by hand.
 
 ## The client
@@ -264,13 +281,15 @@ at least one of these tests; that was checked by mutation, by hand.
 `lease/candidate_integration_test.go` runs it against a broker: one holder
 among two candidates, handover after a release (tens of milliseconds) and
 after a crash (about one TTL, never before the crashed holder's deadline),
-a late reader agreeing with the holder, epochs growing across terms.
+a late reader agreeing with the holder, epochs growing across terms, a
+holder switched to standby handing over from its release, and `Inspect`
+reading a held and a released lease without writing.
 
 `test/e2e` runs the whole thing, scaler and KEDA included, on two k3s
 clusters: cold start, a scaler restart that keeps the workload's pods, crash,
 partition, freeze, a broker outage that ends with the lease on the same site,
-N replicas and a scaler that is gone, with a check that the workload never
-runs in both clusters at once.
+N replicas, a scaler that is gone and a cluster put in standby, with a check
+that the workload never runs in both clusters at once.
 
 ## Not covered yet
 
