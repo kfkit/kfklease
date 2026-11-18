@@ -34,6 +34,32 @@ and this project adheres to
   `EnsureTopic(ctx, cl, topic, ttl, settings) ([]string, error)` where it
   was `EnsureTopic(ctx, cl, topic, ttl) error`. Pass
   `lease.TopicSettings{}` for the defaults and log or ignore the warnings.
+- Chart: `holderPrefix` is replaced by `site`, which is required. Holder
+  ids are `<site>/<pod name>`, where they were `<holderPrefix or release
+  name>/<pod name>`. A release that sets `holderPrefix` fails to render
+  with "holderPrefix was replaced by site", and one without `site` with
+  "site is required". Set `--set site=<the cluster's name>`, the value you
+  had in `holderPrefix`.
+- Chart: `scaledObject.cooldownPeriod` is 60 by default, where it was 0,
+  so that a scaler restart leaves the workload running. KEDA now keeps a
+  workload for a minute after its cluster lost the lease. Set it back to 0
+  only together with a scaler that never restarts while holding.
+- Chart: another cluster takes the lease over `takeoverDelay` after the
+  previous holder's term ended, by expiry or release, where it used to
+  claim at once: 95 s with the defaults (`pollingInterval` 5 +
+  `cooldownPeriod` 60 + `takeoverMargin` 30), so a failover now takes about
+  TTL + 95 s plus the pod start, and so does a release by the health gate.
+  A cluster of the same site still claims at once. An explicit
+  `takeoverDelay` below `pollingInterval + cooldownPeriod + takeoverMargin`
+  fails to render; lower `cooldownPeriod` or `takeoverMargin` for a faster
+  failover.
+- Scaler: a scaler that has not yet read enough of the log to know who
+  holds the lease answers KEDA's `IsActive` and `GetMetrics` with an
+  `Unavailable` error, and pushes nothing on `StreamIsActive`, where it
+  used to answer "not holding". With the chart's fallback, KEDA scales the
+  workload to zero only after `cooldownPeriod` of such errors; without a
+  fallback it keeps the replicas. A ScaledObject of your own should have a
+  `cooldownPeriod` longer than a scaler restart.
 
 ### Added
 
@@ -75,7 +101,7 @@ and this project adheres to
 - Metric `kfklease_lease_holder_info{holder,site}`: 1 for the holder the
   log names, reported by every participant, so any cluster's scaler says
   where the lease is. `site` is the holder id up to its last slash (the
-  chart's `holderPrefix`).
+  chart's `site`).
 - Chart: `imagePullSecrets`, `podLabels`, `priorityClassName`,
   `podSecurityContext` and `securityContext` (the container's), all empty
   by default.
@@ -84,7 +110,25 @@ and this project adheres to
   `unclean.leader.election.enable=true` or a `cleanup.policy` without
   `compact` are logged as warnings. It is never altered.
 
+- The lease belongs to a site: binary `-site` / `KFKLEASE_SITE` and
+  `-takeover-delay` / `KFKLEASE_TAKEOVER_DELAY` (0, claim at once, by
+  default), library `lease.Config.Site` and `lease.Config.TakeoverDelay`,
+  `lease.SiteOf`. A candidate claims at once after a term of its own site
+  and waits the takeover delay after a term of another site; a claim that
+  lands within the delay anyway is released at once. A scaler restart and
+  a Kafka outage leave the workload where it was.
+- `lease.State.Last`, the holder of the latest term after it ended;
+  `lease.Status.Ready` and `ready` in `/status`: whether the participant
+  has known the lease state since it started.
+- Stand: the `restart` scenario deletes the holder's scaler pod and checks
+  that the workload's pods stay the same and the other cluster never
+  starts; the `broker` scenario now ends with the lease on the site that
+  held it before the outage.
+
 ### Changed
+
+- Metric `kfklease_lease_holder_info`: the `site` of a holder id without a
+  slash is the holder id itself, where it was empty.
 
 - The scaler's lease metrics carry a `topic` label
   (`kfklease_holding{topic="orders"}`). Queries that select or sum without

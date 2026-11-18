@@ -87,18 +87,28 @@ release per cluster. One scaler can serve several leases, one per topic,
 each with its own workload (`extraLeases`); a ScaledObject names its lease
 with `topic` in the trigger metadata. The scaler address in the ScaledObject follows the
 release name and namespace, so the same command works in every cluster with
-a different `holderPrefix`:
+a different `site`:
 
 ```bash
 helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.3.0 \
   -n kfklease --create-namespace \
-  --set brokers=kafka:9092 --set topic=my-lease --set holderPrefix=eu-west \
+  --set brokers=kafka:9092 --set topic=my-lease --set site=eu-west \
   --set scaledObject.targetRef.name=my-singleton
 ```
 
-Upgrading from 0.3.0: `scaledObject.target` is now
+The lease belongs to a site, not to a scaler pod. A restarted scaler (an
+upgrade, a node drain, an OOM kill) claims for its site at once and the
+workload stays where it is: KEDA keeps it through `cooldownPeriod` (60 s)
+while the new pod reads the log, and another site waits `takeoverDelay`
+(by default `pollingInterval + cooldownPeriod + takeoverMargin`, 95 s)
+after the end of a foreign term before it claims, so the old site's
+workload is down by then. A Kafka outage ends with the lease where it was.
+
+Upgrading from 0.3.0: `holderPrefix` is now `site`, which is required
+(`--set site=eu-west`); `scaledObject.target` is now
 `scaledObject.targetRef.name` (`--set scaledObject.targetRef.name=my-singleton`);
-the old value fails the render. See [CHANGELOG.md](CHANGELOG.md).
+the old values fail the render. `cooldownPeriod` is now 60 s and a
+failover waits `takeoverDelay`. See [CHANGELOG.md](CHANGELOG.md).
 
 The chart pulls `ghcr.io/kfkit/kfklease-scaler` at the same version:
 linux/amd64 and linux/arm64, signed with cosign. The digest and the verify
@@ -144,17 +154,21 @@ The scaler serves HTTP on `:9091` (`service.httpPort`):
   `kfklease_transitions_total{to="holding"|"standby"}`. The pod carries
   `prometheus.io/*` annotations; `metrics.serviceMonitor.enabled` adds a
   ServiceMonitor for the Prometheus Operator.
-- `/status`, JSON: the same, plus the log's view of the lease. A workload
+- `/status`, JSON: the same, plus the log's view of the lease and `ready`
+  (false until a new scaler has read enough of the log to know who holds
+  the lease; until then KEDA gets an error, not "not holding"). A workload
   that fences by epoch reads its epoch here.
 - `/healthz`.
 
 The binary is configured by flags or environment: `KFKLEASE_BROKERS`,
-`KFKLEASE_TOPIC`, `KFKLEASE_TTL`, `KFKLEASE_HOLDER` (unique per process; the
-chart uses the pod name). The two-cluster stand the chart is tested on is in
+`KFKLEASE_TOPIC`, `KFKLEASE_TTL`, `KFKLEASE_SITE`, `KFKLEASE_HOLDER`
+(`<site>/<name>`, unique per process; the chart uses the pod name),
+`KFKLEASE_TAKEOVER_DELAY`. The two-cluster stand the chart is tested on is in
 [test/e2e](test/e2e).
 
-KEDA gives failover, not mutual exclusion: the old pod is still terminating
-while the new one starts, a `cooldownPeriod` above zero stretches that, and a
+KEDA gives failover, not mutual exclusion: the old pod may still be
+terminating when the new one starts if `takeoverDelay` does not cover its
+stop, and a
 cluster coming back from a crash restarts its stale pod until its own KEDA
 is up again and scales it down. Workloads that must not overlap check the
 epoch downstream. If the scaler alone is gone, KEDA's `fallback`, which
@@ -207,6 +221,8 @@ The end-to-end stand with two Kubernetes clusters is described in
 - [x] N replicas of any scalable target; fail closed when the scaler is gone
 - [x] Optional health gate: fail over when the workload cannot run where the lease is held
 - [x] Several leases, one per topic, served by one scaler
+- [x] The lease belongs to a site: a scaler restart or a Kafka outage leaves the workload in place
+- [ ] Standby mode and a `status` command; scaler replicas per site
 - [x] Failure-mode tests: clock skew and drift, in the simulation
 - [x] Example workload fencing by epoch; workload-level exclusion check on the stand
 - [x] Image and chart on GHCR, cosign-signed

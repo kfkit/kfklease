@@ -60,8 +60,16 @@ State: `holder`, `epoch`, `expires`. For a record with broker timestamp `T`:
   writer, **`epoch` is the offset of the claim**, `expires = T + ttl`.
 - `renew`: valid iff the lease is held at `T` by the same holder and epoch.
   Then `expires = T + ttl`. A renew never starts or revives a term.
-- `release`: valid under the same condition; frees the lease at `T`.
+- `release`: valid under the same condition; frees the lease at `T`
+  (`expires = T`).
 - Anything else has no effect.
+
+The state also keeps `last`, the holder of the latest term, after the term
+ends by expiry or release, and `expires` then says when it ended. Neither
+changes what the fold accepts; the site rules below read them. A view that
+became certain through silence does not know the last holder: `last` is
+empty and `expires` is the latest moment the unknown term can have ended,
+the last record it saw plus a TTL.
 
 Using the claim's offset as the epoch makes it a fencing token that is unique,
 grows with every term, and is known to anyone who sees the record, without
@@ -94,6 +102,36 @@ and the last healthy report, drops its belief at once, writes a release
 when rule 2 lets it, and claims nothing for `Cooldown`. Dropping a belief
 early and claiming later are both on the safe side of rules 4 and 5; the
 fold does not change.
+
+### Sites
+
+The same freedom carries the lease from a process to a site. A holder id
+is `<site>/<name>`, the site being everything before the last slash, a
+cluster under the chart (an id without a slash is a site of its own). With
+a takeover delay `D` (`lease.Config.TakeoverDelay`):
+
+6. A candidate whose site held the latest term claims as soon as the lease
+   is free, as before.
+7. A candidate of another site claims only once the broker's clock, as it
+   estimates it from the last record it read, is `D` past the end of that
+   term, and only when it has read up to the log's end offset: a reader that
+   is behind may have missed a new term of that site. A term whose holder
+   the view does not know counts as another site's; if not a single record
+   of an existing history is left, the delay counts from the silence that
+   made the view certain, on the local clock.
+8. A claim of another site that lands within `D` of the end of the previous
+   term is not believed and is released at once. It was sent in time, but
+   landed late, after a short term of that site. The fold accepted it, so
+   the release is what frees the lease for the others.
+
+Rules 6 to 8 only ever hold a claim back or give a term up, so safety is
+untouched; what they buy is time: a site that loses its term, by expiry or
+by release, has `D` to stop its workload before another site may start one.
+Under the chart `D` is at least KEDA's `pollingInterval + cooldownPeriod`
+plus a margin for the workload to stop, and the cooldown is longer than a
+scaler restart, so a restarted scaler claims for its site again before KEDA
+gives the workload up. A new scaler answers KEDA with an error, not with "not
+holding", until its view has been certain once (`Status.Ready`).
 
 ## The margin
 
@@ -187,11 +225,22 @@ longer than `FailAfter` past its last healthy report or the start of its
 term, no claim within the cooldown, and the gate firing several times per
 run.
 
+A fourth run puts the nodes in two sites with a takeover delay of three
+TTLs: no overlap; no claim of another site accepted within the delay after
+the end of a term, by the broker's clock, unless it is given up without a
+single renewal (rule 8); and many takeovers by the same site within the
+delay, after releases and after terms that ran out. `agent_test.go` pins
+rules 6 to 8 down one case at a time: a release and an expiry by either
+site, a holder known only through silence, a log whose history is gone, a
+reader behind the end offset, a claim that landed early.
+
 Breaking a rule in `view.go` or `agent.go` (trusting a lone renew, reviving a
 term with a late renew, halving the silence period, taking the deadline from
 the acknowledgement time, believing on the acknowledgement alone, matching own
-records by kind instead of offset, ignoring holes, claiming without looking)
-fails at least one of these tests; that was checked by mutation, by hand.
+records by kind instead of offset, ignoring holes, claiming without looking,
+dropping the takeover delay, the own-site exemption, the end-offset check,
+the wait on a log without history or the release of an early claim) fails
+at least one of these tests; that was checked by mutation, by hand.
 
 ## The client
 
@@ -209,7 +258,8 @@ fails at least one of these tests; that was checked by mutation, by hand.
   record it gave up on (delivery timeout) can never be mistaken for the one
   in flight;
 - a stop releases the lease: the belief is dropped first, the record is
-  written second.
+  written second. With sites, the release lets the next pod of the same
+  site claim at once.
 
 `lease/candidate_integration_test.go` runs it against a broker: one holder
 among two candidates, handover after a release (tens of milliseconds) and
@@ -217,8 +267,10 @@ after a crash (about one TTL, never before the crashed holder's deadline),
 a late reader agreeing with the holder, epochs growing across terms.
 
 `test/e2e` runs the whole thing, scaler and KEDA included, on two k3s
-clusters: cold start, crash, partition, freeze and broker restart, with a
-check that the workload never runs in both clusters at once.
+clusters: cold start, a scaler restart that keeps the workload's pods, crash,
+partition, freeze, a broker outage that ends with the lease on the same site,
+N replicas and a scaler that is gone, with a check that the workload never
+runs in both clusters at once.
 
 ## Not covered yet
 
