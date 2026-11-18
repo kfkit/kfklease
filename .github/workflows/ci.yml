@@ -89,10 +89,10 @@ jobs:
                     --set scaledObject.targetRef.name=w "$@" -s templates/deployment.yaml; }
           val() { grep -A1 "name: $1\$" <<<"$out" | grep -qF "value: \"$2\"" || { echo "$1 is not $2"; exit 1; }; }
           out=$(dep)
-          val KFKLEASE_REPLICATION_FACTOR 3; val KFKLEASE_MIN_INSYNC_REPLICAS 0; val KFKLEASE_FLUSH_EVERY_RECORD false
-          out=$(dep --set replicationFactor=1 --set minInsyncReplicas=1 --set flushEveryRecord=true)
+          val KFKLEASE_REPLICATION_FACTOR 3; val KFKLEASE_MIN_INSYNC_REPLICAS 0; val KFKLEASE_FLUSH_EVERY_RECORD true
+          out=$(dep --set replicationFactor=1 --set minInsyncReplicas=1 --set flushEveryRecord=false)
           echo "$out"
-          val KFKLEASE_REPLICATION_FACTOR 1; val KFKLEASE_MIN_INSYNC_REPLICAS 1; val KFKLEASE_FLUSH_EVERY_RECORD true
+          val KFKLEASE_REPLICATION_FACTOR 1; val KFKLEASE_MIN_INSYNC_REPLICAS 1; val KFKLEASE_FLUSH_EVERY_RECORD false
       - name: Pod settings render where Kubernetes reads them
         run: |
           dep() { helm template t charts/kfklease --set site=s --set brokers=k:9092 --set topic=t \

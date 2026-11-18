@@ -62,7 +62,9 @@ for range c.Changed() {
 `CreateTopic` creates a missing topic as a lease log: compacted,
 `LogAppendTime`, three replicas with `min.insync.replicas=2` and unclean
 leader election off (`Config.TopicSettings`; the chart's
-`replicationFactor`, `minInsyncReplicas` and `flushEveryRecord`). A Kafka
+`replicationFactor`, `minInsyncReplicas` and `flushEveryRecord`). The chart
+and the binary also set `flush.messages=1`; the library only when
+`FlushEveryRecord` is set. A Kafka
 cluster with fewer than three brokers needs `ReplicationFactor` set to its
 size. An existing topic is checked and never altered; see
 [The lease topic](docs/install.md#the-lease-topic).

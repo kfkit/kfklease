@@ -189,13 +189,13 @@ chosen for a lease log, not the broker's defaults:
 | replication factor | `replicationFactor`, 3 | with one replica, losing a broker loses the lease |
 | `min.insync.replicas` | `minInsyncReplicas`; by default 2 with three or more replicas, otherwise 1 | the scaler writes with `acks=all`: an acknowledged record is on that many brokers |
 | `unclean.leader.election.enable` | `false`, set on the topic | the epoch is the offset of the accepted claim; after an unclean election the same offset can hold a different record |
-| `flush.messages` | `1` with `flushEveryRecord: true`; unset by default | every record is fsynced before it is acknowledged, which protects the tail of the log when all replicas go down at once |
+| `flush.messages` | `1` with `flushEveryRecord: true`, the default; unset with `false` | every record is fsynced before it is acknowledged, which protects the tail of the log when all replicas go down at once |
 
 A cluster with fewer brokers than `replicationFactor` fails the creation
 with an error that names `replicationFactor`; nothing lowers it on its
-own. `flushEveryRecord` goes against the Kafka documentation, which relies
-on replication instead; at one record every few seconds it costs latency,
-not throughput: on the one-broker stand a produce with `acks=all` took
+own. `flushEveryRecord` is on by default and goes against the Kafka
+documentation, which relies on replication instead; at one record every
+few seconds it costs latency, not throughput: on the one-broker stand a produce with `acks=all` took
 0.9–1.3 ms at the median without it and 1.5–1.9 ms with it.
 
 An existing topic is never altered. At start the scaler checks it: no

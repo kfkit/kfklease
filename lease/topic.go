@@ -49,6 +49,7 @@ type TopicSettings struct {
 	// FlushEveryRecord sets flush.messages=1 on a new topic: every record is
 	// fsynced before it is acknowledged, which protects the tail of the log
 	// when all replicas go down at once, at the cost of renewal latency.
+	// Off in the zero value; the chart and the binary turn it on by default.
 	FlushEveryRecord bool
 }
 
