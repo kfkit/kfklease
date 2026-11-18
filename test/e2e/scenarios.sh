@@ -6,7 +6,7 @@
 # at once and how long nobody wrote.
 #
 #   ./scenarios.sh            # all
-#   ./scenarios.sh crash      # one: coldstart, crash, partition, pause, broker, replicas, scaler-down
+#   ./scenarios.sh crash      # one: coldstart, restart, crash, partition, pause, broker, replicas, scaler-down
 #
 # Expects the stand to be up (./smoke.sh), the image built (./build-image.sh)
 # and the manifests deployed to both clusters (./deploy.sh k3s-a; ./deploy.sh k3s-b).
@@ -19,6 +19,16 @@ source ./lib.sh
 # The workload's replica count in the holding cluster; the replicas
 # scenario raises it for its duration.
 want=1
+
+# A takeover by the other site comes a TTL after the holder's last renewal
+# at the latest, plus the takeover delay; TAKEOVER leaves two TTLs on top
+# for KEDA and the pod start.
+TAKEOVER=$(( TTL + TAKEOVER_DELAY + 2 * TTL ))
+
+fail() {
+  echo "FAILED: $*" >&2
+  return 1
+}
 
 # running <cluster> prints the number of Running, not terminating, singleton pods.
 running() {
@@ -102,6 +112,32 @@ settle() {
   echo "$h"
 }
 
+# scaler_status <cluster> prints the scaler's /status, through the API
+# server's service proxy.
+scaler_status() {
+  kc "$1" get --raw "/api/v1/namespaces/${NS}/services/${RELEASE}:http/proxy/status" 2>/dev/null
+}
+
+# status_get <cluster> <python expression over r, the /status JSON> prints
+# the expression, or nothing when the scaler does not answer.
+status_get() {
+  local st
+  st=$(scaler_status "$1") || return 0
+  python3 -c 'import sys, json; r = json.loads(sys.argv[1]); print(eval(sys.argv[2]))' "$st" "$2" 2>/dev/null || true
+}
+
+# held_epoch <cluster> prints the epoch the cluster's scaler holds, or -1.
+held_epoch() {
+  local e
+  e=$(status_get "$1" 'r["epoch"] if r["holding"] else -1')
+  [[ $e =~ ^[0-9]+$ ]] && echo "$e" || echo -1
+}
+
+# workload_uids <cluster> prints the UIDs of the workload pods, sorted.
+workload_uids() {
+  kc "$1" -n "$NS" get pods -l app=singleton -o jsonpath='{range .items[*]}{.metadata.uid}{"\n"}{end}' | sort
+}
+
 # now_rfc3339 prints the current time for the heartbeat report's --since.
 now_rfc3339() {
   date -u +%Y-%m-%dT%H:%M:%SZ
@@ -141,13 +177,44 @@ scenario_coldstart() {
   echo "   ok: standby idle for $(( 2 * TTL ))s"
 }
 
+scenario_restart() {
+  echo "== restart: delete the holder's scaler pod; the workload stays where it is"
+  local h o since uids before epoch t0 t until holder
+  h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
+  uids=$(workload_uids "$h")
+  before=$(held_epoch "$h")
+  (( before >= 0 )) || fail "the scaler of ${h} does not hold the lease" || return
+  t0=$(date +%s)
+  # The pod releases on its way out and its successor, of the same site,
+  # claims at once; the other site would wait the takeover delay.
+  kc "$h" -n "$NS" delete pod -l app.kubernetes.io/name=kfklease --wait=false >/dev/null
+  until epoch=$(held_epoch "$h"); (( epoch > before )); do
+    (( $(date +%s) - t0 < 3 * TTL )) || fail "${h} holds no new epoch $(( 3 * TTL ))s after its scaler pod was deleted" || return
+    sleep 1
+  done
+  t=$(( $(date +%s) - t0 ))
+  holder=$(status_get "$h" 'r["lease"]["holder"]')
+  [[ $holder == "${h}/"* ]] || fail "the lease is held by ${holder}, not by site ${h}" || return
+  echo "   ${holder} holds epoch ${epoch} (was ${before}) ${t}s after the pod was deleted"
+  # Past KEDA's cooldown: had anything said "not holding" for longer, the
+  # workload would be gone by now.
+  until=$(( $(date +%s) + COOLDOWN + 10 ))
+  while (( $(date +%s) < until )); do
+    [[ $(running "$o") == 0 ]] || fail "${o} started the workload" || return
+    [[ $(workload_uids "$h") == "$uids" ]] || fail "the workload pods of ${h} changed" || return
+    sleep 1
+  done
+  heartbeats "$since"
+  echo "   ok: same workload pods $(( COOLDOWN + 10 ))s on, ${o} never started"
+}
+
 scenario_crash() {
   echo "== crash: kill the holder's cluster"
   local h o t since
   h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
   docker compose kill "$h" >/dev/null 2>&1
-  t=$(wait_running "$o" "$want" $(( 3 * TTL )))
-  echo "   ${o} took over ${t}s after ${h} died (ttl ${TTL}s)"
+  t=$(wait_running "$o" "$want" "$TAKEOVER")
+  echo "   ${o} took over ${t}s after ${h} died (ttl ${TTL}s, takeover delay ${TAKEOVER_DELAY}s)"
   docker compose up -d --wait "$h" >/dev/null 2>&1
   # The revived cluster still has the workload at one replica in its own
   # state, so its kubelet restarts the stale pod until KEDA is back up and
@@ -157,9 +224,10 @@ scenario_crash() {
   t0=$(date +%s)
   kc "$h" -n keda rollout status deploy/keda-operator --timeout=180s >/dev/null
   kc "$h" -n "$NS" rollout status "deploy/$RELEASE" --timeout=120s >/dev/null
-  t=$(wait_running "$h" 0 $(( 3 * TTL )))
+  t=$(wait_running "$h" 0 $(( 3 * TTL + COOLDOWN )))
   echo "   ${h} came back and ran its stale pod for $(( $(date +%s) - t0 ))s before KEDA scaled it down"
-  # The revived scaler has a new holder id and must not take the lease back.
+  # The revived scaler's site no longer holds the lease: it must not take
+  # it back.
   watch_exclusive $(( 2 * TTL ))
   [[ $(holder) == "$o" ]] || { echo "FAILED: lease moved back to the revived cluster" >&2; return 1; }
   heartbeats "$since"
@@ -171,7 +239,7 @@ scenario_partition() {
   local h o since
   h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
   ./partition.sh cut "$h"
-  echo "   ${h} -> ${o}: $(transition "$h" "$o" $(( 3 * TTL ))) (ttl ${TTL}s)"
+  echo "   ${h} -> ${o}: $(transition "$h" "$o" "$TAKEOVER") (ttl ${TTL}s, cooldown ${COOLDOWN}s, takeover delay ${TAKEOVER_DELAY}s)"
   ./partition.sh heal "$h"
   watch_exclusive $(( 2 * TTL ))
   [[ $(holder) == "$o" ]] || { echo "FAILED: lease moved back after the heal" >&2; return 1; }
@@ -184,14 +252,14 @@ scenario_pause() {
   local h o t since
   h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
   docker compose pause "$h" >/dev/null 2>&1
-  t=$(wait_running "$o" "$want" $(( 3 * TTL )))
+  t=$(wait_running "$o" "$want" "$TAKEOVER")
   echo "   ${o} took over ${t}s into the freeze"
   sleep $(( 2 * TTL - t > 0 ? 2 * TTL - t : 0 ))
   docker compose unpause "$h" >/dev/null 2>&1
   # On waking up the frozen scaler is past its deadline: the pod must go.
   # Both pods exist during the freeze, but the frozen one is not running
   # in any useful sense; what matters is how fast it goes after the wake-up.
-  t=$(wait_running "$h" 0 $(( 2 * TTL )))
+  t=$(wait_running "$h" 0 $(( 2 * TTL + COOLDOWN )))
   echo "   ${h} stopped its pod ${t}s after waking up"
   watch_exclusive $(( 2 * TTL ))
   [[ $(holder) == "$o" ]] || { echo "FAILED: lease moved back after the pause" >&2; return 1; }
@@ -200,30 +268,31 @@ scenario_pause() {
 }
 
 scenario_broker() {
-  echo "== broker: Kafka, the arbiter, is down for 2 x ttl"
-  local h t0 lost back since
-  h=$(settle); since=$(now_rfc3339)
+  echo "== broker: Kafka, the arbiter, is down for 2 x ttl; the lease stays with its site"
+  local h o t0 back since
+  h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
   t0=$(date +%s)
   # A restart would be over before the holder's deadline on a fast machine
-  # and the holder would rightly keep the lease; a stop of a known length
-  # makes the outcome deterministic.
+  # and the holder would keep its term; a stop of a known length makes the
+  # outcome deterministic: the term runs out in the log.
   docker compose stop kafka >/dev/null 2>&1
-  # Without Kafka nobody can renew: the holder stops within a ttl.
-  wait_running "$h" 0 $(( 3 * TTL )) >/dev/null
-  lost=$(( $(date +%s) - t0 ))
-  sleep $(( 2 * TTL - lost > 0 ? 2 * TTL - lost : 0 ))
+  sleep $(( 2 * TTL ))
   # Not `start kafka`: that also reruns the certs service, which issues a
   # new CA the mounted client Secret does not trust, and mTLS stays broken.
   docker compose up -d --no-deps --no-recreate kafka >/dev/null 2>&1
-  until [[ -n $(holder) ]]; do
-    (( $(date +%s) - t0 < 6 * TTL )) || { echo "FAILED: nobody took the lease after the broker came back" >&2; return 1; }
+  # Both sites see the same expired term of ${h}: its site claims at once,
+  # the other one waits the takeover delay.
+  until (( $(held_epoch "$h") >= 0 )); do
+    [[ $(running "$o") == 0 ]] || fail "${o} started the workload" || return
+    (( $(date +%s) - t0 < 2 * TTL + TAKEOVER_DELAY )) || fail "${h} did not take the lease back after the broker came back" || return
     sleep 1
   done
   back=$(( $(date +%s) - t0 ))
-  echo "   ${h} stopped ${lost}s into the outage, $(holder) holds ${back}s after it began (ttl ${TTL}s)"
+  echo "   ${h} holds again ${back}s after the outage began (ttl ${TTL}s), its workload at $(running "$h")"
   watch_exclusive $(( 2 * TTL ))
+  [[ $(holder) == "$h" && $(running "$o") == 0 ]] || fail "the workload moved to ${o}" || return
   heartbeats "$since"
-  echo "   ok"
+  echo "   ok: the lease stayed with ${h}"
 }
 
 # redeploy <replicas> renders the chart into both clusters with the
@@ -246,7 +315,7 @@ scenario_replicas() {
   o=$(other "$h")
   [[ $(running "$o") == 0 ]] || { echo "FAILED: standby is running the workload" >&2; return 1; }
   ./partition.sh cut "$h"
-  echo "   ${h} -> ${o}: $(transition "$h" "$o" $(( 3 * TTL ))) (ttl ${TTL}s, ${want} replicas)"
+  echo "   ${h} -> ${o}: $(transition "$h" "$o" "$TAKEOVER") (ttl ${TTL}s, ${want} replicas)"
   ./partition.sh heal "$h"
   watch_exclusive $(( 2 * TTL ))
   [[ $(holder) == "$o" && $(running "$o") == "$want" ]] || { echo "FAILED: ${o} does not run ${want} replicas after the heal" >&2; return 1; }
@@ -294,7 +363,7 @@ scenario_scaler_down() {
   scaler_service "$h" off
   ./partition.sh cut "$h"
   docker compose exec -T "$h" sh -c 'crictl stop --timeout 0 $(crictl ps -q --name "^scaler$")' >/dev/null
-  echo "   ${h} -> ${o}: $(transition "$h" "$o" $(( 3 * TTL ))) (ttl ${TTL}s)"
+  echo "   ${h} -> ${o}: $(transition "$h" "$o" "$TAKEOVER") (ttl ${TTL}s, cooldown ${COOLDOWN}s)"
   ./partition.sh heal "$h"
   scaler_service "$h" on
   watch_exclusive $(( 2 * TTL ))
@@ -304,7 +373,7 @@ scenario_scaler_down() {
 }
 
 if (( $# == 0 )); then
-  set -- coldstart crash partition pause broker replicas scaler-down
+  set -- coldstart restart crash partition pause broker replicas scaler-down
 fi
 for s in "$@"; do
   "scenario_${s//-/_}"

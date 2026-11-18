@@ -9,6 +9,14 @@
   NS=kfklease       # namespace of the scaler and the workload
   RELEASE=kfklease  # chart release: deployment and service name
   TTL=10            # lease ttl in seconds
+  # KEDA keeps a workload for COOLDOWN seconds after its scaler stopped
+  # saying "holding" (the chart's default is 60; shorter here to keep the
+  # scenarios short, still longer than a scaler restart). Another site waits
+  # TAKEOVER_DELAY after the end of a term: polling 5 s + COOLDOWN +
+  # TAKEOVER_MARGIN, which covers the test workload's 2 s grace period.
+  COOLDOWN=30
+  TAKEOVER_MARGIN=5
+  TAKEOVER_DELAY=$(( 5 + COOLDOWN + TAKEOVER_MARGIN ))
   COMPOSE_PROJECT=kfklease-e2e  # the name: in compose.yaml
 }
 
