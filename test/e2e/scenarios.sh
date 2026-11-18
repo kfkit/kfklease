@@ -564,7 +564,20 @@ scenario_handover_crash() {
 if (( $# == 0 )); then
   set -- coldstart restart holder-pod bad-image crash partition pause broker replicas scaler-down standby handover-crash
 fi
+# A failing command ends the run through set -e. A shell error does not:
+# bash drops the whole command it happens in, here the loop, and goes on
+# with the next one. So the loop clears `current` only when a scenario
+# returns, and a run that ends with a scenario still current has failed.
+current=""
+on_exit() {
+  local rc=$?
+  [[ -z $current ]] || echo "FAILED: scenario ${current} did not finish (exit ${rc})" >&2
+}
+trap on_exit EXIT
 for s in "$@"; do
+  current=$s
   "scenario_${s//-/_}"
+  current=""
 done
+[[ -z $current ]] || exit 1
 echo "all scenarios passed"
