@@ -22,10 +22,21 @@ minInsyncReplicas: 0     # 0: 2 with three or more replicas, otherwise 1
 # little renewal latency; the Kafka documentation relies on replication.
 flushEveryRecord: false
 
-# Holder ids are "<holderPrefix>/<pod name>". Empty means the release name.
-# Use something that names the cluster, so that logs and the lease topic
-# say where the workload runs.
-holderPrefix: ""
+# Required: where this release runs, one name per cluster (eu-west, say).
+# The lease belongs to the site, not to the scaler pod: holder ids are
+# "<site>/<pod name>", and a restarted scaler claims for its site at once,
+# so the workload stays where it is.
+site: ""
+
+# How long a cluster waits, after another site's term ended (by expiry or
+# release), before it claims: the time that site's KEDA needs to scale its
+# workload down (pollingInterval + cooldownPeriod) and the workload needs
+# to stop (takeoverMargin). In seconds; 0 derives it from the slowest
+# ScaledObject of the release, and a value below that is refused. The
+# order that keeps a workload in one place: a scaler restart < cooldownPeriod
+# < takeoverDelay.
+takeoverDelay: 0
+takeoverMargin: 30   # seconds; cover the workload's terminationGracePeriodSeconds
 
 logLevel: info
 
@@ -98,9 +109,11 @@ scaledObject:
   # Replicas while this cluster holds the lease.
   replicas: 1
   pollingInterval: 5
-  # Every second of cooldown is a second the old and the new holder may
-  # overlap.
-  cooldownPeriod: 0
+  # How long KEDA keeps the workload after the scaler stopped saying
+  # "holding" or could not be asked: longer than a scaler restart, so that
+  # a restart leaves the workload alone. Another site waits for it through
+  # takeoverDelay before it starts its own.
+  cooldownPeriod: 60
   # Scale the target to zero when KEDA cannot reach the scaler (its pod
   # lost, Pending, not ready), rather than leave it running while the term
   # runs out and another cluster starts it too. Renders KEDA's fallback
@@ -111,7 +124,7 @@ scaledObject:
 # More leases served by the same scaler, one per topic, each with its own
 # workload. Every entry takes part in its own lease and gets its own
 # ScaledObject; its scaledObject is merged over the one above, so only what
-# differs needs saying. ttl, margin, holderPrefix, auth and the healthGate
+# differs needs saying. ttl, margin, site, takeoverDelay, auth and the healthGate
 # timings are shared; healthGate.url is per lease, empty for no gate.
 #
 # extraLeases:

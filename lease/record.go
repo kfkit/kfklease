@@ -6,6 +6,7 @@ package lease
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -52,6 +53,15 @@ type Record struct {
 	Epoch int64
 	// TTL is how long the term stays live after this record.
 	TTL time.Duration
+}
+
+// SiteOf returns the site of a holder id "<site>/<name>": everything before
+// the last slash. A holder id without a slash is a site of its own.
+func SiteOf(holder string) string {
+	if i := strings.LastIndex(holder, "/"); i >= 0 {
+		return holder[:i]
+	}
+	return holder
 }
 
 // term returns the identity of the term the record belongs to or, for a

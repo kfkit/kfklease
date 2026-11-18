@@ -34,10 +34,22 @@ type Config struct {
 	// CreateTopic creates. The zero value is three replicas, two in sync.
 	TopicSettings TopicSettings
 
-	// Holder identifies this participant in the log. It must be unique per
-	// process incarnation: a restarted process must not inherit the term of
-	// its previous life. Empty means "<hostname>/<random>".
+	// Site is where this participant runs, a cluster say: the lease belongs
+	// to a site rather than to one process. A participant claims at once
+	// when the term that ended last was its own site's, and waits
+	// TakeoverDelay after the end of another site's term. Empty means the
+	// site of Holder, see SiteOf.
+	Site string
+	// Holder identifies this participant in the log as "<site>/<name>". It
+	// must be unique per process incarnation: a restarted process must not
+	// inherit the term of its previous life. Empty means
+	// "<site>/<hostname>-<random>", or "<hostname>/<random>" without a Site.
 	Holder string
+	// TakeoverDelay is how long a participant waits, after a term of
+	// another site ended by expiry or release, before it claims: the time
+	// that site's workload gets to stop. Zero claims as soon as the lease
+	// is free.
+	TakeoverDelay time.Duration
 
 	// TTL is how long a term lasts without renewal. It is a property of the
 	// lease and must be the same for every participant.
@@ -115,6 +127,9 @@ func (c Config) withDefaults() (_ Config, err error) {
 	if c.TopicSettings, err = c.TopicSettings.withDefaults(); err != nil {
 		return c, err
 	}
+	if c.TakeoverDelay < 0 {
+		return c, errors.New("lease: negative takeover delay")
+	}
 	if c.Holder == "" {
 		host, _ := os.Hostname()
 		var b [4]byte
@@ -122,6 +137,15 @@ func (c Config) withDefaults() (_ Config, err error) {
 			return c, fmt.Errorf("lease: random holder id: %w", err)
 		}
 		c.Holder = host + "/" + hex.EncodeToString(b[:])
+		if c.Site != "" {
+			c.Holder = c.Site + "/" + host + "-" + hex.EncodeToString(b[:])
+		}
+	}
+	switch site := SiteOf(c.Holder); {
+	case c.Site == "":
+		c.Site = site
+	case c.Site != site || c.Holder == c.Site:
+		return c, fmt.Errorf("lease: holder %q is not in site %q: holder ids are <site>/<name>", c.Holder, c.Site)
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
@@ -162,6 +186,11 @@ type Status struct {
 	// health gate released the lease, on the local monotonic clock; zero
 	// unless it is waiting.
 	CooldownUntil time.Time
+
+	// Ready is whether this participant has known the state of the lease
+	// since it started: false until its view is first certain. Before that,
+	// not Holding means "do not know" rather than "another holds it".
+	Ready bool
 }
 
 // Candidate takes part in a lease: it follows the log, claims the lease when

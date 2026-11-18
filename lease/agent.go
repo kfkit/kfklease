@@ -26,7 +26,7 @@ type agent struct {
 	highWater int64
 	// ownOutcomes remembers verdicts on this participant's records read
 	// back before the acknowledgement told us their offset.
-	ownOutcomes map[int64]Outcome
+	ownOutcomes map[int64]verdict
 
 	// Belief: this participant holds epoch until deadline (monotonic).
 	epoch    int64
@@ -46,6 +46,10 @@ type agent struct {
 	standbyUntil time.Time
 	releaseDue   bool
 
+	// ready is set once the view has been certain: from then on the agent
+	// knows who holds the lease, or knew it last.
+	ready bool
+
 	// Silence bookkeeping, all on the monotonic clock.
 	connected    bool
 	fetchedOnce  bool
@@ -54,6 +58,15 @@ type agent struct {
 	// lastRecordAt is paired with the broker time of that record, to
 	// estimate the broker's clock between records.
 	lastRecordBroker time.Time
+}
+
+// verdict is the fold's outcome of an own record, and for an accepted
+// claim whether it landed too early: within the takeover delay after
+// another site's term, which a late landing can do although the claim was
+// sent in time.
+type verdict struct {
+	out   Outcome
+	early bool
 }
 
 type inflight struct {
@@ -72,7 +85,7 @@ func newAgent(cfg Config, log *slog.Logger, start, end int64, now time.Time) *ag
 		view:        NewView(cfg.TTL),
 		nextOffset:  start,
 		highWater:   end,
-		ownOutcomes: make(map[int64]Outcome),
+		ownOutcomes: make(map[int64]verdict),
 		epoch:       -1,
 		connected:   true,
 		caughtUpAt:  now,
@@ -81,6 +94,7 @@ func newAgent(cfg Config, log *slog.Logger, start, end int64, now time.Time) *ag
 		// Nothing was ever deleted, so the reader sees everything. Holes
 		// left by compaction are caught record by record.
 		a.view = NewViewFromStart(cfg.TTL)
+		a.ready = true
 	}
 	return a
 }
@@ -136,14 +150,17 @@ func (a *agent) record(now time.Time, offset int64, ts time.Time, value []byte) 
 	}
 	rec.Offset = offset
 	rec.Timestamp = ts
+	before, wasCertain := a.view.State(), a.view.Certain()
 	out, err := a.view.Apply(rec)
 	if err != nil {
 		return err
 	}
 	a.log.Debug("record", "offset", rec.Offset, "kind", rec.Kind, "by", rec.Holder, "epoch", rec.Epoch, "outcome", out)
 
+	a.ready = a.ready || a.view.Certain()
 	if rec.Holder == a.cfg.Holder {
-		a.ownRecord(now, rec.Offset, rec.Kind, out)
+		early := rec.Kind == Claim && out == Accepted && wasCertain && ts.Before(a.takeoverFrom(before))
+		a.ownRecord(now, rec.Offset, rec.Kind, verdict{out, early})
 	}
 	if a.believing(now) && a.view.Certain() {
 		s := a.view.State()
@@ -158,17 +175,17 @@ func (a *agent) record(now time.Time, offset int64, ts time.Time, value []byte) 
 // ownRecord handles a record written by this participant. Only the record
 // in flight can change the belief, and only once its offset is known from
 // the acknowledgement; anything else is a record we gave up on.
-func (a *agent) ownRecord(now time.Time, offset int64, kind Kind, out Outcome) {
+func (a *agent) ownRecord(now time.Time, offset int64, kind Kind, v verdict) {
 	in := a.inflight
 	if in == nil || in.kind != kind {
 		return
 	}
 	if in.offset == -1 {
-		a.ownOutcomes[offset] = out
+		a.ownOutcomes[offset] = v
 		return
 	}
 	if in.offset == offset {
-		a.settle(now, out)
+		a.settle(now, v)
 	}
 }
 
@@ -188,21 +205,29 @@ func (a *agent) acked(now time.Time, offset int64, err error) {
 		return
 	}
 	in.offset = offset
-	if out, ok := a.ownOutcomes[offset]; ok {
-		a.settle(now, out)
+	if v, ok := a.ownOutcomes[offset]; ok {
+		a.settle(now, v)
 	}
 }
 
 // settle applies the fold's verdict on the record in flight to the belief.
-func (a *agent) settle(now time.Time, out Outcome) {
+func (a *agent) settle(now time.Time, v verdict) {
 	in := a.inflight
 	a.inflight = nil
 	clear(a.ownOutcomes)
+	out := v.out
 	switch {
 	case out == Pending:
 		// The view lost certainty while the record was in flight. The
 		// record may well be valid, but the belief needs proof.
 		a.log.Warn("own record unjudged", "kind", in.kind, "offset", in.offset)
+	case in.kind == Claim && out == Accepted && v.early:
+		// Another site held a short term while the claim was on its way,
+		// and its workload may still run. The term is ours in the log, so
+		// end it at once rather than let it block everyone for a TTL.
+		a.epoch = in.offset
+		a.releaseDue = true
+		a.log.Warn("claim landed within the takeover delay after another site's term, releasing", "epoch", in.offset)
 	case in.kind == Claim && out == Accepted:
 		a.epoch = in.offset
 		a.extendBelief(in.sentAt)
@@ -299,6 +324,15 @@ func (a *agent) tick(now time.Time) (Record, bool) {
 		}
 		if now.Sub(since) >= a.cfg.TTL+a.cfg.Margin && a.view.Quiet(a.cfg.TTL) {
 			a.log.Info("lease is free: nothing written for a ttl")
+			a.ready = true
+			if a.view.State().Expires.IsZero() && a.cfg.TakeoverDelay > 0 {
+				// Not one record left of a history that existed: whoever
+				// held the lease last, its term ended during this silence
+				// at the latest. Count the takeover delay from now.
+				if at := now.Add(a.cfg.TakeoverDelay); at.After(a.nextClaimAt) {
+					a.nextClaimAt = at
+				}
+			}
 		}
 	}
 
@@ -315,10 +349,39 @@ func (a *agent) tick(now time.Time) (Record, bool) {
 		if now.Sub(a.lastSend) >= a.cfg.RenewEvery {
 			return a.send(now, Renew), true
 		}
-	case now.After(a.nextClaimAt) && !now.Before(a.standbyUntil) && !a.view.State().HeldAt(a.brokerNow(now)):
+	case now.After(a.nextClaimAt) && !now.Before(a.standbyUntil) && a.mayClaim(now):
 		return a.send(now, Claim), true
 	}
 	return Record{}, false
+}
+
+// mayClaim is the claim rule on a certain view: the lease is free by the
+// broker's clock, and the term that ended last was this participant's
+// site's or ended TakeoverDelay ago. A site's own participants take over
+// at once, so a restarted scaler keeps its site's workload; another site
+// waits until that workload has had time to stop, and only on a view that
+// has caught up with the log: a reader that is behind may have missed a new
+// term of that site. A term the view does not know the holder of (silence)
+// counts as another site's.
+func (a *agent) mayClaim(now time.Time) bool {
+	s := a.view.State()
+	brokerNow := a.brokerNow(now)
+	if s.HeldAt(brokerNow) {
+		return false
+	}
+	from := a.takeoverFrom(s)
+	return from.IsZero() || (a.nextOffset >= a.highWater && !brokerNow.Before(from))
+}
+
+// takeoverFrom is the broker time from which this participant may take the
+// lease over after the term s describes: zero, at once, after a term of its
+// own site, on a log with no term yet, or without a delay; TakeoverDelay
+// after the end of the term otherwise.
+func (a *agent) takeoverFrom(s State) time.Time {
+	if s.Expires.IsZero() || (s.Last != "" && SiteOf(s.Last) == a.cfg.Site) || a.cfg.TakeoverDelay == 0 {
+		return time.Time{}
+	}
+	return s.Expires.Add(a.cfg.TakeoverDelay)
 }
 
 func (a *agent) send(now time.Time, kind Kind) Record {
@@ -350,7 +413,7 @@ func (a *agent) newRecord(kind Kind, epoch int64) Record {
 // status is what the agent knows and believes, with the deadline that
 // bounds the belief.
 func (a *agent) status(now time.Time) (s Status, deadline time.Time, epoch int64) {
-	s = Status{Certain: a.view.Certain(), AsOf: a.view.Clock()}
+	s = Status{Certain: a.view.Certain(), AsOf: a.view.Clock(), Ready: a.ready}
 	if s.Certain {
 		s.Lease = a.view.State()
 	}

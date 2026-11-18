@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package scaler exposes leases to KEDA as an external scaler: the metric is
-// 1 while this participant holds the lease and 0 otherwise, so a ScaledObject
+// 1 while this participant holds the lease and 0 otherwise, and an error
+// while a participant that just started does not know yet, so a ScaledObject
 // with idleReplicaCount 0 and minReplicaCount = maxReplicaCount = N runs N
 // replicas where the lease is held and none elsewhere. One scaler can serve
 // several leases; a ScaledObject picks its lease by the "topic" metadata of
@@ -153,7 +154,22 @@ func (s *Server) source(ref *externalscaler.ScaledObjectRef) (Source, error) {
 	return l.Source, nil
 }
 
-func holding(src Source) bool { return src.Status().Holding }
+// errNotReady is the answer of a participant that has not read enough of
+// the log to know who holds the lease: a scaler that just started, while
+// another pod of its site may still hold it. "Not holding" would start
+// KEDA's cooldown for nothing; an error leaves the replicas as they are
+// until the cooldown, or the fallback, says otherwise.
+var errNotReady = status.Error(codes.Unavailable, "the lease state is not known yet: still reading the log")
+
+// holding is the answer for KEDA: whether this participant holds the lease,
+// or errNotReady.
+func holding(src Source) (bool, error) {
+	st := src.Status()
+	if !st.Holding && !st.Ready {
+		return false, errNotReady
+	}
+	return st.Holding, nil
+}
 
 // IsActive reports whether this participant holds the lease.
 func (s *Server) IsActive(_ context.Context, ref *externalscaler.ScaledObjectRef) (*externalscaler.IsActiveResponse, error) {
@@ -161,11 +177,16 @@ func (s *Server) IsActive(_ context.Context, ref *externalscaler.ScaledObjectRef
 	if err != nil {
 		return nil, err
 	}
-	return &externalscaler.IsActiveResponse{Result: holding(src)}, nil
+	active, err := holding(src)
+	if err != nil {
+		return nil, err
+	}
+	return &externalscaler.IsActiveResponse{Result: active}, nil
 }
 
 // StreamIsActive pushes the current value at once, then again on every
-// change and at least once per heartbeat.
+// change and at least once per heartbeat. It pushes nothing while the
+// participant does not know the lease state yet.
 func (s *Server) StreamIsActive(ref *externalscaler.ScaledObjectRef, stream externalscaler.ExternalScaler_StreamIsActiveServer) error {
 	src, err := s.source(ref)
 	if err != nil {
@@ -174,8 +195,17 @@ func (s *Server) StreamIsActive(ref *externalscaler.ScaledObjectRef, stream exte
 	ctx := stream.Context()
 	ticker := time.NewTicker(s.heartbeat)
 	defer ticker.Stop()
-	last := holding(src)
-	if err := stream.Send(&externalscaler.IsActiveResponse{Result: last}); err != nil {
+	// sent is false until the first value went out.
+	var last, sent bool
+	push := func(changesOnly bool) error {
+		cur, err := holding(src)
+		if err != nil || (changesOnly && sent && cur == last) {
+			return nil
+		}
+		last, sent = cur, true
+		return stream.Send(&externalscaler.IsActiveResponse{Result: cur})
+	}
+	if err := push(false); err != nil {
 		return err
 	}
 	for {
@@ -183,15 +213,11 @@ func (s *Server) StreamIsActive(ref *externalscaler.ScaledObjectRef, stream exte
 		case <-ctx.Done():
 			return nil
 		case <-src.Changed():
-			cur := holding(src)
-			if cur == last {
-				continue
-			}
-			last = cur
+			err = push(true)
 		case <-ticker.C:
-			last = holding(src)
+			err = push(false)
 		}
-		if err := stream.Send(&externalscaler.IsActiveResponse{Result: last}); err != nil {
+		if err != nil {
 			return err
 		}
 	}
@@ -208,14 +234,19 @@ func (s *Server) GetMetricSpec(_ context.Context, ref *externalscaler.ScaledObje
 	}, nil
 }
 
-// GetMetrics returns 1 while holding and 0 otherwise.
+// GetMetrics returns 1 while holding, 0 otherwise, and an error while the
+// lease state is not known yet.
 func (s *Server) GetMetrics(_ context.Context, req *externalscaler.GetMetricsRequest) (*externalscaler.GetMetricsResponse, error) {
 	src, err := s.source(req.GetScaledObjectRef())
 	if err != nil {
 		return nil, err
 	}
+	active, err := holding(src)
+	if err != nil {
+		return nil, err
+	}
 	var v int64
-	if holding(src) {
+	if active {
 		v = 1
 	}
 	return &externalscaler.GetMetricsResponse{

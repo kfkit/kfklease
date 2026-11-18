@@ -4,6 +4,7 @@
 package lease
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -17,6 +18,21 @@ func TestConfigDefaults(t *testing.T) {
 		t.Fatalf("defaults: %+v", c)
 	}
 
+	for _, tc := range []struct{ site, holder, wantSite, wantHolderPrefix string }{
+		{"", "eu/pod", "eu", "eu/pod"},
+		{"eu", "eu/pod", "eu", "eu/pod"},
+		{"eu", "", "eu", "eu/"},
+		{"", "solo", "solo", "solo"},
+	} {
+		c, err := Config{Brokers: []string{"b"}, Topic: "t", TTL: time.Second, Site: tc.site, Holder: tc.holder}.withDefaults()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.Site != tc.wantSite || !strings.HasPrefix(c.Holder, tc.wantHolderPrefix) || SiteOf(c.Holder) != c.Site {
+			t.Errorf("site %q, holder %q: got site %q, holder %q", tc.site, tc.holder, c.Site, c.Holder)
+		}
+	}
+
 	bad := []Config{
 		{Topic: "t", TTL: time.Second},
 		{Brokers: []string{"b"}, TTL: time.Second},
@@ -25,6 +41,9 @@ func TestConfigDefaults(t *testing.T) {
 		{Brokers: []string{"b"}, Topic: "t", TTL: time.Second, Margin: 600 * time.Millisecond, RenewEvery: 500 * time.Millisecond},
 		{Brokers: []string{"b"}, Topic: "t", TTL: time.Second, Health: HealthGate{FailAfter: time.Minute}},
 		{Brokers: []string{"b"}, Topic: "t", TTL: time.Second, Health: HealthGate{FailAfter: -time.Minute, Cooldown: time.Minute}},
+		{Brokers: []string{"b"}, Topic: "t", TTL: time.Second, TakeoverDelay: -time.Second},
+		{Brokers: []string{"b"}, Topic: "t", TTL: time.Second, Site: "eu", Holder: "us/pod"},
+		{Brokers: []string{"b"}, Topic: "t", TTL: time.Second, Site: "eu", Holder: "eu"},
 	}
 	for i, b := range bad {
 		if _, err := b.withDefaults(); err == nil {

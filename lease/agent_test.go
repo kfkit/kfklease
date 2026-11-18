@@ -390,3 +390,140 @@ func TestAgentHealthGateReleaseWaitsForTheRecordInFlight(t *testing.T) {
 	h.wantSend(at(5.7), Release)
 	h.wantSilent(at(5.8))
 }
+
+// newSiteHarness is an agent of site "eu" that waits delay after another
+// site's term.
+func newSiteHarness(t *testing.T, start int64, delay time.Duration) *agentHarness {
+	t.Helper()
+	h := newHarness(t, start)
+	h.a.cfg.Site, h.a.cfg.Holder, h.a.cfg.TakeoverDelay = "eu", "eu/me", delay
+	return h
+}
+
+func TestAgentTakeoverDelay(t *testing.T) {
+	const delay = 30 * time.Second
+	claim := func(h *agentHarness, sec float64, holder string) {
+		h.land(at(sec), Record{Kind: Claim, Holder: holder, TTL: agTTL})
+	}
+	release := func(h *agentHarness, sec float64, holder string) {
+		h.land(at(sec), Record{Kind: Release, Holder: holder, Epoch: 0})
+	}
+	// The broker's clock is estimated from the read-back time of the last
+	// record, read 0.2 s after it landed: a term that ended at broker time
+	// e may be taken over by another site from e + 30.2.
+	cases := []struct {
+		name string
+		// start is where the agent's log begins; 1 hides the claim that
+		// started the term, so the view settles by silence alone.
+		start int64
+		setup func(h *agentHarness)
+		// silent is the last moment checked for silence, 0 for none.
+		silent, sendsAt float64
+	}{
+		{"another site released", 0, func(h *agentHarness) { claim(h, 0, "us/x"); release(h, 1, "us/x") }, 31.1, 31.3},
+		{"the own site released", 0, func(h *agentHarness) { claim(h, 0, "eu/old"); release(h, 1, "eu/old") }, 0, 1.3},
+		{"another site's term expired", 0, func(h *agentHarness) { claim(h, 0, "us/x"); claim(h, 1, "us/y") }, 40.1, 40.3},
+		{"the own site's term expired", 0, func(h *agentHarness) { claim(h, 0, "eu/old"); claim(h, 1, "us/y") }, 10.1, 10.3},
+		// Nothing was read for a ttl plus margin after the renew at 1: the
+		// unknown term ended by 11 at the latest.
+		{"unknown holder, settled by silence", 1, func(h *agentHarness) {
+			claim(h, 0, "eu/old")
+			h.land(at(1), Record{Kind: Renew, Holder: "eu/old", Epoch: 0, TTL: agTTL})
+		}, 41.1, 41.3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newSiteHarness(t, tc.start, delay)
+			tc.setup(h)
+			last := h.log[len(h.log)-1].Timestamp.Add(-h.skew)
+			h.read(last.Add(200 * time.Millisecond))
+			for s := last.Sub(t0).Seconds() + 0.3; s < tc.silent; s += 0.5 {
+				h.wantSilent(at(s))
+			}
+			if tc.silent > 0 {
+				h.wantSilent(at(tc.silent))
+			}
+			h.wantSend(at(tc.sendsAt), Claim)
+		})
+	}
+
+	// Not one record left of a history that existed: the delay counts from
+	// the silence that settled the view, on the agent's own clock.
+	h := newSiteHarness(t, 40, delay)
+	h.read(at(0))
+	h.wantSilent(at(12.1))
+	h.wantSilent(at(42.1))
+	h.wantSend(at(42.2), Claim)
+
+	// Without a delay, another site's term is no different.
+	h = newSiteHarness(t, 0, 0)
+	claim(h, 0, "us/x")
+	release(h, 1, "us/x")
+	h.read(at(1.2))
+	h.wantSend(at(1.3), Claim)
+}
+
+func TestAgentReadyOnceCertain(t *testing.T) {
+	ready := func(h *agentHarness) bool { s, _, _ := h.a.status(at(0)); return s.Ready }
+	if h := newHarness(t, 0); !ready(h) {
+		t.Fatal("not ready on a log read from its start")
+	}
+	h := newHarness(t, 40)
+	h.read(at(0))
+	if ready(h) {
+		t.Fatal("ready before the view was ever certain")
+	}
+	h.wantSend(at(12.1), Claim) // silence settles it
+	if !ready(h) {
+		t.Fatal("not ready on a certain view")
+	}
+	h.a.view.Gap()
+	if !ready(h) {
+		t.Fatal("ready is not sticky: a hole later makes it unknown again")
+	}
+}
+
+func TestAgentGivesUpAClaimThatLandedEarly(t *testing.T) {
+	h := newSiteHarness(t, 0, 30*time.Second)
+	h.land(at(0), Record{Kind: Claim, Holder: "us/x", TTL: agTTL})
+	h.land(at(1), Record{Kind: Release, Holder: "us/x", Epoch: 0})
+	h.read(at(1.2))
+	rec := h.wantSend(at(31.3), Claim)
+	// While the claim is on its way, the other site takes the lease back
+	// for a moment: its own nodes need not wait.
+	h.land(at(31.4), Record{Kind: Claim, Holder: "us/y", TTL: agTTL})
+	h.land(at(31.5), Record{Kind: Release, Holder: "us/y", Epoch: 2})
+	off := h.land(at(31.6), rec)
+	h.a.acked(at(31.7), off, nil)
+	h.read(at(31.8))
+	if s := h.a.view.State(); s.Holder != "eu/me" || s.Epoch != off {
+		t.Fatalf("log state = %+v, want the claim accepted", s)
+	}
+	// Accepted in the log, 0.1 s after the other site's term: not believed,
+	// and released at once.
+	h.wantBelief(at(31.8), false)
+	if r := h.wantSend(at(31.9), Release); r.Epoch != off {
+		t.Fatalf("release of epoch %d, want %d", r.Epoch, off)
+	}
+}
+
+func TestAgentTakesOverOnlyWhenCaughtUp(t *testing.T) {
+	h := newSiteHarness(t, 0, 30*time.Second)
+	h.land(at(0), Record{Kind: Claim, Holder: "us/x", TTL: agTTL})
+	h.land(at(1), Record{Kind: Release, Holder: "us/x", Epoch: 0})
+	h.read(at(1.2))
+	// The log has grown, but the record has not arrived yet: it may be a
+	// new term of the other site.
+	h.land(at(31), Record{Kind: Claim, Holder: "us/y", TTL: agTTL})
+	h.a.fetched(at(31.3), int64(len(h.log)))
+	h.wantSilent(at(31.3))
+	h.read(at(31.4))
+	h.wantSilent(at(31.5))
+	// The own site is not held to it.
+	h = newSiteHarness(t, 0, 30*time.Second)
+	h.land(at(0), Record{Kind: Claim, Holder: "eu/x", TTL: agTTL})
+	h.land(at(1), Record{Kind: Release, Holder: "eu/x", Epoch: 0})
+	h.read(at(1.2))
+	h.a.fetched(at(1.3), int64(len(h.log))+1)
+	h.wantSend(at(1.3), Claim)
+}

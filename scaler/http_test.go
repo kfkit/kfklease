@@ -59,7 +59,7 @@ func noMetric(t *testing.T, body, name string) {
 }
 
 func TestHTTPStatusAndMetrics(t *testing.T) {
-	src := &fakeSource{changed: make(chan struct{}, 1)}
+	src := &fakeSource{changed: make(chan struct{}, 1), unknown: true}
 	h := NewHTTP(src, "k3s-a/pod")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -77,7 +77,7 @@ func TestHTTPStatusAndMetrics(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &st); err != nil || code != 200 {
 		t.Fatalf("status: %d %v %s", code, err, body)
 	}
-	if st.Holder != "k3s-a/pod" || st.Holding || st.Certain || st.Lease != nil {
+	if st.Holder != "k3s-a/pod" || st.Holding || st.Certain || st.Ready || st.Lease != nil {
 		t.Fatalf("status = %+v", st)
 	}
 	_, body = get(t, srv, "/metrics")
@@ -90,7 +90,7 @@ func TestHTTPStatusAndMetrics(t *testing.T) {
 	asOf := time.Now()
 	src.setStatus(lease.Status{
 		Holding: true, Epoch: 7, Deadline: time.Now().Add(8 * time.Second),
-		Certain: true, Lease: lease.State{Holder: "k3s-a/pod", Epoch: 7, Expires: asOf.Add(10 * time.Second)}, AsOf: asOf,
+		Certain: true, Ready: true, Lease: lease.State{Holder: "k3s-a/pod", Epoch: 7, Expires: asOf.Add(10 * time.Second)}, AsOf: asOf,
 	})
 	waitFor(t, func() bool {
 		_, b := get(t, srv, "/metrics")
@@ -100,7 +100,7 @@ func TestHTTPStatusAndMetrics(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &st); err != nil {
 		t.Fatal(err)
 	}
-	if !st.Holding || st.Epoch != 7 || st.DeadlineIn < 7 || st.DeadlineIn > 8 || st.Lease == nil || st.Lease.Epoch != 7 {
+	if !st.Holding || !st.Ready || st.Epoch != 7 || st.DeadlineIn < 7 || st.DeadlineIn > 8 || st.Lease == nil || st.Lease.Epoch != 7 {
 		t.Fatalf("holding status = %+v", st)
 	}
 	_, body = get(t, srv, "/metrics")
@@ -115,7 +115,7 @@ func TestHTTPStatusAndMetrics(t *testing.T) {
 	}
 
 	// Lost it: the standby transition is counted, the gauges follow.
-	src.setStatus(lease.Status{Certain: true, Lease: lease.State{Holder: "other", Epoch: 9, Expires: asOf.Add(20 * time.Second)}, AsOf: asOf})
+	src.setStatus(lease.Status{Certain: true, Ready: true, Lease: lease.State{Holder: "other", Epoch: 9, Expires: asOf.Add(20 * time.Second)}, AsOf: asOf})
 	waitFor(t, func() bool {
 		_, b := get(t, srv, "/metrics")
 		return metric(t, b, `kfklease_transitions_total{to="standby"}`) == "1"
@@ -125,8 +125,9 @@ func TestHTTPStatusAndMetrics(t *testing.T) {
 		t.Fatalf("lost metrics:\n%s", body)
 	}
 	// Every participant reports the holder the log names, a foreign one
-	// too, and only that one.
-	if metric(t, body, `kfklease_lease_holder_info{holder="other",site=""}`) != "1" || strings.Count(body, "\nkfklease_lease_holder_info{") != 1 {
+	// too, and only that one. A holder id without a slash is a site of its
+	// own.
+	if metric(t, body, `kfklease_lease_holder_info{holder="other",site="other"}`) != "1" || strings.Count(body, "\nkfklease_lease_holder_info{") != 1 {
 		t.Fatalf("holder info after losing it:\n%s", body)
 	}
 	if metric(t, body, "kfklease_health_cooldown_seconds") != "0" {

@@ -39,7 +39,8 @@ docker compose down -v         # tear down, drop cluster state
 ```
 
 `deploy.sh` renders `charts/kfklease` (helm, or the `alpine/helm` image when
-helm is not installed) with holder prefix `<cluster>` and the `singleton`
+helm is not installed) with site `<cluster>`, `cooldownPeriod` 30 s and
+`takeoverMargin` 5 s (so a takeover delay of 40 s), and the `singleton`
 deployment from `manifests/` as the scale target: one replica while the
 cluster holds the lease (`REPLICAS=3 ./deploy.sh ...` for three), zero
 otherwise. `singleton` runs the heartbeat
@@ -51,22 +52,26 @@ example from `examples/`, built into `kfklease-heartbeat:dev` by
 `scenarios.sh` runs them all or by name. Each fails if the workload ever
 runs in both clusters at once, and, since the workload is the heartbeat
 example, if two lease epochs ever wrote at the same time or a stale record
-got past the fence, measured by the broker's clock to 200 ms. Results with
-TTL 10 s, `pollingInterval: 5`, `cooldownPeriod: 0`:
+got past the fence, measured by the broker's clock to 200 ms. Scenarios
+with TTL 10 s, `pollingInterval: 5`, `cooldownPeriod: 30`, `takeoverDelay`
+40 s (the chart's defaults are 60 and 95: the stand keeps the order
+"scaler restart < cooldown < delay" at a shorter scale):
 
 | Scenario    | What happens                                   | Result                                   |
 |-------------|------------------------------------------------|------------------------------------------|
 | `coldstart` | both clusters start                            | one holder within 1 s, standby idle      |
-| `crash`     | `docker compose kill` the holder's cluster     | takeover after 9–12 s; the revived cluster restarts its stale pod for ~30 s until its KEDA is back, then stays idle |
-| `partition` | holder's cluster cut off from Kafka            | holder's pod down at ~10–12 s, standby's up ~1 s later, no overlap |
-| `pause`     | holder's cluster frozen for 2 × TTL            | takeover ~10 s into the freeze; on wake-up the frozen pod goes within 1 s |
-| `broker`    | Kafka stopped for 2 × TTL                      | holder's pod down within a TTL; a holder again ~10 s after the broker is back |
+| `restart`   | the holder's scaler pod is deleted             | the new pod holds a new epoch for the same site within seconds; the workload's pod UIDs are the same 40 s later and the other cluster never starts |
+| `crash`     | `docker compose kill` the holder's cluster     | takeover after TTL + the takeover delay; the revived cluster restarts its stale pod until its KEDA is back, then stays idle |
+| `partition` | holder's cluster cut off from Kafka            | holder's pod down after its deadline + the cooldown, standby's up after TTL + the delay, no overlap |
+| `pause`     | holder's cluster frozen                        | takeover after TTL + the delay into the freeze; on wake-up the frozen pod goes |
+| `broker`    | Kafka stopped for 2 × TTL                      | the holder's site claims again as soon as the broker is back, the other site waits the delay: the lease stays where it was |
 | `replicas`  | both clusters redeployed with `REPLICAS=3`, then the holder cut off from Kafka | holder at 3, standby at 0; after the cut the holder's pods all go before the standby's three run; back to 1 at the end |
-| `scaler-down` | the holder's scaler Service loses its endpoint, the holder is cut off from Kafka and the scaler is killed (`crictl stop --timeout 0`, no release) | KEDA's fallback (`replicas: 0`) scales the holder's workload to zero on the scaler error; the standby takes over after the term runs out |
+| `scaler-down` | the holder's scaler Service loses its endpoint, the holder is cut off from Kafka and the scaler is killed (`crictl stop --timeout 0`, no release) | KEDA's fallback (`replicas: 0`) scales the holder's workload to zero on the scaler error once the cooldown has passed; the standby takes over after the term runs out and the delay |
 
-Takeover timing is TTL plus KEDA's reaction and pod start; the standby
-never claims before the term in the log runs out, and the old holder stops
-believing a margin earlier than that. Pods are polled once a second, so a
+Takeover timing is TTL plus the takeover delay plus KEDA's reaction and pod
+start; the standby never claims before the term in the log runs out and the
+delay has passed, by which time the old holder's KEDA has scaled its
+workload down. Pods are polled once a second, so a
 pod-level overlap shorter than that can slip past that check; what matters
 is the heartbeat check, which sees every write.
 
