@@ -23,6 +23,12 @@ const (
 	Renew
 	// Release ends the term named by Epoch early.
 	Release
+	// Yield says that the workload of the writer's site has stopped after
+	// the term named by Epoch, which that site held and which has ended.
+	// It leaves the lease state alone: the fold rejects it. Writers of
+	// other sites read it as the end of their takeover delay; see
+	// agent.yieldFrom.
+	Yield
 )
 
 func (k Kind) String() string {
@@ -33,6 +39,8 @@ func (k Kind) String() string {
 		return "renew"
 	case Release:
 		return "release"
+	case Yield:
+		return "yield"
 	}
 	return fmt.Sprintf("kind(%d)", uint8(k))
 }
@@ -49,9 +57,11 @@ type Record struct {
 	// Holder identifies the writer. It must be unique per process
 	// incarnation, not per host.
 	Holder string
-	// Epoch names the term a Renew or Release refers to. Ignored for Claim.
+	// Epoch names the term a Renew, Release or Yield refers to. Ignored for
+	// Claim.
 	Epoch int64
-	// TTL is how long the term stays live after this record.
+	// TTL is how long the term stays live after this record. Ignored for
+	// Yield.
 	TTL time.Duration
 }
 
@@ -87,7 +97,7 @@ type wireRecord struct {
 // part of the value: the broker assigns them.
 func EncodeValue(r Record) ([]byte, error) {
 	switch r.Kind {
-	case Claim, Renew, Release:
+	case Claim, Renew, Release, Yield:
 	default:
 		return nil, fmt.Errorf("lease: cannot encode %v", r.Kind)
 	}
@@ -98,7 +108,9 @@ func EncodeValue(r Record) ([]byte, error) {
 		Version: wireVersion,
 		Kind:    r.Kind.String(),
 		Holder:  r.Holder,
-		TTLMs:   r.TTL.Milliseconds(),
+	}
+	if r.Kind != Yield {
+		w.TTLMs = r.TTL.Milliseconds()
 	}
 	if r.Kind != Claim {
 		w.Epoch = r.Epoch
@@ -129,6 +141,9 @@ func DecodeValue(b []byte) (Record, error) {
 		r.Kind = Renew
 	case "release":
 		r.Kind = Release
+	case "yield":
+		r.Kind = Yield
+		r.TTL = 0
 	default:
 		return Record{}, fmt.Errorf("lease: unknown record kind %q", w.Kind)
 	}

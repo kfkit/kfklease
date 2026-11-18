@@ -49,7 +49,8 @@ const (
 	// Accepted means the record took effect.
 	Accepted
 	// Rejected means the record had no effect: a claim on a held lease, a
-	// renew of a term that is over, a TTL outside the allowed range.
+	// renew of a term that is over, a TTL outside the allowed range. A
+	// yield is always rejected: it is for the writers, not the fold.
 	Rejected
 )
 
@@ -176,6 +177,10 @@ func (v *View) Apply(r Record) (Outcome, error) {
 	}
 	switch r.Kind {
 	case Claim, Renew, Release:
+	case Yield:
+		// Not part of the fold: it neither moves the clock nor breaks a
+		// silence, so the state is what it would be without it.
+		return Rejected, nil
 	default:
 		return Rejected, fmt.Errorf("lease: cannot apply %v", r.Kind)
 	}
