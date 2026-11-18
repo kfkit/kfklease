@@ -66,7 +66,8 @@ some() {
 # overlap is a lower bound.
 transition() {
   local from=$1 to=$2 timeout=$3 t0 now down="" up=""
-  t0=$(date +%s.%N)
+  # Not date +%s.%N: BSD date has no %N.
+  t0=$(python3 -c 'import time; print(time.time())')
   while true; do
     now=$(python3 -c "import time; print(round(time.time() - $t0, 1))")
     [[ -n $down ]] || [[ $(running "$from") != 0 ]] || down=$now
@@ -518,8 +519,10 @@ pods_left() {
 
 scenario_handover_crash() {
   echo "== handover-crash: kill the scalers between the pause and the yield; the handover resumes and leaves no pause behind"
-  local h o since t0 t
-  h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
+  local h o since begun t0 t
+  # The start in epoch seconds as well: BSD date cannot parse the RFC 3339
+  # time back (it has no -d).
+  h=$(settle); o=$(other "$h"); since=$(now_rfc3339); begun=$(date +%s)
   # A finalizer keeps the workload's pod in Terminating: the handover
   # paused the ScaledObject and waits for the pod, and no yield goes out.
   finalizer "$h" add
@@ -549,7 +552,7 @@ scenario_handover_crash() {
   finalizer "$h" remove
   t0=$(date +%s)
   t=$(wait_running "$o" "$want" "$TAKEOVER") || return
-  echo "   ${o} took over ${t}s after ${h}'s last pod went, $(( t0 - $(date -d "$since" +%s) ))s after the standby began (takeover delay ${TAKEOVER_DELAY}s)"
+  echo "   ${o} took over ${t}s after ${h}'s last pod went, $(( t0 - begun ))s after the standby began (takeover delay ${TAKEOVER_DELAY}s)"
   wait_unpaused "$h" || return
   watch_exclusive $(( 2 * TTL ))
   ./deploy.sh "$h" >/dev/null
