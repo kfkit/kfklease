@@ -161,6 +161,28 @@ jobs:
           val() { grep -A1 "name: $1\$" <<<"$out" | grep -qF "value: \"$2\"" || { echo "$1 is not $2"; exit 1; }; }
           out=$(dep); val KFKLEASE_STANDBY false
           out=$(dep --set standby=true); val KFKLEASE_STANDBY true
+      - name: Handover access, namespaced and scoped to the release's own objects
+        run: |
+          t() { helm template t charts/kfklease --set site=s --set brokers=k:9092 --set topic=a \
+                  --set scaledObject.targetRef.name=wa "$@"; }
+          out=$(t --set 'extraLeases[0].topic=b' --set 'extraLeases[0].scaledObject.targetRef.name=wb' \
+                  --set 'extraLeases[0].scaledObject.targetRef.kind=KafkaConnect' \
+                  --set 'extraLeases[0].scaledObject.targetRef.apiVersion=kafka.strimzi.io/v1beta2' \
+                  --set 'extraLeases[1].topic=c' --set 'extraLeases[1].scaledObject.enabled=false')
+          echo "$out"
+          for want in 'kind: ServiceAccount' 'kind: Role' 'kind: RoleBinding' '      serviceAccountName: t' \
+                      '      - wa' '      - wb' '    verbs: [get, patch]' '  - apiGroups: ["apps"]' \
+                      '    resources: [deployments/scale]' '  - apiGroups: ["kafka.strimzi.io"]' \
+                      '    resources: [kafkaconnects/scale]' '    resources: [pods]' '    verbs: [list]' \
+                      '              value: "wa,wb,"'; do
+            grep -qxF "$want" <<<"$out" || { echo "missing: $want"; exit 1; }
+          done
+          grep -qE 'ClusterRole|kind: ClusterRoleBinding' <<<"$out" && { echo "cluster-wide access"; exit 1; }
+          for off in 'handover.enabled=false' 'scaledObject.enabled=false'; do
+            if grep -qE 'kind: Role|serviceAccountName|KFKLEASE_SCALED_OBJECT' <<<"$(t --set "$off")"; then
+              echo "handover rendered with $off"; exit 1
+            fi
+          done
       - name: Several leases in one release, one ScaledObject each
         run: |
           t() { helm template t charts/kfklease --set site=s --set brokers=k:9092 --set topic=a \

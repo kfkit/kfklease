@@ -44,6 +44,7 @@ clock skew between brokers.
 | `claim`   | `holder`, `ttl_ms`     | start a new term                         |
 | `renew`   | `holder`, `epoch`, `ttl_ms` | extend the term `epoch`             |
 | `release` | `holder`, `epoch`      | end the term `epoch` now                 |
+| `yield`   | `holder`, `epoch`      | the writer's site has stopped its workload after the term `epoch`; see [Handover](#handover) |
 
 `holder` is unique per process incarnation, not per host: a restarted process
 must not inherit the term of its previous life, because it has no idea when
@@ -62,7 +63,8 @@ State: `holder`, `epoch`, `expires`. For a record with broker timestamp `T`:
   Then `expires = T + ttl`. A renew never starts or revives a term.
 - `release`: valid under the same condition; frees the lease at `T`
   (`expires = T`).
-- Anything else has no effect.
+- Anything else has no effect, a `yield` included: it is for the writer
+  rules and moves neither the state nor the view's clock.
 
 The state also keeps `last`, the holder of the latest term, after the term
 ends by expiry or release, and `expires` then says when it ended. Neither
@@ -187,6 +189,51 @@ counts from. So when the holder releases because the workload cannot run,
 the others of its site do not take the term over for it, and the lease
 goes to another site after `D`.
 
+### Handover
+
+The takeover delay is a guess at how long the old site's workload takes to
+stop. A site in standby can do better: stop it on purpose and say when it
+is gone.
+
+11. A participant in standby whose site held the latest term reports a
+   handover (`Status.Handover`) once that term has ended in the log, by its
+   estimate of the broker's clock, and until `D` has passed since, on a
+   certain view caught up with the end offset, while no yield for the term
+   is in the log. Whoever drives the site's workload stops it then and,
+   once nothing of it runs, terminating pods included, the participant
+   writes `yield` with the term's epoch (`Candidate.Yield`).
+12. A yield counts only on a certain view, when it names the epoch of the
+   view's state, its writer is of the site of that term's holder, the term
+   had ended at the yield's timestamp, and the view knows the term's
+   natural end: the end the term's last accepted `claim` or `renew` gave it,
+   folded on a certain view. A view that became certain again by an anchor
+   after a hole may have missed a renewal and does not count yields for
+   that term. For a candidate of another site a counting yield ends rule
+   7's delay at the later of the yield's timestamp and the natural end
+   plus two poll intervals; rule 8 judges a landing claim by the same time.
+
+A yield only ever brings a claim forward, so what has to hold is the
+promise it carries: the old site's workload is down and stays down until
+the new term has started. A workload comes back only if KEDA hears "my site
+holds". The holder's own belief ended before its release; another
+participant of its site (rule 9) believes until at most the natural end of
+the term plus a fresh read's lag of two poll intervals, less the margin,
+and the later bound of rule 12 waits that out. Under the chart the scaler
+also pauses the ScaledObject at zero (KEDA's `paused-replicas`), which
+holds whatever any replica answers, and lifts the pause only when its own
+site holds again, by its own claim or a fresh site belief that starts
+after the pause, or when another site holds the latest term. A claim of the
+old site that lands after the yield simply starts a new term; the fold
+accepts at most one of the two sites' claims, and a yield names a term that
+is then no longer the latest.
+
+A yield that is lost changes nothing: the other sites wait `D`. One that
+lands late, after a new term, names a term that is not the latest and is
+ignored. One written by another site, for another term or before the term
+ended is ignored by rule 12. One written by the right site while its
+workload still runs is a lie the protocol cannot catch; `Candidate.Yield`
+is to be called only once nothing of the workload runs.
+
 ## The margin
 
 Two clocks can disagree with the broker's and stretch the belief past the
@@ -298,6 +345,25 @@ that standby never claims, releases a term held, waits for the record in
 flight before releasing, and never believes a claim that lands after the
 switch.
 
+A sixth run adds the handover. Each site has a workload that runs while
+one of its nodes says the site holds and for 1.5 TTLs after, and a pause
+that takes it down within a TTL, now and then within six TTLs. Sites switch
+in and out of standby node by node, about a TTL apart, as a rolling update
+does; a node in standby with a handover pauses the workload and asks for
+the yield once it is down; a pause is lifted when a node starts to say its
+site holds, or when another site holds the latest term. Yields get lost
+and land late like any record, and nodes write bogus yields: for a term of
+another site, for their own term while they hold it, for a term that is not
+the latest. The workloads of two sites never run at once, the beliefs keep
+the properties above, and in 100 runs about 300 yields bring about 60
+takeovers within the delay, the fastest 0.2 s after the term's end.
+`agent_test.go` pins rules 11 and 12 down: a yield after a release, after
+an expiry, later than the natural end; yields by another site, by the
+claimant's site, of another term, written while the term was held, landing
+after a new term, read on an uncertain view, read after a hole; and on the
+writing side a yield on request, once, not for another term, not out of
+standby, not after `D`, not while a site holds.
+
 Breaking a rule in `view.go` or `agent.go` (trusting a lone renew, reviving a
 term with a late renew, halving the silence period, taking the deadline from
 the acknowledgement time, believing on the acknowledgement alone, matching own
@@ -305,7 +371,11 @@ records by kind instead of offset, ignoring holes, claiming without looking,
 dropping the takeover delay, the own-site exemption, the end-offset check,
 the wait on a log without history, the release of an early claim, a claim
 in standby, a term kept in standby or a claim in flight believed in
-standby) fails
+standby; for the handover: the site, epoch and ended checks on a yield, the
+natural-end bound, forgetting the term on an uncertain view, a handover out
+of standby, a yield asked for before the workload is down, lifting the
+pause for as long as a site belief lasts rather than when it starts, the
+last one in `scaler/handover_test.go`) fails
 at least one of these tests; that was checked by mutation, by hand.
 
 ## The client
@@ -325,20 +395,24 @@ at least one of these tests; that was checked by mutation, by hand.
   in flight;
 - a stop releases the lease: the belief is dropped first, the record is
   written second. With sites, the release lets the next pod of the same
-  site claim at once.
+  site claim at once;
+- `Candidate.Yield` writes a yield through the loop, if the handover it
+  names still stands when the loop picks it up.
 
 `lease/candidate_integration_test.go` runs it against a broker: one holder
 among two candidates, handover after a release (tens of milliseconds) and
 after a crash (about one TTL, never before the crashed holder's deadline),
 a late reader agreeing with the holder, epochs growing across terms, a
-holder switched to standby handing over from its release, and `Inspect`
-reading a held and a released lease without writing.
+holder switched to standby handing over from its release, a handover
+through a yield well within the takeover delay, and `Inspect` reading a
+held and a released lease without writing.
 
 `test/e2e` runs the whole thing, scaler and KEDA included, on two k3s
 clusters: cold start, a scaler restart that keeps the workload's pods, crash,
 partition, freeze, a broker outage that ends with the lease on the same site,
-N replicas, a scaler that is gone and a cluster put in standby, with a check
-that the workload never runs in both clusters at once.
+N replicas, a scaler that is gone, a cluster put in standby with the
+handover, and a handover whose scalers are killed between the pause and the
+yield, with a check that the workload never runs in both clusters at once.
 
 ## Not covered yet
 

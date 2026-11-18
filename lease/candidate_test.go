@@ -93,12 +93,12 @@ func TestReportHealthyReachesTheLoop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := c.loopInputs(); !got.IsZero() {
+	if got, _, _ := c.loopInputs(); !got.IsZero() {
 		t.Fatal("healthy before any report")
 	}
 	before := time.Now()
 	c.ReportHealthy()
-	if got, _ := c.loopInputs(); got.Before(before) {
+	if got, _, _ := c.loopInputs(); got.Before(before) {
 		t.Fatalf("last healthy %v, before the report at %v", got, before)
 	}
 }
@@ -121,7 +121,7 @@ func TestSetStandbyHidesHoldingAtOnce(t *testing.T) {
 	if s := c.Status(); s.Holding || !s.Standby {
 		t.Fatalf("in standby: %+v", s)
 	}
-	if _, standby := c.loopInputs(); !standby {
+	if _, standby, _ := c.loopInputs(); !standby {
 		t.Fatal("the loop does not see standby")
 	}
 	c.SetStandby(false)
@@ -135,5 +135,26 @@ func TestSetStandbyHidesHoldingAtOnce(t *testing.T) {
 	}
 	if s := c.Status(); !s.Standby {
 		t.Fatalf("Config.Standby: %+v", s)
+	}
+}
+
+// Yield reaches the loop once: a request is taken, not kept.
+func TestYieldReachesTheLoopOnce(t *testing.T) {
+	c, err := NewCandidate(Config{Brokers: []string{"b:9092"}, Topic: "t", TTL: 10 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, e := c.loopInputs(); e != -1 {
+		t.Fatalf("yield %d before any request", e)
+	}
+	if s := c.Status(); s.Handover || s.HandoverEpoch != -1 {
+		t.Fatalf("handover before the loop ran: %+v", s)
+	}
+	c.Yield(7)
+	if _, _, e := c.loopInputs(); e != 7 {
+		t.Fatalf("yield %d, want 7", e)
+	}
+	if _, _, e := c.loopInputs(); e != -1 {
+		t.Fatalf("yield %d taken twice", e)
 	}
 }

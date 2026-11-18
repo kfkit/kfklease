@@ -62,6 +62,18 @@ type agent struct {
 	// standby: follow the log, never claim, release a term held.
 	standby bool
 
+	// The handover, see yieldFrom. termEnd is the broker time at which the
+	// latest term would have run out unrenewed, by the last claim or renew
+	// of it this participant folded on a certain view: a release ends the
+	// term earlier in the log, but a reader of its site that missed the
+	// release still answers for the site until about then. yielded is the
+	// latest yield that counts for the term of the view's state. yieldDue
+	// is the epoch of a yield the site's workload is down for, waiting for
+	// its turn under the one-request-in-flight rule; -1 for none.
+	termEnd  epochAt
+	yielded  epochAt
+	yieldDue int64
+
 	// lastTickAt is the last tick, and caughtUpAtTick whether the agent sat
 	// at the end of the log on a certain view then: what tells a record
 	// that just landed from one read late. See freshRead.
@@ -87,6 +99,14 @@ type verdict struct {
 	early bool
 }
 
+// epochAt is a broker time tied to a term; epoch -1 for none.
+type epochAt struct {
+	epoch int64
+	at    time.Time
+}
+
+var noEpoch = epochAt{epoch: -1}
+
 type inflight struct {
 	kind   Kind
 	sentAt time.Time
@@ -106,6 +126,9 @@ func newAgent(cfg Config, log *slog.Logger, start, end int64, now time.Time) *ag
 		ownOutcomes: make(map[int64]verdict),
 		epoch:       -1,
 		siteEpoch:   -1,
+		termEnd:     noEpoch,
+		yielded:     noEpoch,
+		yieldDue:    -1,
 		standby:     cfg.Standby,
 		connected:   true,
 		caughtUpAt:  now,
@@ -179,16 +202,21 @@ func (a *agent) record(now time.Time, offset int64, ts time.Time, value []byte) 
 	rec.Offset = offset
 	rec.Timestamp = ts
 	before, wasCertain := a.view.State(), a.view.Certain()
+	var takeoverAt time.Time
+	if wasCertain {
+		takeoverAt = a.takeoverFrom(before)
+	}
 	out, err := a.view.Apply(rec)
 	if err != nil {
 		return err
 	}
+	a.followTerm(rec, out)
 	a.log.Debug("record", "offset", rec.Offset, "kind", rec.Kind, "by", rec.Holder, "epoch", rec.Epoch, "outcome", out)
 
 	fresh := a.freshRead(now)
 	a.noteReady()
 	if rec.Holder == a.cfg.Holder {
-		early := rec.Kind == Claim && out == Accepted && wasCertain && ts.Before(a.takeoverFrom(before))
+		early := rec.Kind == Claim && out == Accepted && wasCertain && ts.Before(takeoverAt)
 		a.ownRecord(now, rec.Offset, rec.Kind, verdict{out, early})
 	}
 	if a.believing(now) && a.view.Certain() {
@@ -200,6 +228,46 @@ func (a *agent) record(now time.Time, offset int64, ts time.Time, value []byte) 
 	}
 	a.followSite(now, rec.Kind, out, fresh)
 	return nil
+}
+
+// followTerm keeps what the handover needs after a record was applied: the
+// natural end of the latest term, and the latest yield for it that counts.
+// On a view that is not certain both are forgotten.
+func (a *agent) followTerm(rec Record, out Outcome) {
+	if !a.view.Certain() {
+		a.forgetTerm()
+		return
+	}
+	s := a.view.State()
+	switch {
+	case rec.Kind == Yield:
+		at := later(rec.Timestamp, a.view.Clock())
+		if a.yieldCounts(rec, s, at) {
+			a.yielded = epochAt{s.Epoch, at}
+			a.log.Debug("yield", "by", rec.Holder, "epoch", rec.Epoch)
+		}
+	case out == Accepted && s.Holder != "":
+		a.termEnd = epochAt{s.Epoch, s.Expires}
+	}
+}
+
+// yieldCounts reports whether a yield read at broker time at speaks for the
+// term of s: written by a participant of the site that held it, naming it,
+// after it ended, and with the term's natural end known.
+func (a *agent) yieldCounts(y Record, s State, at time.Time) bool {
+	return s.Epoch >= 0 && y.Epoch == s.Epoch && s.Last != "" && SiteOf(y.Holder) == SiteOf(s.Last) &&
+		!s.HeldAt(at) && a.termEnd.epoch == s.Epoch
+}
+
+func (a *agent) forgetTerm() {
+	a.termEnd, a.yielded = noEpoch, noEpoch
+}
+
+func later(x, y time.Time) time.Time {
+	if x.After(y) {
+		return x
+	}
+	return y
 }
 
 // freshRead reports whether a record read at now landed just before: the
@@ -486,6 +554,13 @@ func (a *agent) tick(now time.Time) (Record, bool) {
 		// take over without waiting for the term to run out.
 		a.releaseDue = false
 		return a.send(now, Release), true
+	case a.yieldDue >= 0:
+		due := a.yieldDue
+		a.yieldDue = -1
+		if epoch, ok := a.handover(now); ok && epoch == due {
+			a.log.Info("yielding", "epoch", epoch)
+			return a.sendFor(now, Yield, epoch), true
+		}
 	case a.believing(now):
 		if now.Sub(a.lastSend) >= a.cfg.RenewEvery {
 			return a.send(now, Renew), true
@@ -517,18 +592,70 @@ func (a *agent) mayClaim(now time.Time) bool {
 // takeoverFrom is the broker time from which this participant may take the
 // lease over after the term s describes: zero, at once, after a term of its
 // own site, on a log with no term yet, or without a delay; TakeoverDelay
-// after the end of the term otherwise.
+// after the end of the term otherwise, or earlier with a yield, see
+// yieldFrom.
 func (a *agent) takeoverFrom(s State) time.Time {
 	if s.Expires.IsZero() || (s.Last != "" && SiteOf(s.Last) == a.cfg.Site) || a.cfg.TakeoverDelay == 0 {
 		return time.Time{}
 	}
-	return s.Expires.Add(a.cfg.TakeoverDelay)
+	from := s.Expires.Add(a.cfg.TakeoverDelay)
+	if y, ok := a.yieldFrom(s); ok && y.Before(from) {
+		from = y
+	}
+	return from
+}
+
+// yieldFrom is the end of the takeover delay after the term s describes
+// when its site has yielded it: the site's workload has stopped, so
+// another site may start its own without waiting for it. Not before the
+// yield, and not before the term would have run out unrenewed, plus the
+// two poll intervals a read may lag and still count as fresh: a replica of
+// that site that read the last renewal and missed the release answers
+// KEDA "my site holds" until then (followSite), and KEDA must not be told
+// so by both sites at once.
+func (a *agent) yieldFrom(s State) (time.Time, bool) {
+	if s.Epoch < 0 || a.yielded.epoch != s.Epoch || a.termEnd.epoch != s.Epoch {
+		return time.Time{}, false
+	}
+	return later(a.yielded.at, a.termEnd.at.Add(2*a.cfg.pollEvery())), true
+}
+
+// handover reports the term this participant's site owes the other sites a
+// yield for: in standby, on a certain view caught up with the log, the
+// term that ended last was this site's, it has ended, no yield for it is
+// in the log, and the takeover delay after its end has not passed yet;
+// after that a yield would shorten nothing. The site's workload is to stop
+// now; once it has, requestYield.
+func (a *agent) handover(now time.Time) (int64, bool) {
+	s := a.view.State()
+	if !a.standby || a.cfg.TakeoverDelay == 0 || !a.ready || !a.view.Certain() || a.nextOffset < a.highWater ||
+		s.Epoch < 0 || s.Last == "" || SiteOf(s.Last) != a.cfg.Site || a.yielded.epoch == s.Epoch {
+		return -1, false
+	}
+	brokerNow := a.brokerNow(now)
+	if s.HeldAt(brokerNow) || !brokerNow.Before(s.Expires.Add(a.cfg.TakeoverDelay)) {
+		return -1, false
+	}
+	return s.Epoch, true
+}
+
+// requestYield asks for a yield of epoch: the caller saw the site's
+// workload down after handover reported epoch. tick writes it if handover
+// still reports the same term then.
+func (a *agent) requestYield(now time.Time, epoch int64) {
+	if e, ok := a.handover(now); ok && e == epoch {
+		a.yieldDue = epoch
+	}
 }
 
 func (a *agent) send(now time.Time, kind Kind) Record {
+	return a.sendFor(now, kind, a.epoch)
+}
+
+func (a *agent) sendFor(now time.Time, kind Kind, epoch int64) Record {
 	a.inflight = &inflight{kind: kind, sentAt: now, offset: -1}
 	a.lastSend = now
-	return a.newRecord(kind, a.epoch)
+	return a.newRecord(kind, epoch)
 }
 
 // release gives the lease up: the belief goes first, and the returned
@@ -573,6 +700,10 @@ func (a *agent) status(now time.Time) (s Status, own, site belief) {
 	}
 	if now.Before(a.cooldownUntil) {
 		s.CooldownUntil = a.cooldownUntil
+	}
+	s.HandoverEpoch = -1
+	if epoch, ok := a.handover(now); ok {
+		s.Handover, s.HandoverEpoch = true, epoch
 	}
 	return s, own, site
 }

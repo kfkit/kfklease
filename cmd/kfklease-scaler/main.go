@@ -183,6 +183,8 @@ func run(args []string) error {
 		healthTimeout   = fs.Duration("health-timeout", envDuration("KFKLEASE_HEALTH_TIMEOUT", 5*time.Second), "timeout of one workload probe (KFKLEASE_HEALTH_TIMEOUT)")
 		healthFailAfter = fs.Duration("health-fail-after", envDuration("KFKLEASE_HEALTH_FAIL_AFTER", 5*time.Minute), "release the lease when the workload has not passed a probe for this long, counted from the start of the term (KFKLEASE_HEALTH_FAIL_AFTER)")
 		healthCooldown  = fs.Duration("health-cooldown", envDuration("KFKLEASE_HEALTH_COOLDOWN", 10*time.Minute), "claim nothing for this long after such a release (KFKLEASE_HEALTH_COOLDOWN)")
+
+		scaledObject = fs.String("scaled-object", env("KFKLEASE_SCALED_OBJECT", ""), "ScaledObject of the lease's workload in this pod's namespace, for the handover: in standby, pause it when the site's term ends and tell the other sites once its pods are gone, so they take over without the takeover delay. Needs a service account that may get and patch it, get its target's scale and list pods; empty turns the handover off. With several topics, comma-separated in the same order, an empty entry for none (KFKLEASE_SCALED_OBJECT)")
 	)
 	_ = fs.Parse(args)
 
@@ -204,6 +206,19 @@ func run(args []string) error {
 		}
 		if *healthFailAfter < 2**healthInterval {
 			return fmt.Errorf("health fail-after %v must be at least two probe intervals (%v)", *healthFailAfter, *healthInterval)
+		}
+	}
+	scaledObjects := make([]string, len(topics))
+	if *scaledObject != "" {
+		scaledObjects = strings.Split(*scaledObject, ",")
+		if len(scaledObjects) != len(topics) {
+			return fmt.Errorf("scaled object: %d entries for %d topics; give one per topic, empty for none", len(scaledObjects), len(topics))
+		}
+	}
+	var kube *scaler.Kube
+	if slices.ContainsFunc(scaledObjects, func(so string) bool { return so != "" }) {
+		if kube, err = scaler.InClusterKube(); err != nil {
+			return fmt.Errorf("handover: %w", err)
 		}
 	}
 	base := c.config(log)
@@ -291,6 +306,15 @@ func run(args []string) error {
 	// releases its lease if it holds it.
 	runCtx, stopAll := context.WithCancel(ctx)
 	defer stopAll()
+	for i, so := range scaledObjects {
+		if so == "" {
+			continue
+		}
+		h := scaler.Handover{Source: cands[i], Workload: kube, ScaledObject: so, Site: lease.SiteOf(cands[i].Holder()),
+			Interval: handoverInterval, Log: log.With("lease", topics[i])}
+		go h.Run(runCtx)
+		log.Info("handover on", "topic", topics[i], "scaled_object", so, "namespace", kube.Namespace)
+	}
 	runErr := make(chan error, len(cands))
 	for _, c := range cands {
 		go func() { runErr <- c.Run(runCtx) }()
@@ -336,6 +360,10 @@ func run(args []string) error {
 		return waitAll(<-runErr) // releases the leases that are held
 	}
 }
+
+// handoverInterval is how often a handover looks at its lease and, while
+// the workload stops, counts its pods.
+const handoverInterval = time.Second
 
 // readyService is the gRPC health service the chart's readiness probe asks
 // for: SERVING once the scaler knows the state of every lease it serves.

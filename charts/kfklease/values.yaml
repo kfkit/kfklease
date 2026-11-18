@@ -46,6 +46,20 @@ takeoverMargin: 30   # seconds; cover the workload's terminationGracePeriodSecon
 # again; nothing moves back on its own.
 standby: false
 
+# The handover: when this cluster gives a lease up in standby, its scaler
+# pauses the ScaledObject at zero replicas (KEDA's paused-replicas
+# annotation), so the workload goes at once rather than after
+# cooldownPeriod, waits until the target has no pods left, terminating ones
+# included, and then tells the other clusters, which take over without
+# waiting for the rest of their takeoverDelay. The scaler lifts the pause
+# when this cluster holds the lease again, or once another one does. Needs
+# a namespaced Role, rendered here: get and patch on the release's
+# ScaledObjects, get on their targets' scale subresource (the resource is
+# the target's kind in lower case with an "s"), list pods. Nothing
+# cluster-wide. Off: standby moves the workload after takeoverDelay.
+handover:
+  enabled: true
+
 logLevel: info
 
 # Scaler pods per cluster. Every one takes part in the lease for the site

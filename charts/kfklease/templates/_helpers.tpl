@@ -57,3 +57,21 @@ what has to hold across the list: topics and ScaledObject names distinct.
 {{- end -}}
 {{- toYaml $all -}}
 {{- end -}}
+
+{{- /* kfklease.apiGroup: the group of an apiVersion, "" for the core group. */ -}}
+{{- define "kfklease.apiGroup" -}}
+{{- if contains "/" . }}{{ (split "/" .)._0 }}{{ end -}}
+{{- end -}}
+
+{{- /* kfklease.targetResource: the plural resource name of a targetRef,
+its kind in lower case with an "s": deployments, statefulsets,
+kafkaconnects, kafkamirrormaker2s. */ -}}
+{{- define "kfklease.targetResource" -}}
+{{- printf "%ss" (lower .kind) -}}
+{{- end -}}
+
+{{- /* kfklease.handover: whether the release renders the handover's
+access: handover.enabled and at least one ScaledObject. */ -}}
+{{- define "kfklease.handover" -}}
+{{- if .Values.handover.enabled }}{{ range include "kfklease.leases" . | fromYamlArray }}{{ if .scaledObject.enabled }}true{{ end }}{{ end }}{{ end -}}
+{{- end -}}

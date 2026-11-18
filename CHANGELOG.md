@@ -76,6 +76,15 @@ and this project adheres to
   example does, must read `site_holding` and `site_epoch` from `/status`
   rather than `holding` and `epoch`, which are true on one pod of the site
   only. The health probe likewise runs on every pod while the site holds.
+- Chart: with `handover.enabled` (on by default) the scaler pods run under
+  a ServiceAccount of their own, named after the release, where they ran
+  under the namespace's `default` ServiceAccount; the release also creates
+  a Role and a RoleBinding. Image pull secrets attached to the `default`
+  ServiceAccount no longer reach the scaler pods, so the image may fail to
+  pull, and installing needs the right to create Roles in the namespace.
+  List the pull secrets in `imagePullSecrets`, or set
+  `handover.enabled=false` to keep the `default` ServiceAccount (standby
+  then waits for `takeoverDelay`, as before).
 
 ### Added
 
@@ -114,6 +123,23 @@ and this project adheres to
   `segment.ms` equal to `min.compaction.lag.ms`, so that a new participant
   does not read a week of renewals. Optional `flush.messages=1`
   (`flushEveryRecord`, `-flush-every-record`), off by default.
+- The handover: a cluster put in standby stops its workload at once and
+  tells the others when it is gone, so another cluster takes over about a
+  TTL after the release rather than after `takeoverDelay`. The scaler sets
+  KEDA's `autoscaling.keda.sh/paused-replicas: "0"` on the ScaledObject,
+  waits until the target has no pods left, terminating ones included, and
+  writes a new record kind, `yield`, to the lease topic; it lifts the pause
+  when its cluster holds the lease again or another one does. Chart:
+  `handover.enabled`, on by default, with a namespaced Role (get and patch
+  on the release's ScaledObjects, get on their targets' `scale`
+  subresource, list pods). Binary: `-scaled-object` /
+  `KFKLEASE_SCALED_OBJECT`, one per topic. `/status` has `handover`.
+  Library: `Status.Handover`, `Status.HandoverEpoch`, `Candidate.Yield`,
+  `lease.Yield`, `scaler.Handover`, `scaler.Kube`. Scalers of earlier
+  versions log "skipping record" for a yield and wait the full delay.
+- Stand: the `standby` scenario expects the takeover well within the
+  takeover delay, and the new `handover-crash` scenario kills the scalers
+  between the pause and the yield.
 - Metric `kfklease_lease_holder_info{holder,site}`: 1 for the holder the
   log names, reported by every participant, so any cluster's scaler says
   where the lease is. `site` is the holder id up to its last slash (the

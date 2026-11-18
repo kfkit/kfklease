@@ -30,7 +30,8 @@ import (
 //   - safety: at no instant do two agents believe they hold the lease, nor
 //     do agents of two sites believe their site holds it (siteHolding: the
 //     holder, or another agent of its site that reads the holder's term
-//     from the log, as a scaler replica answers KEDA);
+//     from the log, as a scaler replica answers KEDA); with the handover,
+//     the workloads of two sites never run at once either;
 //   - agreement: a reader that starts from any point of the log, once it is
 //     certain, has exactly the state of a reader that saw the whole log.
 
@@ -77,13 +78,59 @@ type simParams struct {
 	// standby switches nodes in and out of standby every twenty TTLs or
 	// so.
 	standby bool
+	// handover gives each site a workload and switches whole sites in and
+	// out of standby; a site in standby stops its workload and yields, as
+	// the scaler does through KEDA (simWorkload). Nodes also write bogus
+	// yields now and then: for a term of another site, or for a term long
+	// gone. Needs sites.
+	handover bool
 }
 
 const (
 	simFailAfter = 3 * simTTL
 	simCooldown  = 5 * simTTL
 	simDelay     = 3 * simTTL
+	// simStop is how long a site's workload runs on after nothing of the
+	// site says "holding" any more: KEDA's polling and cooldown and the
+	// workload's own stop. The takeover delay covers it, and the time a
+	// partitioned replica answers for a term after its release.
+	simStop = simDelay - 3*simTTL/2
 )
+
+// simWorkload is a site's workload as KEDA runs it: up while a node of the
+// site says its site holds the lease, down simStop after the last such
+// answer. A pause (KEDA's paused-replicas 0) takes it down within stopIn
+// whatever the scaler says, and keeps it down until lifted.
+type simWorkload struct {
+	running    bool
+	lastDriven time.Time
+	paused     bool
+	stopAt     time.Time
+}
+
+func (w *simWorkload) step(now time.Time, driven bool) {
+	switch {
+	case driven && !w.paused:
+		w.running = true
+		w.lastDriven = now
+	case w.running && (now.Sub(w.lastDriven) >= simStop || (w.paused && !now.Before(w.stopAt))):
+		w.running = false
+	}
+}
+
+// pause takes the workload down: mostly within a TTL, now and then too
+// slowly for the yield to be of any use.
+func (w *simWorkload) pause(now time.Time, rng *rand.Rand) {
+	if w.paused {
+		return
+	}
+	w.paused = true
+	limit := simTTL
+	if rng.IntN(10) == 0 {
+		limit = 2 * simDelay
+	}
+	w.stopAt = now.Add(time.Duration(rng.Int64N(int64(limit))))
+}
 
 // config is node i's: holder "n<i>", or "s<i%2>/n<i>" with sites.
 func (p simParams) config(i int) Config {
@@ -134,6 +181,9 @@ type simNode struct {
 	trippedAt  time.Time
 
 	standby bool
+	// wasSiteHolding is siteHolding at the node's last step, for the
+	// handover driver, which lifts a pause when it turns true.
+	wasSiteHolding bool
 }
 
 // simStats counts what happened in one run.
@@ -144,6 +194,11 @@ type simStats struct {
 	// siteAnswers counts steps at which an agent that is not the holder
 	// believed its site holds the lease.
 	siteAnswers int
+	// yields counts yields sent by the handover, bogus the others.
+	yields, bogus int
+	// workOverlapAt is the first instant at which the workloads of two
+	// sites ran at once; zero for never.
+	workOverlapAt time.Time
 }
 
 // checkStandby holds a node in standby to its rules after a tick at local
@@ -238,6 +293,8 @@ func runSimStats(t *testing.T, seed uint64, p simParams) (records []Record, over
 	}
 
 	var wire []*simMsg
+	work := map[string]*simWorkload{"s0": {}, "s1": {}}
+	siteStandby := map[string]bool{}
 
 	for now := simTime(0); now.Before(simTime(simDuration)); now = now.Add(simStep) {
 		if !now.Before(nextLeaderChange) {
@@ -280,6 +337,23 @@ func runSimStats(t *testing.T, seed uint64, p simParams) (records []Record, over
 		}
 		if (holders > 1 || len(sites) > 1) && overlapAt.IsZero() {
 			overlapAt = now
+		}
+		if p.handover {
+			running := 0
+			for site, w := range work {
+				w.step(now, sites[site])
+				if w.running {
+					running++
+				}
+			}
+			if running > 1 && st.workOverlapAt.IsZero() {
+				st.workOverlapAt = now
+			}
+			for _, site := range []string{"s0", "s1"} {
+				if rng.Float64() < 0.0003 {
+					siteStandby[site] = !siteStandby[site]
+				}
+			}
 		}
 
 		for i, n := range nodes {
@@ -324,6 +398,13 @@ func runSimStats(t *testing.T, seed uint64, p simParams) (records []Record, over
 				n.standby = !n.standby
 				n.a.setStandby(local, n.standby)
 			}
+			// As a rolling update does it: one node after another, about a
+			// TTL apart, so that a site runs nodes in and out of standby
+			// for a while.
+			if p.handover && n.standby != siteStandby[n.a.cfg.Site] && rng.Float64() < 0.01 {
+				n.standby = siteStandby[n.a.cfg.Site]
+				n.a.setStandby(local, n.standby)
+			}
 			if rng.Float64() < 0.001 {
 				n.partitionedUntil = now.Add(time.Duration(rng.Int64N(int64(2 * simTTL))))
 			}
@@ -362,6 +443,13 @@ func runSimStats(t *testing.T, seed uint64, p simParams) (records []Record, over
 				}
 			}
 			n.a.fetched(local, int64(len(records)))
+			if p.handover {
+				simHandover(n, local, work[n.a.cfg.Site], now, rng)
+				if rng.Float64() < 0.0005 {
+					wire = append(wire, &simMsg{from: n, landAt: now.Add(simStep), rec: n.bogusYield(local)})
+					st.bogus++
+				}
+			}
 
 			var rec Record
 			var ok bool
@@ -376,6 +464,9 @@ func runSimStats(t *testing.T, seed uint64, p simParams) (records []Record, over
 			}
 			if !ok {
 				continue
+			}
+			if rec.Kind == Yield {
+				st.yields++
 			}
 			delay := time.Duration(rng.Int64N(50)) * time.Millisecond
 			if rng.Float64() < 0.03 {
@@ -394,6 +485,44 @@ func runSimStats(t *testing.T, seed uint64, p simParams) (records []Record, over
 		}
 	}
 	return records, overlapAt, st
+}
+
+// simHandover is the scaler's handover driver for node n: while its agent
+// reports a handover, pause the site's workload and, once it is down, ask
+// for the yield; lift the pause when the node starts to say its site holds,
+// or when another site holds the latest term.
+func simHandover(n *simNode, local time.Time, w *simWorkload, now time.Time, rng *rand.Rand) {
+	s, _, _ := n.a.status(local)
+	siteHolding := n.a.siteHolding(local)
+	rising := siteHolding && !n.wasSiteHolding
+	n.wasSiteHolding = siteHolding
+	switch {
+	case rising || (s.Certain && s.Lease.Last != "" && SiteOf(s.Lease.Last) != n.a.cfg.Site):
+		w.paused = false
+	case s.Handover:
+		w.pause(now, rng)
+		if !w.running {
+			n.a.requestYield(local, s.HandoverEpoch)
+		}
+	}
+}
+
+// bogusYield is a yield the protocol must not believe: by a holder for its
+// own term while it lasts (it lands within a step, while the term is
+// certainly held), for the term the node's view names when another site
+// held it, otherwise for a term that is not the latest. A yield for an own
+// term that has ended, written while the workload runs, is a lie the
+// protocol cannot catch, and is not made here.
+func (n *simNode) bogusYield(local time.Time) Record {
+	s := n.a.view.State()
+	epoch := s.Epoch
+	switch {
+	case n.a.deadline.Sub(local) > 2*simStep:
+		epoch = n.a.epoch
+	case s.Last == "" || SiteOf(s.Last) == n.a.cfg.Site:
+		epoch--
+	}
+	return Record{Kind: Yield, Holder: n.a.cfg.Holder, Epoch: epoch}
 }
 
 func TestSimulationSafetyAndAgreement(t *testing.T) {
@@ -650,5 +779,62 @@ func TestSimulationSiteAnswers(t *testing.T) {
 				t.Fatalf("too tame to mean anything: %d steps of site answers", answers)
 			}
 		})
+	}
+}
+
+// The handover: sites switch in and out of standby, node by node; a site in
+// standby pauses its workload when its term has ended and yields the term
+// once the workload is down, and another site takes over from the yield
+// rather than after the takeover delay. Yields get lost and land late like
+// any record, workloads sometimes stop too slowly for the yield to matter,
+// and bogus yields (another site's term, a term not the latest) are mixed
+// in. Safety holds for the beliefs and for the workloads, and handovers
+// do take effect well within the delay.
+func TestSimulationHandover(t *testing.T) {
+	seeds := 100
+	if testing.Short() {
+		seeds = 20
+	}
+	var yields, bogus, early int
+	fastest := time.Duration(math.MaxInt64)
+	for seed := uint64(1); seed <= uint64(seeds); seed++ {
+		records, overlapAt, st := runSimStats(t, seed, simParams{sites: true, handover: true})
+		if !overlapAt.IsZero() {
+			t.Fatalf("seed %d, t=%v: two agents or two sites believe they hold the lease", seed, overlapAt.Sub(t0))
+		}
+		if !st.workOverlapAt.IsZero() {
+			t.Fatalf("seed %d, t=%v: the workloads of two sites run at once", seed, st.workOverlapAt.Sub(t0))
+		}
+		yields += st.yields
+		bogus += st.bogus
+		ref := NewViewFromStart(simTTL)
+		believed := map[int64]bool{}
+		var takeovers []Record
+		var gaps []time.Duration
+		for _, r := range records {
+			prev := ref.State()
+			out, err := ref.Apply(r)
+			if err != nil {
+				t.Fatalf("seed %d: %v", seed, err)
+			}
+			if out == Accepted && r.Kind == Renew {
+				believed[r.Epoch] = true
+			}
+			if out == Accepted && r.Kind == Claim && !prev.Expires.IsZero() && SiteOf(prev.Last) != SiteOf(r.Holder) {
+				takeovers = append(takeovers, r)
+				gaps = append(gaps, r.Timestamp.Sub(prev.Expires))
+			}
+		}
+		for i, r := range takeovers {
+			if gaps[i] < simDelay && believed[r.Offset] {
+				early++
+				fastest = min(fastest, gaps[i])
+			}
+		}
+	}
+	t.Logf("%d runs: %d yields, %d bogus yields; %d takeovers by another site within the delay after a yield, the fastest %v after the end of the term",
+		seeds, yields, bogus, early, fastest)
+	if yields < seeds || early < seeds/2 || bogus < seeds {
+		t.Fatalf("too tame to mean anything: %d yields, %d takeovers within the delay, %d bogus yields", yields, early, bogus)
 	}
 }

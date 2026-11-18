@@ -420,3 +420,39 @@ func TestIntegrationSiteReplicas(t *testing.T) {
 		t.Fatalf("x took the lease of another site: %+v", x.Status())
 	}
 }
+
+// The handover: a site in standby gives the term up, reports the handover,
+// and once told its workload is down writes a yield; another site takes
+// over from the yield, well before its takeover delay.
+func TestIntegrationYield(t *testing.T) {
+	topic := randomTopic(t)
+	const delay = 5 * itTTL
+	withDelay := func(c *Config) { c.TakeoverDelay = delay }
+	a := startWith(t, topic, "eu/a", withDelay)
+	waitFor(t, itTTL, "a holds", func() bool { return a.Status().Holding })
+	epoch := a.Status().Epoch
+	x := startWith(t, topic, "us/x", withDelay)
+	waitFor(t, itTTL, "x is ready", func() bool { return x.Status().Ready })
+
+	t0 := time.Now()
+	a.SetStandby(true)
+	waitFor(t, itTTL, "a reports the handover", func() bool { return a.Status().Handover })
+	if s := a.Status(); s.HandoverEpoch != epoch {
+		t.Fatalf("a: %+v, want a handover of epoch %d", s, epoch)
+	}
+	// The workload takes a while to stop; without a yield, x waits.
+	time.Sleep(itTTL / 2)
+	if x.Status().Holding {
+		t.Fatal("x took over before the yield")
+	}
+	a.Yield(epoch)
+	waitFor(t, delay/2, "x takes over", func() bool { return x.Status().Holding })
+	took := time.Since(t0)
+	t.Logf("x holding %v after a went to standby, takeover delay %v", took, delay)
+	if took >= delay/2 {
+		t.Fatalf("x took over after %v: waited for the delay, not the yield", took)
+	}
+	if s := a.Status(); s.Handover {
+		t.Fatalf("a still reports a handover once another site holds: %+v", s)
+	}
+}

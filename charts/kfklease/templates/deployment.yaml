@@ -7,7 +7,8 @@
 {{- $leases := include "kfklease.leases" . | fromYamlArray -}}
 {{- $topics := list -}}
 {{- $urls := list -}}
-{{- range $leases }}{{ $topics = append $topics .topic }}{{ $urls = append $urls .healthUrl }}{{ end -}}
+{{- $scaledObjects := list -}}
+{{- range $leases }}{{ $topics = append $topics .topic }}{{ $urls = append $urls .healthUrl }}{{ $scaledObjects = append $scaledObjects (ternary .scaledObject.targetRef.name "" (and .scaledObject.enabled $.Values.handover.enabled)) }}{{ end -}}
 {{- /* The takeover delay covers the slowest ScaledObject of the release:
 its KEDA polling, its cooldown and the workload's stop. */ -}}
 {{- $bound := 0 -}}
@@ -61,6 +62,10 @@ spec:
     spec:
       # Long enough to write the release on shutdown.
       terminationGracePeriodSeconds: 15
+      {{- if include "kfklease.handover" . }}
+      # Pauses the ScaledObjects for a handover; see rbac.yaml.
+      serviceAccountName: {{ include "kfklease.name" . }}
+      {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -135,6 +140,12 @@ spec:
               value: {{ printf "%ds" $delay | quote }}
             - name: KFKLEASE_STANDBY
               value: {{ .Values.standby | quote }}
+            {{- if include "kfklease.handover" . }}
+            # One per topic, in the same order; empty: no handover for that
+            # lease.
+            - name: KFKLEASE_SCALED_OBJECT
+              value: {{ join "," $scaledObjects | quote }}
+            {{- end }}
             {{- if $tls.enabled }}
             - name: KFKLEASE_TLS
               value: "true"

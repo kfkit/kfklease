@@ -69,6 +69,8 @@ with TTL 10 s, `pollingInterval: 5`, `cooldownPeriod: 30`, `takeoverDelay`
 | `broker`    | Kafka stopped for 2 × TTL                      | the holder's site claims again as soon as the broker is back, the other site waits the delay: the lease stays where it was |
 | `replicas`  | both clusters redeployed with `REPLICAS=3`, then the holder cut off from Kafka | holder at 3, standby at 0; after the cut the holder's pods all go before the standby's three run; back to 1 at the end |
 | `scaler-down` | the holder's scaler Service loses its endpoint, the holder is cut off from Kafka and the scaler is killed (`crictl stop --timeout 0`, no release) | KEDA's fallback (`replicas: 0`) scales the holder's workload to zero on the scaler error once the cooldown has passed; the standby takes over after the term runs out and the delay |
+| `standby` | the holder's cluster is redeployed with `STANDBY=true` | the handover pauses its ScaledObject, its pod goes and it yields: the other cluster runs the workload well within the delay after the rollout, no overlap; the pause is lifted, `status` names the new site, and nothing moves back once the cluster leaves standby |
+| `handover-crash` | as `standby`, but a finalizer keeps the workload pod in `Terminating`, and the scaler pods are force-deleted after the pause | the other cluster does not start while the pod terminates; the restarted scalers keep the pause, yield once the finalizer goes, and the pause is gone after the takeover |
 
 Takeover timing is TTL plus the takeover delay plus KEDA's reaction and pod
 start; the standby never claims before the term in the log runs out and the

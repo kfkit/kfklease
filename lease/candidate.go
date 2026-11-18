@@ -215,6 +215,18 @@ type Status struct {
 	// Standby is whether this participant is in standby: it follows the
 	// log and never claims.
 	Standby bool
+
+	// Handover is set in standby while this participant's site owes the
+	// other sites a yield: the term that ended last was the site's, no
+	// yield for it is in the log, and the takeover delay after its end has
+	// not passed. Whoever drives the site's workload stops it now and,
+	// once nothing of it runs any more, calls Candidate.Yield with
+	// HandoverEpoch; another site then takes over without waiting for the
+	// rest of the delay.
+	Handover bool
+	// HandoverEpoch is the term to yield, valid while Handover; -1
+	// otherwise.
+	HandoverEpoch int64
 }
 
 // Candidate takes part in a lease: it follows the log, claims the lease when
@@ -240,6 +252,9 @@ type Candidate struct {
 	healthyAt time.Time
 	// standby is what SetStandby asked for, for the loop to pick up.
 	standby bool
+	// yieldEpoch is what Yield asked for, for the loop to pick up; -1 for
+	// nothing.
+	yieldEpoch int64
 
 	// testCrash makes Run return at once, without a release, when closed.
 	testCrash <-chan struct{}
@@ -253,10 +268,12 @@ func NewCandidate(cfg Config) (*Candidate, error) {
 		return nil, err
 	}
 	return &Candidate{
-		cfg:     cfg,
-		log:     cfg.Logger.With("lease", cfg.Topic, "holder", cfg.Holder),
-		changed: make(chan struct{}, 1),
-		standby: cfg.Standby,
+		cfg:        cfg,
+		log:        cfg.Logger.With("lease", cfg.Topic, "holder", cfg.Holder),
+		changed:    make(chan struct{}, 1),
+		standby:    cfg.Standby,
+		yieldEpoch: -1,
+		status:     Status{HandoverEpoch: -1},
 	}, nil
 }
 
@@ -286,6 +303,11 @@ func (c *Candidate) Status() Status {
 	if !now.Before(s.CooldownUntil) {
 		s.CooldownUntil = time.Time{}
 	}
+	if !c.standby {
+		// A handover is for standby only; the loop drops it as soon as it
+		// sees standby off.
+		s.Handover, s.HandoverEpoch = false, -1
+	}
 	return s
 }
 
@@ -314,11 +336,26 @@ func (c *Candidate) SetStandby(on bool) {
 	}
 }
 
-// loopInputs are what other goroutines asked for, for the loop to pick up.
-func (c *Candidate) loopInputs() (healthyAt time.Time, standby bool) {
+// Yield writes a yield for epoch, the HandoverEpoch of Status, if Status
+// still reports that handover when the loop picks it up: it tells the other
+// sites that this site's workload has stopped after that term, so they may
+// take over at once rather than after their takeover delay. Call it only
+// once nothing of the workload runs any more, terminating pods included;
+// a yield is a promise the protocol cannot check.
+func (c *Candidate) Yield(epoch int64) {
+	c.mu.Lock()
+	c.yieldEpoch = epoch
+	c.mu.Unlock()
+	c.signal()
+}
+
+// loopInputs are what other goroutines asked for, for the loop to pick up;
+// a yield request is taken.
+func (c *Candidate) loopInputs() (healthyAt time.Time, standby bool, yieldEpoch int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.healthyAt, c.standby
+	yieldEpoch, c.yieldEpoch = c.yieldEpoch, -1
+	return c.healthyAt, c.standby, yieldEpoch
 }
 
 // Changed is signalled whenever Status changes. Signals coalesce: a receiver
@@ -501,12 +538,15 @@ func (r *run) loop(ctx context.Context) error {
 		default:
 		}
 
-		healthyAt, standby := r.c.loopInputs()
+		healthyAt, standby, yieldEpoch := r.c.loopInputs()
 		if !healthyAt.IsZero() {
 			r.a.healthy(healthyAt)
 		}
 		now := time.Now()
 		r.a.setStandby(now, standby)
+		if yieldEpoch >= 0 {
+			r.a.requestYield(now, yieldEpoch)
+		}
 		if rec, ok := r.a.tick(now); ok {
 			r.produce(ctx, rec)
 		}

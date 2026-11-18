@@ -53,6 +53,9 @@ type StatusResponse struct {
 	// Standby is whether the participant is in standby mode: it follows
 	// the log and never claims.
 	Standby bool `json:"standby"`
+	// Handover is whether this site owes the other sites a yield for the
+	// term it gave up in standby: its workload is being stopped.
+	Handover bool `json:"handover"`
 }
 
 // LeaseResponse is the log's view of the lease.
@@ -180,7 +183,7 @@ func (h *HTTP) status(w http.ResponseWriter, r *http.Request) {
 	}
 	s := l.Source.Status()
 	h.note(l.Topic)
-	resp := StatusResponse{Topic: l.Topic, Holder: l.Holder, Holding: s.Holding, Certain: s.Certain, Ready: s.Ready, AsOf: s.AsOf, CooldownIn: untilNow(s.CooldownUntil), Standby: s.Standby}
+	resp := StatusResponse{Topic: l.Topic, Holder: l.Holder, Holding: s.Holding, Certain: s.Certain, Ready: s.Ready, AsOf: s.AsOf, CooldownIn: untilNow(s.CooldownUntil), Standby: s.Standby, Handover: s.Handover}
 	if s.Holding {
 		resp.Epoch = s.Epoch
 		resp.DeadlineIn = untilNow(s.Deadline)

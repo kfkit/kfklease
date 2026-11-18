@@ -774,3 +774,218 @@ func TestAgentHealthGateCountsAcrossTheSite(t *testing.T) {
 		t.Fatalf("at 11.2: tick = (%v, %v), want the release ten seconds into the site's run", rec.Kind, ok)
 	}
 }
+
+// A yield from the site of the term that ended last ends the takeover
+// delay for another site: from the yield, but not before the term would
+// have run out unrenewed plus two poll intervals (0.75 s each here). Any
+// other yield changes nothing. Records are read 0.2 s after the last one
+// landed, so the broker's clock is estimated 0.2 s behind the agent's.
+func TestAgentYield(t *testing.T) {
+	const delay = 30 * time.Second
+	rec := func(kind Kind, holder string, epoch int64) Record {
+		r := Record{Kind: kind, Holder: holder, Epoch: epoch}
+		if kind == Claim || kind == Renew {
+			r.TTL = agTTL
+		}
+		return r
+	}
+	type landed struct {
+		sec float64
+		rec Record
+	}
+	cases := []struct {
+		name string
+		log  []landed
+		// silent is the last moment checked for silence; sendsAt the claim.
+		silent, sendsAt float64
+	}{
+		{"yield after a release", []landed{{0, rec(Claim, "us/x", 0)}, {3, rec(Renew, "us/x", 0)}, {4, rec(Release, "us/x", 0)}, {6, rec(Yield, "us/y", 0)}},
+			14.6, 14.8}, // the renew at 3 runs out at 13, + 1.5
+		{"yield later than the natural end", []landed{{0, rec(Claim, "us/x", 0)}, {1, rec(Release, "us/x", 0)}, {20, rec(Yield, "us/x", 0)}},
+			0, 20.3},
+		{"yield after an expiry", []landed{{0, rec(Claim, "us/x", 0)}, {12, rec(Yield, "us/x", 0)}},
+			12.1, 12.3}, // 10 + 1.5 = 11.5 has passed by the time it is read
+		{"yield by another site", []landed{{0, rec(Claim, "us/x", 0)}, {1, rec(Release, "us/x", 0)}, {2, rec(Yield, "ap/z", 0)}},
+			31.1, 31.3},
+		{"yield by the claimant's own site", []landed{{0, rec(Claim, "us/x", 0)}, {1, rec(Release, "us/x", 0)}, {2, rec(Yield, "eu/z", 0)}},
+			31.1, 31.3},
+		{"yield of another term", []landed{{0, rec(Claim, "us/x", 0)}, {1, rec(Release, "us/x", 0)}, {2, rec(Yield, "us/x", 5)}},
+			31.1, 31.3},
+		{"yield while the term was held", []landed{{0, rec(Claim, "us/x", 0)}, {1, rec(Yield, "us/x", 0)}, {2, rec(Release, "us/x", 0)}},
+			32.1, 32.3},
+		// The yield names the term before the last: it lands late.
+		{"yield after a new term", []landed{{0, rec(Claim, "us/x", 0)}, {1, rec(Release, "us/x", 0)}, {2, rec(Claim, "us/y", 0)}, {3, rec(Release, "us/y", 2)}, {4, rec(Yield, "us/x", 0)}},
+			33.1, 33.3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newSiteHarness(t, 0, delay)
+			for _, l := range tc.log {
+				h.land(at(l.sec), l.rec)
+			}
+			last := at(tc.log[len(tc.log)-1].sec)
+			h.read(last.Add(200 * time.Millisecond))
+			for s := last.Sub(t0).Seconds() + 0.3; s < tc.silent; s += 0.5 {
+				h.wantSilent(at(s))
+			}
+			if tc.silent > 0 {
+				h.wantSilent(at(tc.silent))
+			}
+			claim := h.wantSend(at(tc.sendsAt), Claim)
+			// A claim that lands after the yield took effect is no early
+			// claim: it is believed, not given up.
+			off := h.land(at(tc.sendsAt+0.1), claim)
+			h.a.acked(at(tc.sendsAt+0.15), off, nil)
+			h.read(at(tc.sendsAt + 0.2))
+			h.wantBelief(at(tc.sendsAt+0.2), true)
+		})
+	}
+
+	// A hole hides a renewal, so the term ran longer than the claim
+	// said: the view anchors again on the renew and the release, but the
+	// term's natural end is not known, and the yield does not count.
+	h := newSiteHarness(t, 0, delay)
+	h.land(at(0), rec(Claim, "us/x", 0))
+	h.land(at(3), rec(Renew, "us/x", 0)) // compacted away
+	h.land(at(5), rec(Renew, "us/x", 0))
+	h.land(at(6), rec(Release, "us/x", 0))
+	h.land(at(7), rec(Yield, "us/x", 0))
+	for _, r := range h.log {
+		if r.Offset == 1 {
+			continue
+		}
+		value, err := EncodeValue(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := h.a.record(at(7.2), r.Offset, r.Timestamp, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.a.fetched(at(7.2), int64(len(h.log)))
+	if !h.a.view.Certain() {
+		t.Fatal("the view did not anchor again")
+	}
+	h.wantSilent(at(17.2)) // 15 + 1.5 has passed, but the yield does not count
+	h.wantSilent(at(36.1))
+	h.wantSend(at(36.3), Claim)
+
+	// A yield read on a view that is not certain does not count: the
+	// claim that started the term is gone, so the view settles by silence
+	// (at 2.2 + ttl + margin), on a term that ended by 1 + ttl at the
+	// latest, and the delay counts from there.
+	h = newSiteHarness(t, 1, delay)
+	h.land(at(0), rec(Claim, "us/x", 0))
+	h.land(at(1), rec(Release, "us/x", 0))
+	h.land(at(2), rec(Yield, "us/x", 0))
+	h.read(at(2.2))
+	h.wantSilent(at(14.3))
+	h.wantSilent(at(41.1))
+	h.wantSend(at(41.3), Claim)
+}
+
+// The handover on the side that yields: in standby, once its site's term
+// has ended, the agent reports it, and writes a yield for it on request,
+// once, and only while the handover still stands.
+func TestAgentHandover(t *testing.T) {
+	const delay = 30 * time.Second
+	handover := func(h *agentHarness, now time.Time) (int64, bool) {
+		s, _, _ := h.a.status(now)
+		if s.Handover != (s.HandoverEpoch >= 0) {
+			h.t.Fatalf("status = %+v: handover and its epoch disagree", s)
+		}
+		return s.HandoverEpoch, s.Handover
+	}
+	standbyAfterTerm := func(t *testing.T) (*agentHarness, int64) {
+		h := newSiteHarness(t, 0, delay)
+		epoch := h.acquire(at(0))
+		if _, ok := handover(h, at(1)); ok {
+			t.Fatal("handover while holding")
+		}
+		h.a.setStandby(at(2), true)
+		rel := h.wantSend(at(2), Release)
+		off := h.land(at(2.1), rel)
+		h.a.acked(at(2.15), off, nil)
+		h.read(at(2.2))
+		return h, epoch
+	}
+
+	t.Run("yields once on request", func(t *testing.T) {
+		h, epoch := standbyAfterTerm(t)
+		if e, ok := handover(h, at(2.3)); !ok || e != epoch {
+			t.Fatalf("handover = %d, %v; want %d", e, ok, epoch)
+		}
+		h.wantSilent(at(2.3)) // nothing without a request
+		h.a.requestYield(at(5), epoch)
+		y := h.wantSend(at(5), Yield)
+		if y.Epoch != epoch || y.Holder != "eu/me" {
+			t.Fatalf("yield = %+v", y)
+		}
+		off := h.land(at(5.1), y)
+		h.a.acked(at(5.15), off, nil)
+		h.read(at(5.2))
+		if _, ok := handover(h, at(5.3)); ok {
+			t.Fatal("handover still due after the yield landed")
+		}
+		h.a.requestYield(at(5.3), epoch)
+		h.wantSilent(at(5.3))
+	})
+	t.Run("a request for another term", func(t *testing.T) {
+		h, epoch := standbyAfterTerm(t)
+		h.a.requestYield(at(3), epoch+1)
+		h.wantSilent(at(3))
+	})
+	t.Run("standby off before the yield goes out", func(t *testing.T) {
+		h, epoch := standbyAfterTerm(t)
+		h.a.requestYield(at(3), epoch)
+		h.a.setStandby(at(3), false)
+		if rec, ok := h.tick(at(3)); ok && rec.Kind == Yield {
+			t.Fatal("yield sent out of standby")
+		}
+	})
+	t.Run("not after the delay", func(t *testing.T) {
+		h, epoch := standbyAfterTerm(t)
+		// The release landed at 2 on the agent's clock; the broker's clock
+		// is estimated from its read-back at 2.2.
+		if _, ok := handover(h, at(32.1)); !ok {
+			t.Fatal("no handover just before the delay ran out")
+		}
+		if _, ok := handover(h, at(32.2)); ok {
+			t.Fatal("handover after the delay ran out")
+		}
+		h.a.requestYield(at(32.2), epoch)
+		h.wantSilent(at(32.2))
+	})
+	t.Run("not while another site holds", func(t *testing.T) {
+		h, _ := standbyAfterTerm(t)
+		epoch := h.land(at(3), Record{Kind: Claim, Holder: "eu/other", TTL: agTTL})
+		h.read(at(3.1))
+		if _, ok := handover(h, at(3.2)); ok {
+			t.Fatal("handover while its own site holds again")
+		}
+		h.land(at(4), Record{Kind: Release, Holder: "eu/other", Epoch: epoch})
+		h.read(at(4.1))
+		if e, ok := handover(h, at(4.2)); !ok || e != epoch {
+			t.Fatalf("handover = %d, %v; want the new term %d", e, ok, epoch)
+		}
+		h.land(at(5), Record{Kind: Claim, Holder: "us/x", TTL: agTTL})
+		h.read(at(5.1))
+		if _, ok := handover(h, at(5.2)); ok {
+			t.Fatal("handover while another site holds")
+		}
+	})
+	t.Run("not out of standby", func(t *testing.T) {
+		h := newSiteHarness(t, 0, delay)
+		h.land(at(0), Record{Kind: Claim, Holder: "eu/other", TTL: agTTL})
+		h.land(at(1), Record{Kind: Release, Holder: "eu/other", Epoch: 0})
+		h.a.nextClaimAt = at(1000)
+		h.read(at(1.1))
+		if _, ok := handover(h, at(1.2)); ok {
+			t.Fatal("handover out of standby")
+		}
+		h.a.setStandby(at(1.3), true)
+		if _, ok := handover(h, at(1.3)); !ok {
+			t.Fatal("no handover in standby")
+		}
+	})
+}
