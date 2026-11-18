@@ -1,0 +1,15 @@
+{{- if and .Values.podDisruptionBudget.enabled (gt (int .Values.replicaCount) 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "kfklease.name" . }}
+  labels:
+    {{- include "kfklease.labels" . | nindent 4 }}
+spec:
+  # A drain never takes the last scaler pod of the cluster: the site keeps
+  # an answer for KEDA and a participant that can take the term over.
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "kfklease.selectorLabels" . | nindent 6 }}
+{{- end }}

@@ -6,7 +6,7 @@
 # at once and how long nobody wrote.
 #
 #   ./scenarios.sh            # all
-#   ./scenarios.sh crash      # one: coldstart, restart, crash, partition, pause, broker, replicas, scaler-down, standby
+#   ./scenarios.sh crash      # one: coldstart, restart, holder-pod, bad-image, crash, partition, pause, broker, replicas, scaler-down, standby
 #
 # Expects the stand to be up (./smoke.sh), the image built (./build-image.sh)
 # and the manifests deployed to both clusters (./deploy.sh k3s-a; ./deploy.sh k3s-b).
@@ -126,10 +126,11 @@ status_get() {
   python3 -c 'import sys, json; r = json.loads(sys.argv[1]); print(eval(sys.argv[2]))' "$st" "$2" 2>/dev/null || true
 }
 
-# held_epoch <cluster> prints the epoch the cluster's scaler holds, or -1.
+# held_epoch <cluster> prints the epoch the cluster's site holds, as the
+# scaler pod the Service picks sees it, or -1.
 held_epoch() {
   local e
-  e=$(status_get "$1" 'r["epoch"] if r["holding"] else -1')
+  e=$(status_get "$1" 'r["site_epoch"] if r["site_holding"] else -1')
   [[ $e =~ ^[0-9]+$ ]] && echo "$e" || echo -1
 }
 
@@ -177,35 +178,105 @@ scenario_coldstart() {
   echo "   ok: standby idle for $(( 2 * TTL ))s"
 }
 
-scenario_restart() {
-  echo "== restart: delete the holder's scaler pod; the workload stays where it is"
-  local h o since uids before epoch t0 t until holder
-  h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
-  uids=$(workload_uids "$h")
-  before=$(held_epoch "$h")
-  (( before >= 0 )) || fail "the scaler of ${h} does not hold the lease" || return
-  t0=$(date +%s)
-  # The pod releases on its way out and its successor, of the same site,
-  # claims at once; the other site would wait the takeover delay.
-  kc "$h" -n "$NS" delete pod -l app.kubernetes.io/name=kfklease --wait=false >/dev/null
-  until epoch=$(held_epoch "$h"); (( epoch > before )); do
-    (( $(date +%s) - t0 < 3 * TTL )) || fail "${h} holds no new epoch $(( 3 * TTL ))s after its scaler pod was deleted" || return
-    sleep 1
-  done
-  t=$(( $(date +%s) - t0 ))
-  holder=$(status_get "$h" 'r["lease"]["holder"]')
-  [[ $holder == "${h}/"* ]] || fail "the lease is held by ${holder}, not by site ${h}" || return
-  echo "   ${holder} holds epoch ${epoch} (was ${before}) ${t}s after the pod was deleted"
-  # Past KEDA's cooldown: had anything said "not holding" for longer, the
-  # workload would be gone by now.
+# stays <cluster> <uids>: for KEDA's cooldown and ten seconds more, the
+# other cluster never starts the workload and <cluster> keeps the workload
+# pods <uids>. Had the scaler said "not holding", or failed to answer, for
+# that long, the workload would be gone by then.
+stays() {
+  local h=$1 uids=$2 o until
+  o=$(other "$h")
   until=$(( $(date +%s) + COOLDOWN + 10 ))
   while (( $(date +%s) < until )); do
     [[ $(running "$o") == 0 ]] || fail "${o} started the workload" || return
     [[ $(workload_uids "$h") == "$uids" ]] || fail "the workload pods of ${h} changed" || return
     sleep 1
   done
+}
+
+# new_epoch <cluster> <before> <what> waits until the cluster's site holds an
+# epoch above <before>, of a holder of that site, and prints the holder.
+new_epoch() {
+  local h=$1 before=$2 what=$3 t0 epoch holder
+  t0=$(date +%s)
+  until epoch=$(held_epoch "$h"); (( epoch > before )); do
+    (( $(date +%s) - t0 < 3 * TTL )) || fail "${h} holds no new epoch $(( 3 * TTL ))s after ${what}" || return
+    sleep 1
+  done
+  holder=$(status_get "$h" 'r["lease"]["holder"]')
+  [[ $holder == "${h}/"* ]] || fail "the lease is held by ${holder}, not by site ${h}" || return
+  echo "   ${holder} holds epoch ${epoch} (was ${before}) $(( $(date +%s) - t0 ))s after ${what}" >&2
+  echo "$holder"
+}
+
+scenario_restart() {
+  echo "== restart: delete every scaler pod of the holder's cluster; the workload stays where it is"
+  local h o since uids before
+  h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
+  uids=$(workload_uids "$h")
+  before=$(held_epoch "$h")
+  (( before >= 0 )) || fail "the site ${h} does not hold the lease" || return
+  # The holder releases on its way out and a new pod of the same site
+  # claims at once; the other site would wait the takeover delay.
+  kc "$h" -n "$NS" delete pod -l app.kubernetes.io/name=kfklease --wait=false >/dev/null
+  new_epoch "$h" "$before" "the pods were deleted" >/dev/null || return
+  stays "$h" "$uids" || return
   heartbeats "$since"
   echo "   ok: same workload pods $(( COOLDOWN + 10 ))s on, ${o} never started"
+}
+
+scenario_holder_pod() {
+  echo "== holder-pod: delete the scaler pod that holds the lease; another of its site takes over, the workload stays"
+  local h o since uids before holder pod after
+  h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
+  uids=$(workload_uids "$h")
+  before=$(held_epoch "$h")
+  (( before >= 0 )) || fail "the site ${h} does not hold the lease" || return
+  holder=$(status_get "$h" 'r["lease"]["holder"]')
+  pod=${holder#"${h}/"}
+  [[ $pod != "$holder" ]] || fail "the lease is held by ${holder}, not by site ${h}" || return
+  # The other replica answered KEDA for the site all along; it claims as
+  # soon as the release lands.
+  kc "$h" -n "$NS" delete pod "$pod" --wait=false >/dev/null
+  after=$(new_epoch "$h" "$before" "${pod} was deleted") || return
+  [[ $after != "$holder" ]] || fail "the deleted pod still holds the lease" || return
+  stays "$h" "$uids" || return
+  heartbeats "$since"
+  echo "   ok: same workload pods $(( COOLDOWN + 10 ))s on, ${o} never started"
+}
+
+# scaler_pods <cluster> prints one line per scaler pod: name, image, ready,
+# and why its container waits, if it does.
+scaler_pods() {
+  kc "$1" -n "$NS" get pods -l app.kubernetes.io/name=kfklease -o json | python3 -c '
+import sys, json
+for p in json.load(sys.stdin)["items"]:
+    c = (p["status"].get("containerStatuses") or [{}])[0]
+    ready = any(x["type"] == "Ready" and x["status"] == "True" for x in p["status"].get("conditions", []))
+    waiting = c.get("state", {}).get("waiting", {}).get("reason", "-")
+    print(p["metadata"]["name"], p["spec"]["containers"][0]["image"], ready, waiting)'
+}
+
+scenario_bad_image() {
+  echo "== bad-image: upgrade the holder's scaler to an image that does not pull; its old pods keep the site, the workload stays"
+  local h o since uids before t0 pods
+  h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
+  uids=$(workload_uids "$h")
+  before=$(held_epoch "$h")
+  (( before >= 0 )) || fail "the site ${h} does not hold the lease" || return
+  IMAGE_TAG=does-not-exist WAIT=false ./deploy.sh "$h" >/dev/null
+  t0=$(date +%s)
+  until grep -qE ':does-not-exist False (ErrImageNeverPull|ErrImagePull|ImagePullBackOff)$' <<<"$(scaler_pods "$h")"; do
+    (( $(date +%s) - t0 < 60 )) || fail "no pod of the new image failed to pull: $(scaler_pods "$h")" || return
+    sleep 1
+  done
+  echo "   the rollout is stuck:" && scaler_pods "$h" | sed 's/^/     /'
+  stays "$h" "$uids" || return
+  pods=$(scaler_pods "$h")
+  [[ $(grep -c ':dev True' <<<"$pods") == 2 ]] || fail "the old scaler pods did not stay ready: ${pods}" || return
+  (( $(held_epoch "$h") >= before )) || fail "${h} no longer holds the lease" || return
+  ./deploy.sh "$h" >/dev/null
+  heartbeats "$since"
+  echo "   ok: same workload pods $(( COOLDOWN + 10 ))s on, ${o} never started, rolled back"
 }
 
 scenario_crash() {
@@ -402,7 +473,7 @@ scenario_standby() {
 }
 
 if (( $# == 0 )); then
-  set -- coldstart restart crash partition pause broker replicas scaler-down standby
+  set -- coldstart restart holder-pod bad-image crash partition pause broker replicas scaler-down standby
 fi
 for s in "$@"; do
   "scenario_${s//-/_}"

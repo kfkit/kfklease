@@ -1,6 +1,6 @@
 apiVersion: v2
 name: kfklease
-description: One lease participant for this cluster, served to KEDA as an external scaler
+description: The lease participants of this cluster, served to KEDA as an external scaler
 type: application
 version: 0.3.0
 appVersion: "0.3.0"

@@ -142,6 +142,51 @@ gives the workload up. A new scaler answers KEDA with an error, not with "not
 holding", until its view has been certain once, with the log read to its
 end (`Status.Ready`).
 
+### Several participants per site
+
+A site may run several participants, the scaler replicas of one cluster.
+One holds the term and renews it; the others follow the log, and with
+rule 6 the first of them to claim takes the term over at once when it
+ends. For KEDA every one of them answers for the site
+(`Status.SiteHolding`), so that losing one pod neither blinds KEDA nor
+moves anything:
+
+9. A participant believes its site holds the lease while it holds it
+   itself, or while it has read an accepted `claim` or `renew` of another
+   participant of its site, *fresh*, and the term that record gives in the
+   log has not run out: the record's term counts from the moment it was
+   read, for the TTL less the margin, as the holder counts its own from
+   the send. Anything that ends the term in the log, a release or another
+   holder, or a view that is no longer certain, ends the belief at once.
+   A reader cut off from Kafka sees no more renewals, and the belief runs
+   out with the term. In standby there is no site belief, and without a
+   takeover delay there is none either.
+10. A record is fresh when the reader sat at the end of a certain log at
+   its previous loop iteration, and that iteration was no more than two
+   poll intervals ago (half a renewal interval). A record read after a
+   freeze, a lost connection or from a backlog may be any age and extends
+   nothing.
+
+Rule 4 bounds a holder's belief by the send of its record, which comes
+before the landing. Rule 9 can only start from the read, which comes after
+it: a site belief outlives the term in the log by however long the record
+took to reach the reader. Rule 10 keeps that to a fetch round trip, and
+what makes it safe across sites is rule 7: another site claims only `D`
+after the term ended, by the broker's clock, so a site belief would have to
+lag by `D` (95 s under the chart) to meet another site's term. That is why
+rule 9 needs a delay. The simulation checks it with a delay of half a TTL
+too, where the delay covers almost nothing of a stale read and only
+rule 10 keeps a reader that wakes up from a pause from answering for a
+term long gone; without rule 10 that case overlaps.
+
+The health gate counts per site, too. Every participant whose site holds
+the lease probes the workload, and one that finds it unhealthy for
+`FailAfter` claims nothing for `Cooldown`, holder or not; a term that
+follows another of its site within a TTL continues the run the gate
+counts from. So when the holder releases because the workload cannot run,
+the others of its site do not take the term over for it, and the lease
+goes to another site after `D`.
+
 ## The margin
 
 Two clocks can disagree with the broker's and stretch the belief past the
@@ -207,7 +252,10 @@ from the log for up to two TTLs, and participants that join late and see
 only a tail of the log with holes in it. Clocks are perfect and the margin
 is zero, so any overlap is a protocol bug. It checks that
 
-- no two agents ever believe they hold the lease at the same instant;
+- no two agents ever believe they hold the lease at the same instant, and
+  no agents of two sites ever believe their sites hold it at the same
+  instant (rule 9, with the takeover delay of the sites and with one of
+  half a TTL);
 - a reader started at any offset, once certain, has exactly the state of a
   reader that saw the whole log;
 - candidates do not spam the log with claims they can see are hopeless.

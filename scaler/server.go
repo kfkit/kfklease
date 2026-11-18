@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package scaler exposes leases to KEDA as an external scaler: the metric is
-// 1 while this participant holds the lease and 0 otherwise, and an error
-// while a participant that just started does not know yet, so a ScaledObject
+// 1 while this participant's site holds the lease (lease.Status.SiteHolding:
+// this participant, or another scaler replica of its site) and 0 otherwise,
+// and an error while a participant that just started does not know yet, so
+// that every replica of a site gives KEDA the same answer. A ScaledObject
 // with idleReplicaCount 0 and minReplicaCount = maxReplicaCount = N runs N
 // replicas where the lease is held and none elsewhere. One scaler can serve
 // several leases; a ScaledObject picks its lease by the "topic" metadata of
@@ -161,17 +163,17 @@ func (s *Server) source(ref *externalscaler.ScaledObjectRef) (Source, error) {
 // until the cooldown, or the fallback, says otherwise.
 var errNotReady = status.Error(codes.Unavailable, "the lease state is not known yet: still reading the log")
 
-// holding is the answer for KEDA: whether this participant holds the lease,
-// or errNotReady.
+// holding is the answer for KEDA: whether this participant's site holds the
+// lease, or errNotReady.
 func holding(src Source) (bool, error) {
 	st := src.Status()
-	if !st.Holding && !st.Ready {
+	if !st.SiteHolding && !st.Ready {
 		return false, errNotReady
 	}
-	return st.Holding, nil
+	return st.SiteHolding, nil
 }
 
-// IsActive reports whether this participant holds the lease.
+// IsActive reports whether this participant's site holds the lease.
 func (s *Server) IsActive(_ context.Context, ref *externalscaler.ScaledObjectRef) (*externalscaler.IsActiveResponse, error) {
 	src, err := s.source(ref)
 	if err != nil {
@@ -234,8 +236,8 @@ func (s *Server) GetMetricSpec(_ context.Context, ref *externalscaler.ScaledObje
 	}, nil
 }
 
-// GetMetrics returns 1 while holding, 0 otherwise, and an error while the
-// lease state is not known yet.
+// GetMetrics returns 1 while the site holds the lease, 0 otherwise, and an
+// error while the lease state is not known yet.
 func (s *Server) GetMetrics(_ context.Context, req *externalscaler.GetMetricsRequest) (*externalscaler.GetMetricsResponse, error) {
 	src, err := s.source(req.GetScaledObjectRef())
 	if err != nil {

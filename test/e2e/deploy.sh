@@ -2,7 +2,9 @@
 # Deploys the chart and the test workload into one cluster:  ./deploy.sh k3s-a
 # Uses helm when installed, the alpine/helm image otherwise. REPLICAS sets
 # the workload's replica count while the cluster holds the lease (default 1),
-# STANDBY=true puts the cluster in standby mode.
+# STANDBY=true puts the cluster in standby mode, IMAGE_TAG sets the scaler's
+# image tag (default dev), and WAIT=false returns without waiting for the
+# scaler's rollout.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -47,14 +49,21 @@ case "$cluster" in
 esac
 
 helm_template --namespace "$NS" \
-  --set image.repository=kfklease-scaler --set image.tag=dev --set image.pullPolicy=Never \
+  --set image.repository=kfklease-scaler --set image.tag="${IMAGE_TAG:-dev}" --set image.pullPolicy=Never \
   --set topic="$TOPIC" --set ttl="${TTL}s" --set replicationFactor=1 \
   --set site="$cluster" --set scaledObject.targetRef.name=singleton \
   --set scaledObject.cooldownPeriod="$COOLDOWN" --set takeoverMargin="$TAKEOVER_MARGIN" \
   --set scaledObject.replicas="${REPLICAS:-1}" --set standby="${STANDBY:-false}" --set logLevel=debug \
   "${auth[@]}" \
   | kc "$cluster" -n "$NS" apply -f - >/dev/null
-# shellcheck disable=SC2016 # the literal is the variable name for envsubst
-CLUSTER="$cluster" envsubst '$CLUSTER' < manifests/singleton.yaml | kc "$cluster" -n "$NS" apply -f - >/dev/null
-kc "$cluster" -n "$NS" rollout status "deploy/$RELEASE" --timeout=120s >/dev/null
+# The workload once: its manifest says replicas 0, and KEDA owns the count
+# from then on. Applying it again would scale a running workload to zero and
+# start a new pod, which a redeploy of the chart must not do.
+if ! kc "$cluster" -n "$NS" get deploy singleton >/dev/null 2>&1; then
+  # shellcheck disable=SC2016 # the literal is the variable name for envsubst
+  CLUSTER="$cluster" envsubst '$CLUSTER' < manifests/singleton.yaml | kc "$cluster" -n "$NS" apply -f - >/dev/null
+fi
+if [[ ${WAIT:-true} == true ]]; then
+  kc "$cluster" -n "$NS" rollout status "deploy/$RELEASE" --timeout=120s >/dev/null
+fi
 echo "deployed to ${cluster}"

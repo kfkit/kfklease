@@ -5,10 +5,11 @@
 // and the tool that checks it did.
 //
 // beat: the workload. Before every write it asks the local scaler for its
-// status and writes a heartbeat only while the scaler believes it holds the
-// lease, tagging the record with the lease epoch. A pod that outlives its
-// cluster's term (KEDA has not scaled it down yet, or the cluster came back
-// from a crash) sees holding=false and writes nothing.
+// status and writes a heartbeat only while the scaler believes its site
+// holds the lease, tagging the record with the site's epoch. A pod that
+// outlives its cluster's term (KEDA has not scaled it down yet, or the
+// cluster came back from a crash) sees site_holding=false and writes
+// nothing.
 //
 // report: the downstream side. It reads the heartbeats and applies the
 // fencing rule a real consumer would: a record whose epoch is below the
@@ -115,13 +116,14 @@ func beat(args []string) error {
 			log.Warn("status", "err", err)
 			continue
 		}
-		// The fence: no belief, no write. The epoch travels with the record
-		// so the consumer can fence too.
-		if !st.Holding {
+		// The fence: no belief, no write. The site's belief, since the
+		// Service may route to any scaler replica of the site. The epoch
+		// travels with the record so the consumer can fence too.
+		if !st.SiteHolding {
 			continue
 		}
 		seq++
-		value, err := json.Marshal(Heartbeat{Cluster: *cluster, Holder: st.Holder, Epoch: st.Epoch, Seq: seq})
+		value, err := json.Marshal(Heartbeat{Cluster: *cluster, Holder: st.Holder, Epoch: st.SiteEpoch, Seq: seq})
 		if err != nil {
 			return err
 		}

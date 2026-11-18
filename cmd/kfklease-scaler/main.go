@@ -246,6 +246,7 @@ func run(args []string) error {
 	hs := health.NewServer()
 	grpc_health_v1.RegisterHealthServer(gs, hs)
 	hs.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
+	hs.SetServingStatus(readyService, grpc_health_v1.HealthCheckResponse_NOT_SERVING)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -294,6 +295,16 @@ func run(args []string) error {
 	for _, c := range cands {
 		go func() { runErr <- c.Run(runCtx) }()
 	}
+	go func() {
+		srcs := make([]scaler.Source, len(cands))
+		for i, c := range cands {
+			srcs[i] = c
+		}
+		if waitReady(runCtx, srcs, 200*time.Millisecond) {
+			hs.SetServingStatus(readyService, grpc_health_v1.HealthCheckResponse_SERVING)
+			log.Info("ready: the state of every lease is known")
+		}
+	}()
 	// waitAll stops every candidate, waits for the rest after first and
 	// joins their errors.
 	waitAll := func(first error) error {
@@ -317,9 +328,35 @@ func run(args []string) error {
 		return errors.Join(fmt.Errorf("grpc: %w", err), waitAll(<-runErr))
 	case <-ctx.Done():
 		log.Info("shutting down")
-		hs.SetServingStatus("", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
-		err := waitAll(<-runErr) // releases the leases that are held
-		gs.GracefulStop()
-		return err
+		// Stop answering KEDA first: its streams to this pod break, and it
+		// asks another replica of the site, which still sees the term, and
+		// takes it over once the release lands. Then release.
+		hs.Shutdown() // every service NOT_SERVING, for good
+		gs.Stop()
+		return waitAll(<-runErr) // releases the leases that are held
+	}
+}
+
+// readyService is the gRPC health service the chart's readiness probe asks
+// for: SERVING once the scaler knows the state of every lease it serves.
+// Until then it would answer KEDA with an error, so a rolling update waits
+// for it and the Service sends KEDA elsewhere. The liveness probe asks for
+// the server as a whole ("") and does not wait.
+const readyService = "ready"
+
+// waitReady polls srcs every interval until all of them are Ready and
+// reports true, or false when ctx is done first.
+func waitReady(ctx context.Context, srcs []scaler.Source, every time.Duration) bool {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		if !slices.ContainsFunc(srcs, func(s scaler.Source) bool { return !s.Status().Ready }) {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-t.C:
+		}
 	}
 }

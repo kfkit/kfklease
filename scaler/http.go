@@ -28,6 +28,14 @@ type StatusResponse struct {
 	Holding bool   `json:"holding"`
 	// Epoch is the fencing token, valid while Holding.
 	Epoch int64 `json:"epoch"`
+	// SiteHolding is whether this participant's site holds the lease: this
+	// participant, or another replica of the site as this one reads the
+	// log. What KEDA is told, and what a workload behind the scaler's
+	// Service fences on when the site runs several replicas.
+	SiteHolding bool `json:"site_holding"`
+	// SiteEpoch is the fencing token of the site's term, valid while
+	// SiteHolding.
+	SiteEpoch int64 `json:"site_epoch"`
 	// DeadlineIn is how long the belief lasts unless renewed, in seconds;
 	// 0 when not holding.
 	DeadlineIn float64 `json:"deadline_in_seconds"`
@@ -177,6 +185,9 @@ func (h *HTTP) status(w http.ResponseWriter, r *http.Request) {
 		resp.Epoch = s.Epoch
 		resp.DeadlineIn = untilNow(s.Deadline)
 	}
+	if s.SiteHolding {
+		resp.SiteHolding, resp.SiteEpoch = true, s.SiteEpoch
+	}
 	if s.Certain {
 		resp.Lease = &LeaseResponse{Holder: s.Lease.Holder, Epoch: s.Lease.Epoch, Expires: s.Lease.Expires}
 	}
@@ -188,28 +199,29 @@ func (h *HTTP) status(w http.ResponseWriter, r *http.Request) {
 // descs are the gauges, read from the Sources at scrape time, so they are
 // always current and there is nothing to keep in sync.
 type descs struct {
-	holding, epoch, deadline, certain, leaseHeld, leaseAge, cooldown, standby *prometheus.Desc
-	holderInfo                                                                *prometheus.Desc
+	holding, siteHolding, epoch, deadline, certain, leaseHeld, leaseAge, cooldown, standby *prometheus.Desc
+	holderInfo                                                                             *prometheus.Desc
 }
 
 func newDescs(labels []string) descs {
 	d := func(name, help string) *prometheus.Desc { return prometheus.NewDesc(name, help, labels, nil) }
 	return descs{
-		holding:   d("kfklease_holding", "1 while this participant believes it holds the lease."),
-		epoch:     d("kfklease_epoch", "Fencing token of the held term; -1 when not holding."),
-		deadline:  d("kfklease_belief_remaining_seconds", "Seconds until the belief expires unless renewed; 0 when not holding."),
-		certain:   d("kfklease_certain", "1 when the view of the log can be trusted."),
-		leaseHeld: d("kfklease_lease_held", "1 when the log says someone holds the lease, as of the last record seen."),
-		leaseAge:  d("kfklease_lease_as_of_seconds", "Unix time of the last record seen, on the broker's clock."),
-		cooldown:  d("kfklease_health_cooldown_seconds", "Seconds until this participant may claim again after the health gate released the lease; 0 otherwise."),
-		standby:   d("kfklease_standby_mode", "1 while this participant is in standby mode: it follows the log and never claims."),
+		holding:     d("kfklease_holding", "1 while this participant believes it holds the lease."),
+		siteHolding: d("kfklease_site_holding", "1 while this participant believes its site holds the lease: what KEDA is told."),
+		epoch:       d("kfklease_epoch", "Fencing token of the held term; -1 when not holding."),
+		deadline:    d("kfklease_belief_remaining_seconds", "Seconds until the belief expires unless renewed; 0 when not holding."),
+		certain:     d("kfklease_certain", "1 when the view of the log can be trusted."),
+		leaseHeld:   d("kfklease_lease_held", "1 when the log says someone holds the lease, as of the last record seen."),
+		leaseAge:    d("kfklease_lease_as_of_seconds", "Unix time of the last record seen, on the broker's clock."),
+		cooldown:    d("kfklease_health_cooldown_seconds", "Seconds until this participant may claim again after the health gate released the lease; 0 otherwise."),
+		standby:     d("kfklease_standby_mode", "1 while this participant is in standby mode: it follows the log and never claims."),
 	}
 }
 
 // Describe implements prometheus.Collector.
 func (h *HTTP) Describe(ch chan<- *prometheus.Desc) {
 	d := h.descs
-	for _, x := range []*prometheus.Desc{d.holding, d.epoch, d.deadline, d.certain, d.leaseHeld, d.leaseAge, d.cooldown, d.standby, d.holderInfo} {
+	for _, x := range []*prometheus.Desc{d.holding, d.siteHolding, d.epoch, d.deadline, d.certain, d.leaseHeld, d.leaseAge, d.cooldown, d.standby, d.holderInfo} {
 		ch <- x
 	}
 }
@@ -229,6 +241,7 @@ func (h *HTTP) Collect(ch chan<- prometheus.Metric) {
 			remaining = untilNow(s.Deadline)
 		}
 		gauge(d.holding, b2f(s.Holding))
+		gauge(d.siteHolding, b2f(s.SiteHolding))
 		gauge(d.epoch, epoch)
 		gauge(d.deadline, remaining)
 		gauge(d.certain, b2f(s.Certain))

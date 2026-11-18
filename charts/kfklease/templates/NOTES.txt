@@ -1,8 +1,8 @@
 {{ include "kfklease.name" . }} takes part in the lease on topic {{ .Values.topic }}
-for site {{ .Values.site }}, as "{{ .Values.site }}/<pod>".
+for site {{ .Values.site }} with {{ .Values.replicaCount }} pod(s), each as "{{ .Values.site }}/<pod>".
 
 Watch it:
-  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "kfklease.name" . }} -f
+  kubectl -n {{ .Release.Namespace }} logs -l app.kubernetes.io/instance={{ .Release.Name }} --prefix -f
 {{- if .Values.scaledObject.enabled }}
 
 {{ .Values.scaledObject.targetRef.kind }} {{ .Values.scaledObject.targetRef.name }} runs {{ .Values.scaledObject.replicas }} replica(s) while this cluster
