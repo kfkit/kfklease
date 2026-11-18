@@ -62,6 +62,10 @@ type Config struct {
 	// RenewEvery is how often a holder renews. Zero means TTL / 3.
 	RenewEvery time.Duration
 
+	// Standby starts the participant in standby: it follows the log and
+	// never claims. See Candidate.SetStandby.
+	Standby bool
+
 	// Health is an optional gate on the workload's health, fed by
 	// Candidate.ReportHealthy. The zero value turns it off.
 	Health HealthGate
@@ -188,9 +192,14 @@ type Status struct {
 	CooldownUntil time.Time
 
 	// Ready is whether this participant has known the state of the lease
-	// since it started: false until its view is first certain. Before that,
-	// not Holding means "do not know" rather than "another holds it".
+	// since it started: false until its view is first certain with the log
+	// read up to its end. Before that, not Holding means "do not know"
+	// rather than "another holds it".
 	Ready bool
+
+	// Standby is whether this participant is in standby: it follows the
+	// log and never claims.
+	Standby bool
 }
 
 // Candidate takes part in a lease: it follows the log, claims the lease when
@@ -214,6 +223,8 @@ type Candidate struct {
 
 	// healthyAt is the last ReportHealthy, for the loop to pick up.
 	healthyAt time.Time
+	// standby is what SetStandby asked for, for the loop to pick up.
+	standby bool
 
 	// testCrash makes Run return at once, without a release, when closed.
 	testCrash <-chan struct{}
@@ -230,6 +241,7 @@ func NewCandidate(cfg Config) (*Candidate, error) {
 		cfg:     cfg,
 		log:     cfg.Logger.With("lease", cfg.Topic, "holder", cfg.Holder),
 		changed: make(chan struct{}, 1),
+		standby: cfg.Standby,
 	}, nil
 }
 
@@ -242,8 +254,9 @@ func (c *Candidate) Status() Status {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	s := c.status
+	s.Standby = c.standby
 	now := time.Now()
-	if !c.deadline.IsZero() && now.Before(c.deadline) {
+	if !c.standby && !c.deadline.IsZero() && now.Before(c.deadline) {
 		s.Holding = true
 		s.Epoch = c.epoch
 		s.Deadline = c.deadline
@@ -263,10 +276,27 @@ func (c *Candidate) ReportHealthy() {
 	c.mu.Unlock()
 }
 
-func (c *Candidate) lastHealthy() time.Time {
+// SetStandby switches standby on or off. In standby the participant follows
+// the log and never claims. A term it holds ends at once: Status stops
+// reporting Holding when SetStandby returns, and the release is written
+// right after. Another site then takes the lease over after its takeover
+// delay, which is the time this site's workload has to stop. Off, the
+// participant claims again by the usual rules.
+func (c *Candidate) SetStandby(on bool) {
+	c.mu.Lock()
+	changed := c.standby != on
+	c.standby = on
+	c.mu.Unlock()
+	if changed {
+		c.signal()
+	}
+}
+
+// loopInputs are what other goroutines asked for, for the loop to pick up.
+func (c *Candidate) loopInputs() (healthyAt time.Time, standby bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.healthyAt
+	return c.healthyAt, c.standby
 }
 
 // Changed is signalled whenever Status changes. Signals coalesce: a receiver
@@ -278,9 +308,12 @@ func (c *Candidate) setStatus(s Status, deadline time.Time, epoch int64) {
 	same := c.status == s && c.deadline.Equal(deadline) && c.epoch == epoch
 	c.status, c.deadline, c.epoch = s, deadline, epoch
 	c.mu.Unlock()
-	if same {
-		return
+	if !same {
+		c.signal()
 	}
+}
+
+func (c *Candidate) signal() {
 	select {
 	case c.changed <- struct{}{}:
 	default:
@@ -446,10 +479,12 @@ func (r *run) loop(ctx context.Context) error {
 		default:
 		}
 
-		if t := r.c.lastHealthy(); !t.IsZero() {
-			r.a.healthy(t)
+		healthyAt, standby := r.c.loopInputs()
+		if !healthyAt.IsZero() {
+			r.a.healthy(healthyAt)
 		}
 		now := time.Now()
+		r.a.setStandby(now, standby)
 		if rec, ok := r.a.tick(now); ok {
 			r.produce(ctx, rec)
 		}

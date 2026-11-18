@@ -8,6 +8,7 @@
   KAFKA_PORT=9092
   NS=kfklease       # namespace of the scaler and the workload
   RELEASE=kfklease  # chart release: deployment and service name
+  TOPIC=kfklease-e2e  # the lease
   TTL=10            # lease ttl in seconds
   # KEDA keeps a workload for COOLDOWN seconds after its scaler stopped
   # saying "holding" (the chart's default is 60; shorter here to keep the

@@ -38,17 +38,22 @@ type agent struct {
 
 	// The health gate, on the monotonic clock. heldSince is when the
 	// current term was acquired, lastHealthy the last time the workload was
-	// reported healthy. standbyUntil holds claims back after the gate
-	// released the lease; releaseDue is that release, waiting for its turn
-	// under the one-request-in-flight rule.
-	heldSince    time.Time
-	lastHealthy  time.Time
-	standbyUntil time.Time
-	releaseDue   bool
+	// reported healthy. cooldownUntil holds claims back after the gate
+	// released the lease; releaseDue is that release, or one owed by
+	// standby or an early claim, waiting for its turn under the
+	// one-request-in-flight rule.
+	heldSince     time.Time
+	lastHealthy   time.Time
+	cooldownUntil time.Time
+	releaseDue    bool
 
-	// ready is set once the view has been certain: from then on the agent
-	// knows who holds the lease, or knew it last.
+	// ready is set once the view has been certain with the log read up to
+	// its end offset: from then on the agent knows who holds the lease, or
+	// knew it last.
 	ready bool
+
+	// standby: follow the log, never claim, release a term held.
+	standby bool
 
 	// Silence bookkeeping, all on the monotonic clock.
 	connected    bool
@@ -87,6 +92,7 @@ func newAgent(cfg Config, log *slog.Logger, start, end int64, now time.Time) *ag
 		highWater:   end,
 		ownOutcomes: make(map[int64]verdict),
 		epoch:       -1,
+		standby:     cfg.Standby,
 		connected:   true,
 		caughtUpAt:  now,
 	}
@@ -94,7 +100,7 @@ func newAgent(cfg Config, log *slog.Logger, start, end int64, now time.Time) *ag
 		// Nothing was ever deleted, so the reader sees everything. Holes
 		// left by compaction are caught record by record.
 		a.view = NewViewFromStart(cfg.TTL)
-		a.ready = true
+		a.noteReady()
 	}
 	return a
 }
@@ -125,6 +131,14 @@ func (a *agent) fetched(now time.Time, highWater int64) {
 	}
 	a.fetchedOnce = true
 	a.highWater = max(a.highWater, highWater)
+	a.noteReady()
+}
+
+// noteReady sets ready once the view is certain and has caught up with the
+// log. A view of the whole history is certain before it has read a single
+// record, and knows nothing yet.
+func (a *agent) noteReady() {
+	a.ready = a.ready || (a.view.Certain() && a.nextOffset >= a.highWater)
 }
 
 // record applies the next record of the log: its offset, its broker
@@ -157,7 +171,7 @@ func (a *agent) record(now time.Time, offset int64, ts time.Time, value []byte) 
 	}
 	a.log.Debug("record", "offset", rec.Offset, "kind", rec.Kind, "by", rec.Holder, "epoch", rec.Epoch, "outcome", out)
 
-	a.ready = a.ready || a.view.Certain()
+	a.noteReady()
 	if rec.Holder == a.cfg.Holder {
 		early := rec.Kind == Claim && out == Accepted && wasCertain && ts.Before(a.takeoverFrom(before))
 		a.ownRecord(now, rec.Offset, rec.Kind, verdict{out, early})
@@ -228,6 +242,12 @@ func (a *agent) settle(now time.Time, v verdict) {
 		a.epoch = in.offset
 		a.releaseDue = true
 		a.log.Warn("claim landed within the takeover delay after another site's term, releasing", "epoch", in.offset)
+	case in.kind == Claim && out == Accepted && a.standby:
+		// Sent before standby was switched on. Never believed, so that
+		// nothing reports holding for a moment; released at once.
+		a.epoch = in.offset
+		a.releaseDue = true
+		a.log.Info("claim landed in standby, releasing", "epoch", in.offset)
 	case in.kind == Claim && out == Accepted:
 		a.epoch = in.offset
 		a.extendBelief(in.sentAt)
@@ -302,7 +322,26 @@ func (a *agent) checkHealth(now time.Time) {
 	if d := a.unhealthyFor(now); d >= gate.FailAfter {
 		a.log.Warn("workload unhealthy, releasing", "epoch", a.epoch, "unhealthy_for", d, "cooldown", gate.Cooldown)
 		a.dropBelief()
-		a.standbyUntil = now.Add(gate.Cooldown)
+		a.cooldownUntil = now.Add(gate.Cooldown)
+		a.releaseDue = true
+	}
+}
+
+// setStandby switches standby on or off. In standby the agent follows the
+// log and never claims; a term it holds ends at once: the belief goes now,
+// the release when rule 2 lets it, as with the health gate.
+func (a *agent) setStandby(now time.Time, on bool) {
+	if on == a.standby {
+		return
+	}
+	a.standby = on
+	if !on {
+		a.log.Info("standby off")
+		return
+	}
+	a.log.Info("standby on")
+	if a.believing(now) {
+		a.dropBelief()
 		a.releaseDue = true
 	}
 }
@@ -349,7 +388,7 @@ func (a *agent) tick(now time.Time) (Record, bool) {
 		if now.Sub(a.lastSend) >= a.cfg.RenewEvery {
 			return a.send(now, Renew), true
 		}
-	case now.After(a.nextClaimAt) && !now.Before(a.standbyUntil) && a.mayClaim(now):
+	case !a.standby && now.After(a.nextClaimAt) && !now.Before(a.cooldownUntil) && a.mayClaim(now):
 		return a.send(now, Claim), true
 	}
 	return Record{}, false
@@ -413,15 +452,15 @@ func (a *agent) newRecord(kind Kind, epoch int64) Record {
 // status is what the agent knows and believes, with the deadline that
 // bounds the belief.
 func (a *agent) status(now time.Time) (s Status, deadline time.Time, epoch int64) {
-	s = Status{Certain: a.view.Certain(), AsOf: a.view.Clock(), Ready: a.ready}
+	s = Status{Certain: a.view.Certain(), AsOf: a.view.Clock(), Ready: a.ready, Standby: a.standby}
 	if s.Certain {
 		s.Lease = a.view.State()
 	}
 	if a.believing(now) {
 		deadline = a.deadline
 	}
-	if now.Before(a.standbyUntil) {
-		s.CooldownUntil = a.standbyUntil
+	if now.Before(a.cooldownUntil) {
+		s.CooldownUntil = a.cooldownUntil
 	}
 	return s, deadline, a.epoch
 }

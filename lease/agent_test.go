@@ -466,9 +466,22 @@ func TestAgentTakeoverDelay(t *testing.T) {
 func TestAgentReadyOnceCertain(t *testing.T) {
 	ready := func(h *agentHarness) bool { s, _, _ := h.a.status(at(0)); return s.Ready }
 	if h := newHarness(t, 0); !ready(h) {
-		t.Fatal("not ready on a log read from its start")
+		t.Fatal("not ready on an empty log")
 	}
-	h := newHarness(t, 40)
+	// A log read from its start is certain at once, but says nothing until
+	// it has been read to its end.
+	h := newHarness(t, 0)
+	h.land(at(0), Record{Kind: Claim, Holder: "other", TTL: agTTL})
+	h.land(at(1), Record{Kind: Renew, Holder: "other", Epoch: 0, TTL: agTTL})
+	h.a = newAgent(h.a.cfg, slog.New(slog.DiscardHandler), 0, int64(len(h.log)), at(1.1))
+	if ready(h) {
+		t.Fatal("ready before reading a log with records in it")
+	}
+	h.read(at(1.2))
+	if !ready(h) {
+		t.Fatal("not ready on a log read to its end")
+	}
+	h = newHarness(t, 40)
 	h.read(at(0))
 	if ready(h) {
 		t.Fatal("ready before the view was ever certain")
@@ -526,4 +539,81 @@ func TestAgentTakesOverOnlyWhenCaughtUp(t *testing.T) {
 	h.read(at(1.2))
 	h.a.fetched(at(1.3), int64(len(h.log))+1)
 	h.wantSend(at(1.3), Claim)
+}
+
+func TestAgentStandbyNeverClaims(t *testing.T) {
+	h := newHarness(t, 0)
+	h.a.setStandby(at(0), true)
+	// The lease is free and the view certain, for a long while.
+	for s := 0.0; s < 60; s += 0.5 {
+		h.wantSilent(at(s))
+	}
+	if s, _, _ := h.a.status(at(60)); !s.Standby || !s.Ready {
+		t.Fatalf("status = %+v, want standby and ready", s)
+	}
+	// It follows the log all the same.
+	h.land(at(60), Record{Kind: Claim, Holder: "other", TTL: agTTL})
+	h.read(at(60.1))
+	if s := h.a.view.State(); s.Holder != "other" {
+		t.Fatalf("log state = %+v, want other holding", s)
+	}
+	h.a.setStandby(at(61), false)
+	h.wantSilent(at(61)) // held by other
+	h.wantSend(at(70.5), Claim)
+}
+
+func TestAgentStandbyReleasesATermHeld(t *testing.T) {
+	h := newHarness(t, 0)
+	epoch := h.acquire(at(0))
+	h.renewAt(3)
+	h.a.setStandby(at(4), true)
+	// The belief goes at once, the release follows at the next tick.
+	h.wantBelief(at(4), false)
+	rel := h.wantSend(at(4), Release)
+	if rel.Epoch != epoch {
+		t.Fatalf("release epoch = %d, want %d", rel.Epoch, epoch)
+	}
+	off := h.land(at(4.1), rel)
+	h.a.acked(at(4.2), off, nil)
+	h.read(at(4.3))
+	if h.a.view.State().HeldAt(h.a.view.Clock()) {
+		t.Fatal("the release did not end the term in the log")
+	}
+	// Free, and its own site's: still no claim.
+	for s := 4.5; s < 60; s += 0.5 {
+		h.wantSilent(at(s))
+	}
+}
+
+func TestAgentStandbyReleaseWaitsForTheRecordInFlight(t *testing.T) {
+	h := newHarness(t, 0)
+	h.acquire(at(0))
+	renew := h.wantSend(at(3), Renew)
+	h.a.setStandby(at(3.1), true)
+	h.wantBelief(at(3.1), false)
+	h.wantSilent(at(3.2))
+	off := h.land(at(3.3), renew)
+	h.a.acked(at(3.4), off, nil)
+	h.read(at(3.5))
+	h.wantBelief(at(3.5), false) // the accepted renew does not bring it back
+	h.wantSend(at(3.6), Release)
+	h.wantSilent(at(3.7))
+}
+
+// A claim sent before standby was switched on and accepted after: never
+// believed, not even for a moment, and released.
+func TestAgentStandbyGivesUpAClaimInFlight(t *testing.T) {
+	h := newHarness(t, 0)
+	claim := h.wantSend(at(0), Claim)
+	h.a.setStandby(at(0.05), true)
+	off := h.land(at(0.1), claim)
+	h.a.acked(at(0.15), off, nil)
+	h.read(at(0.2))
+	h.wantBelief(at(0.2), false)
+	if s, deadline, _ := h.a.status(at(0.2)); !deadline.IsZero() || s.Holding {
+		t.Fatalf("status = %+v, deadline %v: reports holding", s, deadline)
+	}
+	if r := h.wantSend(at(0.3), Release); r.Epoch != off {
+		t.Fatalf("release of epoch %d, want %d", r.Epoch, off)
+	}
 }

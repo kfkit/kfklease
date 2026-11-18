@@ -125,6 +125,20 @@ and this project adheres to
   starts; the `broker` scenario now ends with the lease on the site that
   held it before the outage.
 
+- Standby mode: the participant follows the log and never claims; a holder
+  stops believing at once and writes a release. Chart value `standby`,
+  binary `-standby` / `KFKLEASE_STANDBY`, library `lease.Config.Standby`
+  and `Candidate.SetStandby`, `lease.Status.Standby`, `standby` in
+  `/status` and the metric `kfklease_standby_mode`. For maintenance, or to
+  move the workload to another cluster on purpose.
+- `kfklease-scaler status` prints who holds each lease, one JSON line per
+  topic, read from the topic without taking part in the lease; in a
+  scaler's pod it takes everything from the pod's environment. Library:
+  `lease.Inspect`.
+- Stand: the `standby` scenario puts the holding cluster in standby, checks
+  that the workload moves without overlap and that `status` names the new
+  site, and that nothing moves back once standby is off.
+
 ### Changed
 
 - Metric `kfklease_lease_holder_info`: the `site` of a holder id without a
@@ -136,6 +150,12 @@ and this project adheres to
   several leases should become `sum by (topic) (kfklease_holding)`.
 
 ### Fixed
+
+- A participant that starts on a log read from offset 0, which a compacted
+  topic usually is, reported `Ready` before it had read a record, so a
+  scaler that had just started could answer KEDA "not holding" for a
+  moment instead of an error. `Ready` now also waits until the log has
+  been read to its end.
 
 - Stand: the `broker` scenario brings Kafka back without reissuing the
   stand's CA, so an mTLS participant can reconnect after the outage.

@@ -42,6 +42,9 @@ type StatusResponse struct {
 	// CooldownIn is how long this participant claims nothing after the
 	// health gate released the lease, in seconds; 0 otherwise.
 	CooldownIn float64 `json:"health_cooldown_in_seconds"`
+	// Standby is whether the participant is in standby mode: it follows
+	// the log and never claims.
+	Standby bool `json:"standby"`
 }
 
 // LeaseResponse is the log's view of the lease.
@@ -169,7 +172,7 @@ func (h *HTTP) status(w http.ResponseWriter, r *http.Request) {
 	}
 	s := l.Source.Status()
 	h.note(l.Topic)
-	resp := StatusResponse{Topic: l.Topic, Holder: l.Holder, Holding: s.Holding, Certain: s.Certain, Ready: s.Ready, AsOf: s.AsOf, CooldownIn: untilNow(s.CooldownUntil)}
+	resp := StatusResponse{Topic: l.Topic, Holder: l.Holder, Holding: s.Holding, Certain: s.Certain, Ready: s.Ready, AsOf: s.AsOf, CooldownIn: untilNow(s.CooldownUntil), Standby: s.Standby}
 	if s.Holding {
 		resp.Epoch = s.Epoch
 		resp.DeadlineIn = untilNow(s.Deadline)
@@ -185,8 +188,8 @@ func (h *HTTP) status(w http.ResponseWriter, r *http.Request) {
 // descs are the gauges, read from the Sources at scrape time, so they are
 // always current and there is nothing to keep in sync.
 type descs struct {
-	holding, epoch, deadline, certain, leaseHeld, leaseAge, cooldown *prometheus.Desc
-	holderInfo                                                       *prometheus.Desc
+	holding, epoch, deadline, certain, leaseHeld, leaseAge, cooldown, standby *prometheus.Desc
+	holderInfo                                                                *prometheus.Desc
 }
 
 func newDescs(labels []string) descs {
@@ -199,13 +202,14 @@ func newDescs(labels []string) descs {
 		leaseHeld: d("kfklease_lease_held", "1 when the log says someone holds the lease, as of the last record seen."),
 		leaseAge:  d("kfklease_lease_as_of_seconds", "Unix time of the last record seen, on the broker's clock."),
 		cooldown:  d("kfklease_health_cooldown_seconds", "Seconds until this participant may claim again after the health gate released the lease; 0 otherwise."),
+		standby:   d("kfklease_standby_mode", "1 while this participant is in standby mode: it follows the log and never claims."),
 	}
 }
 
 // Describe implements prometheus.Collector.
 func (h *HTTP) Describe(ch chan<- *prometheus.Desc) {
 	d := h.descs
-	for _, x := range []*prometheus.Desc{d.holding, d.epoch, d.deadline, d.certain, d.leaseHeld, d.leaseAge, d.cooldown, d.holderInfo} {
+	for _, x := range []*prometheus.Desc{d.holding, d.epoch, d.deadline, d.certain, d.leaseHeld, d.leaseAge, d.cooldown, d.standby, d.holderInfo} {
 		ch <- x
 	}
 }
@@ -234,6 +238,7 @@ func (h *HTTP) Collect(ch chan<- prometheus.Metric) {
 			ch <- prometheus.MustNewConstMetric(d.holderInfo, prometheus.GaugeValue, 1, h.values(t, s.Lease.Holder, lease.SiteOf(s.Lease.Holder))...)
 		}
 		gauge(d.cooldown, untilNow(s.CooldownUntil))
+		gauge(d.standby, b2f(s.Standby))
 		if !s.AsOf.IsZero() {
 			gauge(d.leaseAge, float64(s.AsOf.UnixMilli())/1000)
 		}
