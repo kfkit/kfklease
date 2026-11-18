@@ -59,7 +59,13 @@ func start(t *testing.T, topic, holder string) *participant {
 
 func startGated(t *testing.T, topic, holder string, gate HealthGate) *participant {
 	t.Helper()
-	c, err := NewCandidate(Config{
+	return startWith(t, topic, holder, func(c *Config) { c.Health = gate })
+}
+
+// startWith starts a participant whose config opt adjusts.
+func startWith(t *testing.T, topic, holder string, opt func(*Config)) *participant {
+	t.Helper()
+	cfg := Config{
 		Brokers:       brokers(t),
 		Topic:         topic,
 		CreateTopic:   true,
@@ -67,9 +73,10 @@ func startGated(t *testing.T, topic, holder string, gate HealthGate) *participan
 		Holder:        holder,
 		TTL:           itTTL,
 		Margin:        itMargin,
-		Health:        gate,
 		Logger:        slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
-	})
+	}
+	opt(&cfg)
+	c, err := NewCandidate(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -369,5 +376,47 @@ func TestIntegrationInspect(t *testing.T) {
 	defer cancel2()
 	if _, err := Inspect(short, cfg); err == nil {
 		t.Fatal("inspected a missing topic")
+	}
+}
+
+// Two participants of one site, as two scaler replicas of a cluster, and one
+// of another site. The one of the site that does not hold believes its site
+// does, with the holder's epoch, and the other site's does not; when the
+// holder stops, the other of its site takes over at once, and its site
+// belief carries on into its own term.
+func TestIntegrationSiteReplicas(t *testing.T) {
+	topic := randomTopic(t)
+	delay := func(c *Config) { c.TakeoverDelay = 5 * itTTL }
+	a := startWith(t, topic, "eu/a", delay)
+	waitFor(t, itTTL, "a holds", func() bool { return a.Status().Holding })
+	b := startWith(t, topic, "eu/b", delay)
+	x := startWith(t, topic, "us/x", delay)
+	// b's first site belief needs a renewal read at the end of the log.
+	waitFor(t, 2*itTTL, "b believes its site holds", func() bool { return b.Status().SiteHolding })
+	epoch := a.Status().Epoch
+	if s := b.Status(); s.Holding || s.SiteEpoch != epoch {
+		t.Fatalf("b: %+v, want the site's epoch %d and no term of its own", s, epoch)
+	}
+	if s := a.Status(); !s.SiteHolding || s.SiteEpoch != epoch {
+		t.Fatalf("a: %+v, want its own term as the site's", s)
+	}
+	// Held over several renewals, not just the first.
+	until := time.Now().Add(2 * itTTL)
+	for time.Now().Before(until) {
+		if !b.Status().SiteHolding || x.Status().SiteHolding {
+			t.Fatalf("b: %+v; x: %+v", b.Status(), x.Status())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	t0 := time.Now()
+	a.stop(t)
+	waitFor(t, itTTL, "b takes over for its site", func() bool { return b.Status().Holding })
+	t.Logf("b holding %v after a stopped", time.Since(t0))
+	if s := b.Status(); s.Epoch <= epoch || !s.SiteHolding || s.SiteEpoch != s.Epoch {
+		t.Fatalf("b: %+v, want a new epoch above %d as the site's", s, epoch)
+	}
+	if x.Status().Holding || x.Status().SiteHolding {
+		t.Fatalf("x took the lease of another site: %+v", x.Status())
 	}
 }

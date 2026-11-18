@@ -4,6 +4,7 @@
 package lease
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -26,7 +27,10 @@ import (
 //
 // Two properties are checked:
 //
-//   - safety: at no instant do two agents believe they hold the lease;
+//   - safety: at no instant do two agents believe they hold the lease, nor
+//     do agents of two sites believe their site holds it (siteHolding: the
+//     holder, or another agent of its site that reads the holder's term
+//     from the log, as a scaler replica answers KEDA);
 //   - agreement: a reader that starts from any point of the log, once it is
 //     certain, has exactly the state of a reader that saw the whole log.
 
@@ -66,8 +70,10 @@ type simParams struct {
 	margin      time.Duration
 	// health turns the health gate on, with workloads that go up and down.
 	health bool
-	// sites puts the nodes in two sites, with a takeover delay.
+	// sites puts the nodes in two sites, with a takeover delay: delay, or
+	// simDelay when zero.
 	sites bool
+	delay time.Duration
 	// standby switches nodes in and out of standby every twenty TTLs or
 	// so.
 	standby bool
@@ -85,7 +91,7 @@ func (p simParams) config(i int) Config {
 	var delay time.Duration
 	if p.sites {
 		holder = fmt.Sprintf("s%d/%s", i%2, holder)
-		delay = simDelay
+		delay = cmp.Or(p.delay, simDelay)
 	}
 	cfg, err := Config{
 		Brokers: []string{"fake"}, Topic: "fake", Holder: holder, TakeoverDelay: delay,
@@ -135,6 +141,9 @@ type simStats struct {
 	gateReleases int
 	// standbyReleases are releases sent in standby.
 	standbyReleases int
+	// siteAnswers counts steps at which an agent that is not the holder
+	// believed its site holds the lease.
+	siteAnswers int
 }
 
 // checkStandby holds a node in standby to its rules after a tick at local
@@ -253,12 +262,23 @@ func runSimStats(t *testing.T, seed uint64, p simParams) (records []Record, over
 		wire = rest
 
 		holders := 0
+		sites := map[string]bool{}
 		for _, n := range nodes {
-			if n.a != nil && n.a.believing(n.local(now)) {
+			if n.a == nil {
+				continue
+			}
+			local := n.local(now)
+			if n.a.believing(local) {
 				holders++
 			}
+			if n.a.siteHolding(local) {
+				sites[n.a.cfg.Site] = true
+				if !n.a.believing(local) {
+					st.siteAnswers++
+				}
+			}
 		}
-		if holders > 1 && overlapAt.IsZero() {
+		if (holders > 1 || len(sites) > 1) && overlapAt.IsZero() {
 			overlapAt = now
 		}
 
@@ -599,5 +619,36 @@ func TestSimulationStandby(t *testing.T) {
 	t.Logf("%d runs: %d terms, %d releases in standby", seeds, terms, releases)
 	if releases < seeds || terms < seeds*5 {
 		t.Fatalf("too tame to mean anything: %d releases in standby, %d terms", releases, terms)
+	}
+}
+
+// Site answers: every agent of a site that is not the holder believes its
+// site holds the lease while it reads the holder's term from the log, as a
+// second scaler replica answers KEDA. Safety covers them: agents of two
+// sites never believe their sites hold the lease at once, through pauses,
+// partitions, lagging reads and late joiners. With a takeover delay of half
+// a TTL the delay covers little of a stale read, so only the freshness rule
+// keeps a reader that wakes up from a pause from answering for a term long
+// gone; the case shows that rule bites.
+func TestSimulationSiteAnswers(t *testing.T) {
+	seeds := 100
+	if testing.Short() {
+		seeds = 20
+	}
+	for _, delay := range []time.Duration{simDelay, simTTL / 2} {
+		t.Run(delay.String(), func(t *testing.T) {
+			var answers int
+			for seed := uint64(1); seed <= uint64(seeds); seed++ {
+				_, overlapAt, st := runSimStats(t, seed, simParams{sites: true, delay: delay})
+				if !overlapAt.IsZero() {
+					t.Fatalf("seed %d, t=%v: two sites believe they hold the lease", seed, overlapAt.Sub(t0))
+				}
+				answers += st.siteAnswers
+			}
+			t.Logf("%d runs: %v of answers for the site by agents that do not hold the lease", seeds, time.Duration(answers)*simStep)
+			if answers < seeds*int(10*simTTL/simStep) {
+				t.Fatalf("too tame to mean anything: %d steps of site answers", answers)
+			}
+		})
 	}
 }

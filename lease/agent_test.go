@@ -610,10 +610,167 @@ func TestAgentStandbyGivesUpAClaimInFlight(t *testing.T) {
 	h.a.acked(at(0.15), off, nil)
 	h.read(at(0.2))
 	h.wantBelief(at(0.2), false)
-	if s, deadline, _ := h.a.status(at(0.2)); !deadline.IsZero() || s.Holding {
-		t.Fatalf("status = %+v, deadline %v: reports holding", s, deadline)
+	if s, own, _ := h.a.status(at(0.2)); !own.deadline.IsZero() || s.Holding {
+		t.Fatalf("status = %+v, deadline %v: reports holding", s, own.deadline)
 	}
 	if r := h.wantSend(at(0.3), Release); r.Epoch != off {
 		t.Fatalf("release of epoch %d, want %d", r.Epoch, off)
+	}
+}
+
+// siteRecord lands a record of another participant at sec, with a tick just
+// before and the read just after, as the loop of a reader at the end of the
+// log does.
+func (h *agentHarness) siteRecord(sec float64, rec Record) int64 {
+	h.t.Helper()
+	h.tick(at(sec - 0.1))
+	if rec.Kind != Release {
+		rec.TTL = agTTL
+	}
+	off := h.land(at(sec), rec)
+	h.read(at(sec + 0.1))
+	return off
+}
+
+func (h *agentHarness) wantSite(now time.Time, holding bool, epoch int64) {
+	h.t.Helper()
+	_, _, site := h.a.status(now)
+	if got := h.a.siteHolding(now); got != holding || (holding && site.epoch != epoch) {
+		h.t.Fatalf("at %v: site holding = %v, epoch %d; want %v, epoch %d", now.Sub(t0), got, site.epoch, holding, epoch)
+	}
+}
+
+func TestAgentSiteBelief(t *testing.T) {
+	const delay = 30 * time.Second
+	newSibling := func(t *testing.T, delay time.Duration) *agentHarness {
+		h := newSiteHarness(t, 0, delay)
+		h.a.nextClaimAt = at(1000) // a reader, not a candidate, for now
+		return h
+	}
+
+	t.Run("follows a term of its site", func(t *testing.T) {
+		h := newSibling(t, delay)
+		epoch := h.siteRecord(1, Record{Kind: Claim, Holder: "eu/b"})
+		// Read at 1.1: the term counts from there for ttl - margin.
+		h.wantSite(at(9.09), true, epoch)
+		h.wantSite(at(9.1), false, 0)
+		h.siteRecord(4, Record{Kind: Renew, Holder: "eu/b", Epoch: epoch})
+		h.wantSite(at(12.09), true, epoch)
+		h.wantBelief(at(12.09), false)
+		h.siteRecord(5, Record{Kind: Release, Holder: "eu/b", Epoch: epoch})
+		h.wantSite(at(5.1), false, 0)
+	})
+
+	t.Run("a stale read extends nothing", func(t *testing.T) {
+		h := newSibling(t, delay)
+		epoch := h.siteRecord(1, Record{Kind: Claim, Holder: "eu/b"})
+		// Frozen from 1.1 to 8: the renew of 4 is read at 8, far from the
+		// last tick, and might be any age.
+		h.land(at(4), Record{Kind: Renew, Holder: "eu/b", Epoch: epoch, TTL: agTTL})
+		h.read(at(8))
+		h.wantSite(at(9.09), true, epoch)
+		h.wantSite(at(9.1), false, 0)
+		// So does a read behind the end of the log: the tick at 9.9 saw
+		// the renew of 9.5 landed but not read.
+		h.land(at(9.5), Record{Kind: Renew, Holder: "eu/b", Epoch: epoch, TTL: agTTL})
+		h.a.fetched(at(9.6), int64(len(h.log)))
+		h.tick(at(9.9))
+		h.read(at(10))
+		h.wantSite(at(10), false, 0)
+		// The next fresh renew does.
+		h.siteRecord(12, Record{Kind: Renew, Holder: "eu/b", Epoch: epoch})
+		h.wantSite(at(20.09), true, epoch)
+	})
+
+	t.Run("not for another site, without a delay, or in standby", func(t *testing.T) {
+		h := newSibling(t, delay)
+		h.siteRecord(1, Record{Kind: Claim, Holder: "us/x"})
+		h.wantSite(at(1.2), false, 0)
+
+		h = newSibling(t, 0)
+		h.siteRecord(1, Record{Kind: Claim, Holder: "eu/b"})
+		h.wantSite(at(1.2), false, 0)
+
+		h = newSibling(t, delay)
+		epoch := h.siteRecord(1, Record{Kind: Claim, Holder: "eu/b"})
+		h.wantSite(at(1.2), true, epoch)
+		h.a.setStandby(at(1.3), true)
+		h.wantSite(at(1.3), false, 0)
+		h.siteRecord(4, Record{Kind: Renew, Holder: "eu/b", Epoch: epoch})
+		h.wantSite(at(4.2), false, 0)
+	})
+
+	t.Run("the own term is the site's", func(t *testing.T) {
+		h := newSiteHarness(t, 0, delay)
+		epoch := h.acquire(at(0))
+		if !h.a.siteHolding(at(0.2)) {
+			t.Fatal("the holder does not count its own term as its site's")
+		}
+		if _, own, site := h.a.status(at(0.2)); own.epoch != epoch || !site.deadline.IsZero() {
+			t.Fatalf("own %+v, site %+v: want the own belief only", own, site)
+		}
+	})
+
+	t.Run("takes over for its site at once", func(t *testing.T) {
+		h := newSiteHarness(t, 0, delay)
+		h.a.nextClaimAt = at(5)
+		epoch := h.siteRecord(1, Record{Kind: Claim, Holder: "eu/b"})
+		h.siteRecord(6, Record{Kind: Release, Holder: "eu/b", Epoch: epoch})
+		h.wantSend(at(6.2), Claim)
+	})
+}
+
+// The health gate on a participant whose site another one holds: it probes
+// the same workload, and when that has been unhealthy for FailAfter it
+// claims nothing for the cooldown, so the holder's release moves the lease
+// to another site rather than around this one.
+func TestAgentHealthGateOfASibling(t *testing.T) {
+	gate := HealthGate{FailAfter: 10 * time.Second, Cooldown: time.Minute}
+	for _, healthy := range []bool{false, true} {
+		h := newSiteHarness(t, 0, 30*time.Second)
+		h.a.cfg.Health = gate
+		h.a.nextClaimAt = at(1000)
+		epoch := h.siteRecord(1, Record{Kind: Claim, Holder: "eu/b"}) // the site's term starts at 1.1
+		h.a.healthy(at(2))
+		for s := 4.0; s < 15; s += 3 {
+			if healthy {
+				h.a.healthy(at(s - 0.5))
+			}
+			h.siteRecord(s, Record{Kind: Renew, Holder: "eu/b", Epoch: epoch})
+		}
+		s, _, _ := h.a.status(at(13))
+		if tripped := !s.CooldownUntil.IsZero(); tripped == healthy {
+			t.Fatalf("healthy=%v: cooldown until %v", healthy, s.CooldownUntil.Sub(t0))
+		}
+		// Tripped, it still answers for its site while the holder holds.
+		h.wantSite(at(13), true, epoch)
+		h.a.nextClaimAt = time.Time{}
+		h.siteRecord(14, Record{Kind: Release, Holder: "eu/b", Epoch: epoch})
+		if healthy {
+			h.wantSend(at(14.2), Claim)
+			continue
+		}
+		for s := 14.2; s < 72; s += 0.5 {
+			h.wantSilent(at(s))
+		}
+	}
+}
+
+// A term of the site that follows another within a TTL continues the run
+// the health gate counts from: taking over for an unhealthy site buys its
+// workload no time.
+func TestAgentHealthGateCountsAcrossTheSite(t *testing.T) {
+	h := newSiteHarness(t, 0, 30*time.Second)
+	h.a.cfg.Health = HealthGate{FailAfter: 10 * time.Second, Cooldown: time.Minute}
+	h.a.nextClaimAt = at(1000)
+	epoch := h.siteRecord(1, Record{Kind: Claim, Holder: "eu/b"}) // the run starts at 1.1
+	h.siteRecord(4, Record{Kind: Release, Holder: "eu/b", Epoch: epoch})
+	h.a.nextClaimAt = time.Time{}
+	h.acquire(at(4.2))
+	h.renewAt(7.2)
+	h.renewAt(10.2)
+	h.wantBelief(at(11), true)
+	if rec, ok := h.tick(at(11.2)); !ok || rec.Kind != Release {
+		t.Fatalf("at 11.2: tick = (%v, %v), want the release ten seconds into the site's run", rec.Kind, ok)
 	}
 }

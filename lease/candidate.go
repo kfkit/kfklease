@@ -178,6 +178,21 @@ type Status struct {
 	// monotonic clock; zero unless Holding.
 	Deadline time.Time
 
+	// SiteHolding is the belief that this participant's site holds the
+	// lease: it holds it itself, or it reads from the log, fresh, that
+	// another participant of its site does. That other participant's term
+	// counts from the moment its record was read here, for the TTL less the
+	// margin. It needs a TakeoverDelay, which keeps other sites away for
+	// that long after the term ended, and it is never set in standby. What
+	// a site's workload acts on when the site runs several participants.
+	SiteHolding bool
+	// SiteEpoch is the fencing token of the site's term, valid while
+	// SiteHolding: Epoch when Holding.
+	SiteEpoch int64
+	// SiteDeadline is when the site belief expires unless the log shows a
+	// renewal, on the local monotonic clock; zero unless SiteHolding.
+	SiteDeadline time.Time
+
 	// Certain is whether Lease can be trusted; see View.
 	Certain bool
 	// Lease is the state of the lease in the log, as of AsOf on the broker's
@@ -215,11 +230,11 @@ type Candidate struct {
 	mu      sync.Mutex
 	status  Status // without Holding and Epoch, which depend on the clock
 	changed chan struct{}
-	// The belief: holder of epoch until deadline (monotonic). Status checks
-	// the deadline itself, so that a Candidate whose loop is stalled (a
-	// frozen process waking up) never reports a belief it has outlived.
-	deadline time.Time
-	epoch    int64
+	// The beliefs: its own term and its site's, each until a deadline
+	// (monotonic). Status checks the deadlines itself, so that a Candidate
+	// whose loop is stalled (a frozen process waking up) never reports a
+	// belief it has outlived.
+	own, site belief
 
 	// healthyAt is the last ReportHealthy, for the loop to pick up.
 	healthyAt time.Time
@@ -256,10 +271,17 @@ func (c *Candidate) Status() Status {
 	s := c.status
 	s.Standby = c.standby
 	now := time.Now()
-	if !c.standby && !c.deadline.IsZero() && now.Before(c.deadline) {
+	switch {
+	case c.standby:
+		// Neither belief; the loop drops them as soon as it sees standby.
+	case now.Before(c.own.deadline):
 		s.Holding = true
-		s.Epoch = c.epoch
-		s.Deadline = c.deadline
+		s.Epoch, s.Deadline = c.own.epoch, c.own.deadline
+		s.SiteHolding = true
+		s.SiteEpoch, s.SiteDeadline = s.Epoch, s.Deadline
+	case now.Before(c.site.deadline):
+		s.SiteHolding = true
+		s.SiteEpoch, s.SiteDeadline = c.site.epoch, c.site.deadline
 	}
 	if !now.Before(s.CooldownUntil) {
 		s.CooldownUntil = time.Time{}
@@ -303,10 +325,10 @@ func (c *Candidate) loopInputs() (healthyAt time.Time, standby bool) {
 // that lags sees one signal for several changes, never none.
 func (c *Candidate) Changed() <-chan struct{} { return c.changed }
 
-func (c *Candidate) setStatus(s Status, deadline time.Time, epoch int64) {
+func (c *Candidate) setStatus(s Status, own, site belief) {
 	c.mu.Lock()
-	same := c.status == s && c.deadline.Equal(deadline) && c.epoch == epoch
-	c.status, c.deadline, c.epoch = s, deadline, epoch
+	same := c.status == s && c.own == own && c.site == site
+	c.status, c.own, c.site = s, own, site
 	c.mu.Unlock()
 	if !same {
 		c.signal()

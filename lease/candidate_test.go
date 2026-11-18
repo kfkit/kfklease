@@ -57,7 +57,7 @@ func TestStatusHoldingExpiresWithoutTheLoop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.setStatus(Status{Certain: true}, time.Now().Add(50*time.Millisecond), 3)
+	c.setStatus(Status{Certain: true}, belief{time.Now().Add(50 * time.Millisecond), 3}, belief{})
 	if s := c.Status(); !s.Holding || s.Epoch != 3 {
 		t.Fatalf("before the deadline: %+v", s)
 	}
@@ -78,7 +78,7 @@ func TestStatusCooldownExpiresWithoutTheLoop(t *testing.T) {
 		t.Fatal(err)
 	}
 	until := time.Now().Add(50 * time.Millisecond)
-	c.setStatus(Status{Certain: true, CooldownUntil: until}, time.Time{}, -1)
+	c.setStatus(Status{Certain: true, CooldownUntil: until}, belief{}, belief{})
 	if s := c.Status(); !s.CooldownUntil.Equal(until) || s.Holding {
 		t.Fatalf("during the cooldown: %+v", s)
 	}
@@ -110,7 +110,7 @@ func TestSetStandbyHidesHoldingAtOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.setStatus(Status{Certain: true, Ready: true}, time.Now().Add(time.Minute), 3)
+	c.setStatus(Status{Certain: true, Ready: true}, belief{time.Now().Add(time.Minute), 3}, belief{})
 	<-c.Changed()
 	c.SetStandby(true)
 	select {

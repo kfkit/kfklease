@@ -31,18 +31,25 @@ type agent struct {
 	// Belief: this participant holds epoch until deadline (monotonic).
 	epoch    int64
 	deadline time.Time
+	// Site belief: another participant of this site holds siteEpoch until
+	// siteDeadline (monotonic), as this participant reads the log. See
+	// followSite.
+	siteEpoch    int64
+	siteDeadline time.Time
 
 	inflight    *inflight
 	lastSend    time.Time
 	nextClaimAt time.Time
 
-	// The health gate, on the monotonic clock. heldSince is when the
-	// current term was acquired, lastHealthy the last time the workload was
-	// reported healthy. cooldownUntil holds claims back after the gate
-	// released the lease; releaseDue is that release, or one owed by
-	// standby or an early claim, waiting for its turn under the
-	// one-request-in-flight rule.
+	// The health gate, on the monotonic clock. heldSince is when this
+	// site's current run of terms began, as far as this participant saw
+	// it, lastSiteHeld the last tick at which the site held, and
+	// lastHealthy the last time the workload was reported healthy.
+	// cooldownUntil holds claims back after the gate tripped; releaseDue is
+	// the release it owes, or one owed by standby or an early claim,
+	// waiting for its turn under the one-request-in-flight rule.
 	heldSince     time.Time
+	lastSiteHeld  time.Time
 	lastHealthy   time.Time
 	cooldownUntil time.Time
 	releaseDue    bool
@@ -54,6 +61,12 @@ type agent struct {
 
 	// standby: follow the log, never claim, release a term held.
 	standby bool
+
+	// lastTickAt is the last tick, and caughtUpAtTick whether the agent sat
+	// at the end of the log on a certain view then: what tells a record
+	// that just landed from one read late. See freshRead.
+	lastTickAt     time.Time
+	caughtUpAtTick bool
 
 	// Silence bookkeeping, all on the monotonic clock.
 	connected    bool
@@ -92,6 +105,7 @@ func newAgent(cfg Config, log *slog.Logger, start, end int64, now time.Time) *ag
 		highWater:   end,
 		ownOutcomes: make(map[int64]verdict),
 		epoch:       -1,
+		siteEpoch:   -1,
 		standby:     cfg.Standby,
 		connected:   true,
 		caughtUpAt:  now,
@@ -171,6 +185,7 @@ func (a *agent) record(now time.Time, offset int64, ts time.Time, value []byte) 
 	}
 	a.log.Debug("record", "offset", rec.Offset, "kind", rec.Kind, "by", rec.Holder, "epoch", rec.Epoch, "outcome", out)
 
+	fresh := a.freshRead(now)
 	a.noteReady()
 	if rec.Holder == a.cfg.Holder {
 		early := rec.Kind == Claim && out == Accepted && wasCertain && ts.Before(a.takeoverFrom(before))
@@ -183,7 +198,74 @@ func (a *agent) record(now time.Time, offset int64, ts time.Time, value []byte) 
 			a.dropBelief()
 		}
 	}
+	a.followSite(now, rec.Kind, out, fresh)
 	return nil
+}
+
+// freshRead reports whether a record read at now landed just before: the
+// agent sat at the end of a certain log at its last tick, and that tick was
+// recent, so the record arrived since, give or take the latency of a fetch.
+// A record read after a freeze, a lost connection or from a backlog may be
+// old and is not fresh.
+func (a *agent) freshRead(now time.Time) bool {
+	return a.caughtUpAtTick && a.connected && !a.lastTickAt.IsZero() && now.Sub(a.lastTickAt) <= 2*a.cfg.pollEvery()
+}
+
+// followSite keeps the site belief after a record was applied: another
+// participant of this site holds the lease. A fresh, accepted claim or renew
+// of such a term starts or extends the belief by the term the log gives it,
+// counted from the moment the record was read and less the margin, as the
+// holder counts its own from the send; anything that ends the term in the
+// log ends the belief. It takes a takeover delay: another site claims only
+// that long after the term ended, which also covers the time a record took
+// to reach this reader. In standby there is no site belief.
+func (a *agent) followSite(now time.Time, kind Kind, out Outcome, fresh bool) {
+	s := a.view.State()
+	if !a.siteDeadline.IsZero() && (!a.view.Certain() || s.Holder == "" || s.Epoch != a.siteEpoch || !s.HeldAt(a.view.Clock())) {
+		a.dropSite()
+	}
+	if out != Accepted || kind == Release || !fresh || !a.view.Certain() || !a.followsSite(s) {
+		return
+	}
+	if a.siteDeadline.IsZero() {
+		a.siteStarted(now)
+		a.log.Debug("site holds", "by", s.Holder, "epoch", s.Epoch)
+	}
+	a.siteEpoch = s.Epoch
+	a.siteDeadline = now.Add(s.Expires.Sub(a.view.Clock()) - a.cfg.Margin)
+}
+
+// followsSite reports whether a term of s's holder counts as this site's
+// for the site belief.
+func (a *agent) followsSite(s State) bool {
+	return a.cfg.TakeoverDelay > 0 && !a.standby && s.Holder != a.cfg.Holder && SiteOf(s.Holder) == a.cfg.Site
+}
+
+func (a *agent) dropSite() {
+	if a.siteDeadline.IsZero() {
+		return
+	}
+	a.siteDeadline = time.Time{}
+	a.log.Debug("site no longer holds", "epoch", a.siteEpoch)
+}
+
+// siteHolding reports whether this participant's site holds the lease, as
+// far as it may act on: it holds the lease itself, or it believes another
+// participant of its site does.
+func (a *agent) siteHolding(now time.Time) bool {
+	return a.believing(now) || now.Before(a.siteDeadline)
+}
+
+// siteStarted notes that a term of this site began at now, this
+// participant's or another's. The health gate counts from the start of the
+// site's run of terms: a term that follows one of the same site within a
+// TTL continues it, so that passing the lease around a site gives a
+// workload that cannot run no extra time.
+func (a *agent) siteStarted(now time.Time) {
+	if a.lastSiteHeld.IsZero() || now.Sub(a.lastSiteHeld) > a.cfg.TTL {
+		a.heldSince = now
+	}
+	a.lastSiteHeld = now
 }
 
 // ownRecord handles a record written by this participant. Only the record
@@ -251,7 +333,7 @@ func (a *agent) settle(now time.Time, v verdict) {
 	case in.kind == Claim && out == Accepted:
 		a.epoch = in.offset
 		a.extendBelief(in.sentAt)
-		a.heldSince = now
+		a.siteStarted(now)
 		a.log.Info("acquired", "epoch", a.epoch)
 	case in.kind == Claim:
 		s := a.view.State()
@@ -300,9 +382,9 @@ func (a *agent) healthy(now time.Time) {
 	}
 }
 
-// unhealthyFor is how long the holder's workload has gone without a healthy
-// report, counted from the later of the start of the term and the last
-// report: a workload gets FailAfter to come up in a new term.
+// unhealthyFor is how long the site's workload has gone without a healthy
+// report, counted from the later of the start of the site's terms and the
+// last report: a workload gets FailAfter to come up where it was moved.
 func (a *agent) unhealthyFor(now time.Time) time.Duration {
 	since := a.heldSince
 	if a.lastHealthy.After(since) {
@@ -311,20 +393,29 @@ func (a *agent) unhealthyFor(now time.Time) time.Duration {
 	return now.Sub(since)
 }
 
-// checkHealth applies the health gate: a holder whose workload has gone
-// unhealthy for FailAfter stops believing at once, owes the log a release,
-// and claims nothing for Cooldown.
+// checkHealth applies the health gate while the site holds: when its
+// workload has gone unhealthy for FailAfter, this participant claims nothing
+// for Cooldown, and if it is the holder it stops believing at once and owes
+// the log a release. Every participant of the site probes the same
+// workload, so the others do not take the lease over for the site when the
+// holder lets it go.
 func (a *agent) checkHealth(now time.Time) {
 	gate := a.cfg.Health
-	if gate.FailAfter <= 0 || !a.believing(now) {
+	if gate.FailAfter <= 0 || !a.siteHolding(now) || now.Before(a.cooldownUntil) {
 		return
 	}
-	if d := a.unhealthyFor(now); d >= gate.FailAfter {
-		a.log.Warn("workload unhealthy, releasing", "epoch", a.epoch, "unhealthy_for", d, "cooldown", gate.Cooldown)
-		a.dropBelief()
-		a.cooldownUntil = now.Add(gate.Cooldown)
-		a.releaseDue = true
+	d := a.unhealthyFor(now)
+	if d < gate.FailAfter {
+		return
 	}
+	a.cooldownUntil = now.Add(gate.Cooldown)
+	if !a.believing(now) {
+		a.log.Warn("workload unhealthy, claiming nothing for this site", "site_epoch", a.siteEpoch, "unhealthy_for", d, "cooldown", gate.Cooldown)
+		return
+	}
+	a.log.Warn("workload unhealthy, releasing", "epoch", a.epoch, "unhealthy_for", d, "cooldown", gate.Cooldown)
+	a.dropBelief()
+	a.releaseDue = true
 }
 
 // setStandby switches standby on or off. In standby the agent follows the
@@ -340,6 +431,7 @@ func (a *agent) setStandby(now time.Time, on bool) {
 		return
 	}
 	a.log.Info("standby on")
+	a.dropSite()
 	if a.believing(now) {
 		a.dropBelief()
 		a.releaseDue = true
@@ -354,7 +446,17 @@ func (a *agent) tick(now time.Time) (Record, bool) {
 		a.log.Warn("deadline passed without renewal", "epoch", a.epoch)
 		a.dropBelief()
 	}
+	if !a.siteDeadline.IsZero() && !now.Before(a.siteDeadline) {
+		a.dropSite()
+	}
 	a.checkHealth(now)
+	if a.siteHolding(now) {
+		a.lastSiteHeld = now
+	}
+	defer func() {
+		a.lastTickAt = now
+		a.caughtUpAtTick = a.connected && a.view.Certain() && a.nextOffset >= a.highWater
+	}()
 
 	if a.connected && a.nextOffset >= a.highWater && !a.view.Certain() {
 		since := a.caughtUpAt
@@ -449,18 +551,28 @@ func (a *agent) newRecord(kind Kind, epoch int64) Record {
 	return rec
 }
 
-// status is what the agent knows and believes, with the deadline that
-// bounds the belief.
-func (a *agent) status(now time.Time) (s Status, deadline time.Time, epoch int64) {
+// belief is a term to act on until deadline, on the monotonic clock; a zero
+// deadline is no belief.
+type belief struct {
+	deadline time.Time
+	epoch    int64
+}
+
+// status is what the agent knows, with its beliefs: its own term, and its
+// site's term held by another participant.
+func (a *agent) status(now time.Time) (s Status, own, site belief) {
 	s = Status{Certain: a.view.Certain(), AsOf: a.view.Clock(), Ready: a.ready, Standby: a.standby}
 	if s.Certain {
 		s.Lease = a.view.State()
 	}
 	if a.believing(now) {
-		deadline = a.deadline
+		own = belief{a.deadline, a.epoch}
+	}
+	if now.Before(a.siteDeadline) {
+		site = belief{a.siteDeadline, a.siteEpoch}
 	}
 	if now.Before(a.cooldownUntil) {
 		s.CooldownUntil = a.cooldownUntil
 	}
-	return s, deadline, a.epoch
+	return s, own, site
 }
