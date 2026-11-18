@@ -67,6 +67,7 @@ helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.3.0 \
 | `replicaCount` | scaler pods per cluster, `2` by default. One holds the term, every one answers KEDA for the site; see [Scaler replicas](#scaler-replicas) |
 | `podDisruptionBudget.enabled`, `.minAvailable` | `true` and `1` by default: a drain never takes the last scaler pod of the cluster. Rendered only with more than one replica |
 | `standby` | `false` by default; `true` keeps this cluster out of every lease of the release: it follows them and never claims. See [Standby and the status command](#standby-and-the-status-command) |
+| `handover.enabled` | `true` by default: when the cluster gives a lease up in standby, its scaler pauses the ScaledObject at zero and tells the other clusters once the workload's pods are gone, so they take over without waiting for `takeoverDelay`. Renders a namespaced Role; see [The handover](#the-handover) |
 | `ttl` | how long a term lasts without renewal, `10s` by default. The same for every participant of a lease |
 | `margin` | how much earlier than the term's end the holder stops believing, `ttl/5` by default; see [Choosing TTL and margin](#choosing-ttl-and-margin) |
 | `replicationFactor` | replicas of the topic `createTopic` creates, `3` by default. A cluster with fewer brokers fails the creation; see [The lease topic](#the-lease-topic) |
@@ -598,11 +599,14 @@ helm upgrade kfklease oci://ghcr.io/kfkit/charts/kfklease -n kfklease --version 
 ```
 
 On the holding cluster this restarts the scaler, whose pod releases the
-lease on its way out. The cluster's KEDA scales the workload to zero after
-`cooldownPeriod`, and another cluster claims `takeoverDelay` after the
-release, so the old pods are gone before the new ones start: about
-`takeoverDelay` plus the pod start, 1 min 40 s or so with the defaults.
-With no other cluster out of standby, nobody holds the lease.
+lease on its way out. With the handover (the default, see below) the
+workload stops at once and another cluster takes over as soon as its pods
+are gone: a TTL or so after the release, plus the pod start. Without it,
+the cluster's KEDA scales the workload to zero after `cooldownPeriod`, and
+another cluster claims `takeoverDelay` after the release, so the old pods
+are gone before the new ones start: about `takeoverDelay` plus the pod
+start, 1 min 40 s or so with the defaults. With no other cluster out of
+standby, nobody holds the lease.
 
 `standby: false` lets the cluster claim again by the usual rules. Nothing
 moves back on its own: while another cluster holds the lease, it stays
@@ -611,6 +615,59 @@ there. To move it back, put that cluster in standby.
 The library has the same switch at run time: `Candidate.SetStandby`, or
 `Config.Standby` to start in it. A participant in standby that holds the
 lease stops believing at once and writes a release.
+
+#### The handover
+
+The takeover delay is there because nothing tells the other clusters when
+the old workload is gone. In standby, the scaler knows: once its site's
+term has ended, a scaler pod of the cluster
+
+1. sets KEDA's `autoscaling.keda.sh/paused-replicas: "0"` on the
+   ScaledObject, so KEDA scales the workload to zero now rather than after
+   `cooldownPeriod`;
+2. counts the target's pods, terminating ones included, through the
+   selector of its scale subresource, once a second;
+3. once there are none, writes a `yield` record for the term to the lease
+   topic.
+
+Another cluster reads the yield as the end of its takeover delay, but
+claims no earlier than a TTL after the old term's last renewal (plus half a
+renewal interval): until then a scaler replica of the old cluster that
+missed the release could still answer KEDA "my site holds". The handover
+gives up when `takeoverDelay` has passed since the term ended; by then the
+other cluster claims anyway. A handover that does not finish (a pod that
+never terminates, an API error) writes no yield, and the other cluster
+waits the full delay, as without the handover.
+
+The pause is lifted when the cluster holds the lease again, and once
+another cluster holds it, so a scaler stopped half-way through a handover
+does not leave the workload paused: the next scaler pod picks the handover
+up where it was. It is never lifted while the cluster's own term is the
+latest one in the log: the yield promised the others that the workload
+stays down.
+
+The chart gives the scaler a ServiceAccount and a Role in the release
+namespace, nothing cluster-wide:
+
+| Resource | Verbs | Why |
+|---|---|---|
+| `scaledobjects.keda.sh`, by name: the release's own | `get`, `patch` | pause and lift; read the target from KEDA's `status.scaleTargetGVKR` |
+| `<target>/scale` in the target's group, by name | `get` | the target's pod selector |
+| `pods` | `list` | whether any pod of the target is left |
+
+The target's resource is its kind in lower case with an `s`
+(`deployments`, `statefulsets`, `kafkaconnects`, `kafkamirrormaker2s`).
+`handover.enabled: false` renders none of it, and standby moves the
+workload after `takeoverDelay`. Outside the chart: `-scaled-object` (or
+`KFKLEASE_SCALED_OBJECT`), one ScaledObject per topic, and the same access
+for the pod's service account. With your own ScaledObject
+(`scaledObject.enabled: false`) the chart renders no handover; the access
+and `KFKLEASE_SCALED_OBJECT` are then yours to add.
+
+`/status` reports `"handover": true` while a scaler waits for the workload
+to go. The library side is `Status.Handover` and `Candidate.Yield`: a
+yield is a promise the protocol cannot check, so call it only once nothing
+of the workload runs.
 
 **Who holds the lease**, from anywhere that reaches Kafka, without taking
 part in it:
@@ -645,6 +702,8 @@ writes to the topic.
 | `acquired` and `no longer holder` alternate | renewals are not landing in time: the broker is slow or the link is flaky. Raise the TTL, or look at the broker |
 | Two clusters run the workload for a few seconds after a handover | the workload takes longer to stop than `takeoverMargin`, or a revived cluster runs its stale pod until its KEDA is back. Raise `takeoverMargin`; fence by epoch |
 | A failover takes about two minutes | TTL plus `takeoverDelay`, which is `pollingInterval + cooldownPeriod + takeoverMargin`: the price of a scaler restart that keeps the workload. Lower `cooldownPeriod` if scaler restarts are fast |
+| Standby moves the workload only after `takeoverDelay` | the handover did not finish: the scaler logs `handover: cannot pause`, `cannot count the workload's pods` (RBAC, a target kind whose plural is not kind + `s`, a ScaledObject KEDA has not resolved yet) or keeps logging nothing while a pod of the workload hangs in `Terminating`. See [The handover](#the-handover) |
+| A ScaledObject keeps `autoscaling.keda.sh/paused-replicas: "0"` | a handover that never finished, with the cluster's own term still the latest. It goes when the cluster or another one holds the lease; remove it by hand only when no other cluster could have taken over on the promise of a yield |
 | KEDA logs `the lease state is not known yet` | a scaler that just started and has not read the log yet; it settles within seconds. If it does not, look at its connection to Kafka |
 
 Set `logLevel: debug` to see every record the scaler folds.

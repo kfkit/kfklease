@@ -191,7 +191,15 @@ probe for `healthGate.failAfter` releases the lease and sits out
 
 To take a cluster out, or move the workload on purpose, set `standby: true`
 on its release: its scaler never claims, a holder releases, and another
-cluster takes over after its takeover delay. `kfklease-scaler status`
+cluster takes over. With the handover (`handover.enabled`, on by default)
+the scaler pauses its ScaledObject at zero, waits until the workload's pods
+are gone and writes a `yield` to the lease topic, and the other cluster
+takes over about a TTL after the release instead of after its takeover
+delay. For that the scaler pods run under a ServiceAccount of the release
+with a namespaced Role (get and patch on the release's ScaledObjects, get
+on their targets' `scale`, list pods); pull secrets go in
+`imagePullSecrets`, not on the `default` ServiceAccount. See
+[docs/install.md](docs/install.md#the-handover). `kfklease-scaler status`
 prints who holds each lease, read from the topic, from anywhere that
 reaches Kafka (`kubectl exec deploy/kfklease -- /app status` in a scaler's
 pod); see
@@ -238,7 +246,7 @@ The end-to-end stand with two Kubernetes clusters is described in
 - [x] The lease belongs to a site: a scaler restart or a Kafka outage leaves the workload in place
 - [x] Standby mode and a `status` command
 - [x] Scaler replicas per site
-- [ ] A handover that skips the takeover delay
+- [x] A handover that skips the takeover delay
 - [x] Failure-mode tests: clock skew and drift, in the simulation
 - [x] Example workload fencing by epoch; workload-level exclusion check on the stand
 - [x] Image and chart on GHCR, cosign-signed
