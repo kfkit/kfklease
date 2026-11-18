@@ -291,9 +291,6 @@ func (c *Candidate) Status() Status {
 	switch {
 	case c.standby:
 		// Neither belief; the loop drops them as soon as it sees standby.
-	case s.Handover:
-		// Only in standby; the loop drops it as soon as it sees standby off.
-		s.Handover, s.HandoverEpoch = false, -1
 	case now.Before(c.own.deadline):
 		s.Holding = true
 		s.Epoch, s.Deadline = c.own.epoch, c.own.deadline
@@ -305,6 +302,11 @@ func (c *Candidate) Status() Status {
 	}
 	if !now.Before(s.CooldownUntil) {
 		s.CooldownUntil = time.Time{}
+	}
+	if !c.standby {
+		// A handover is for standby only; the loop drops it as soon as it
+		// sees standby off.
+		s.Handover, s.HandoverEpoch = false, -1
 	}
 	return s
 }
