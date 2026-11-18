@@ -1,0 +1,56 @@
+{{- /* The handover's access: the release's own ScaledObjects (get, patch),
+their targets' scale subresource (get), and pods (list), in the release
+namespace only. */ -}}
+{{- if include "kfklease.handover" . }}
+{{- $sos := list }}
+{{- range include "kfklease.leases" . | fromYamlArray }}{{ if .scaledObject.enabled }}{{ $sos = append $sos .scaledObject }}{{ end }}{{ end }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "kfklease.name" . }}
+  labels:
+    {{- include "kfklease.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "kfklease.name" . }}
+  labels:
+    {{- include "kfklease.labels" . | nindent 4 }}
+rules:
+  # Pause a ScaledObject at zero replicas for a handover, lift the pause,
+  # and read its target from KEDA's status.
+  - apiGroups: [keda.sh]
+    resources: [scaledobjects]
+    resourceNames:
+      {{- range $sos }}
+      - {{ .targetRef.name }}
+      {{- end }}
+    verbs: [get, patch]
+  {{- range $sos }}
+  # The target's pod selector, from its scale subresource.
+  - apiGroups: [{{ include "kfklease.apiGroup" .targetRef.apiVersion | quote }}]
+    resources: [{{ include "kfklease.targetResource" .targetRef }}/scale]
+    resourceNames: [{{ .targetRef.name }}]
+    verbs: [get]
+  {{- end }}
+  # Whether any pod of a target is left, terminating ones included.
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "kfklease.name" . }}
+  labels:
+    {{- include "kfklease.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "kfklease.name" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kfklease.name" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

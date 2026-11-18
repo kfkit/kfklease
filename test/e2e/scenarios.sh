@@ -6,7 +6,7 @@
 # at once and how long nobody wrote.
 #
 #   ./scenarios.sh            # all
-#   ./scenarios.sh crash      # one: coldstart, restart, holder-pod, bad-image, crash, partition, pause, broker, replicas, scaler-down, standby
+#   ./scenarios.sh crash      # one: coldstart, restart, holder-pod, bad-image, crash, partition, pause, broker, replicas, scaler-down, standby, handover-crash
 #
 # Expects the stand to be up (./smoke.sh), the image built (./build-image.sh)
 # and the manifests deployed to both clusters (./deploy.sh k3s-a; ./deploy.sh k3s-b).
@@ -450,14 +450,39 @@ lease_status() {
     -brokers "$KAFKA_ADDR:$KAFKA_PORT" -topic "$TOPIC" -ttl "${TTL}s" -log-level warn
 }
 
+# paused <cluster> prints the paused-replicas annotation of the workload's
+# ScaledObject, empty when there is none.
+paused() {
+  kc "$1" -n "$NS" get scaledobject singleton -o jsonpath='{.metadata.annotations.autoscaling\.keda\.sh/paused-replicas}'
+}
+
+# wait_unpaused <cluster> waits until the ScaledObject has no pause left.
+wait_unpaused() {
+  local t0
+  t0=$(date +%s)
+  until [[ -z $(paused "$1") ]]; do
+    (( $(date +%s) - t0 < 2 * TTL )) || fail "the ScaledObject of $1 is still paused" || return
+    sleep 1
+  done
+}
+
 scenario_standby() {
-  echo "== standby: put the holder's cluster in standby; the workload moves, and stays moved"
-  local h o since st site
+  echo "== standby: put the holder's cluster in standby; the workload moves through the handover, and stays moved"
+  local h o since st site tr up
   h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
   # The scaler restarts in standby; its predecessor releases on the way out.
+  # A standby pod pauses the ScaledObject at zero, waits for the workload's
+  # pods to go and yields, and the other site takes over from the yield
+  # rather than after the takeover delay.
   STANDBY=true ./deploy.sh "$h" >/dev/null
   [[ $(status_get "$h" 'r["standby"]') == True ]] || fail "the scaler of ${h} is not in standby" || return
-  echo "   ${h} -> ${o}: $(transition "$h" "$o" "$TAKEOVER") (takeover delay ${TAKEOVER_DELAY}s)"
+  tr=$(transition "$h" "$o" "$TAKEOVER") || return
+  echo "   ${h} -> ${o}: ${tr} after the rollout (takeover delay ${TAKEOVER_DELAY}s)"
+  up=$(sed -E 's/.*up=([0-9.]+)s.*/\1/' <<<"$tr")
+  python3 -c "import sys; sys.exit(0 if $up < $TAKEOVER_DELAY - 10 else 1)" \
+    || fail "${o} came up ${up}s after the rollout: it waited for the takeover delay, not the yield" || return
+  # The other site holds the latest term: the pause is lifted.
+  wait_unpaused "$h" || return
   st=$(lease_status) || fail "status command failed" || return
   echo "   status: ${st}"
   site=$(python3 -c 'import sys, json; r = json.loads(sys.argv[1]); print(r["site"] if r["held"] else "")' "$st")
@@ -472,8 +497,69 @@ scenario_standby() {
   echo "   ok: ${o} holds, ${h} back out of standby and idle"
 }
 
+# finalizer <cluster> add|remove holds the workload's pods in Terminating
+# once deleted, or lets them go.
+finalizer() {
+  local cluster=$1 patch pod
+  case "$2" in
+    add) patch='{"metadata":{"finalizers":["kfklease-e2e/hold"]}}' ;;
+    remove) patch='{"metadata":{"finalizers":null}}' ;;
+  esac
+  for pod in $(kc "$cluster" -n "$NS" get pods -l app=singleton -o name); do
+    kc "$cluster" -n "$NS" patch "$pod" --type=merge -p "$patch" >/dev/null
+  done
+}
+
+# pods_left <cluster> prints the number of workload pods, terminating ones
+# included.
+pods_left() {
+  kc "$1" -n "$NS" get pods -l app=singleton -o name | wc -l
+}
+
+scenario_handover_crash() {
+  echo "== handover-crash: kill the scalers between the pause and the yield; the handover resumes and leaves no pause behind"
+  local h o since t0 t
+  h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
+  # A finalizer keeps the workload's pod in Terminating: the handover
+  # paused the ScaledObject and waits for the pod, and no yield goes out.
+  finalizer "$h" add
+  # Not waiting for the rollout: the handover starts when its last old pod
+  # releases, and the scalers go down right after the pause.
+  STANDBY=true WAIT=false ./deploy.sh "$h" >/dev/null
+  t0=$(date +%s)
+  until [[ $(paused "$h") == 0 ]]; do
+    (( $(date +%s) - t0 < 2 * TTL )) || fail "${h} did not pause its ScaledObject" || return
+    sleep 1
+  done
+  until [[ $(running "$h") == 0 ]]; do
+    (( $(date +%s) - t0 < 2 * TTL )) || fail "${h} did not stop its workload" || return
+    sleep 1
+  done
+  (( $(pods_left "$h") > 0 )) || fail "the finalizer did not hold the pod" || return
+  echo "   ${h} paused and its pod is terminating; killing its scaler pods"
+  kc "$h" -n "$NS" delete pod -l app.kubernetes.io/name=kfklease --grace-period=0 --force >/dev/null 2>&1
+  kc "$h" -n "$NS" rollout status "deploy/$RELEASE" --timeout=120s >/dev/null
+  # A pod that still terminates is a pod that may still run: no yield, so
+  # the other site does not start.
+  for _ in 1 2 3 4 5; do
+    [[ $(running "$o") == 0 ]] || fail "${o} started while ${h}'s pod was still terminating" || return
+    sleep 1
+  done
+  [[ $(paused "$h") == 0 ]] || fail "the restarted scalers lifted the pause during the handover" || return
+  finalizer "$h" remove
+  t0=$(date +%s)
+  t=$(wait_running "$o" "$want" "$TAKEOVER") || return
+  echo "   ${o} took over ${t}s after ${h}'s last pod went, $(( t0 - $(date -d "$since" +%s) ))s after the standby began (takeover delay ${TAKEOVER_DELAY}s)"
+  wait_unpaused "$h" || return
+  watch_exclusive $(( 2 * TTL ))
+  ./deploy.sh "$h" >/dev/null
+  [[ -z $(paused "$h") && $(holder) == "$o" ]] || fail "${h} out of standby: paused '$(paused "$h")', holder $(holder)" || return
+  heartbeats "$since"
+  echo "   ok: the restarted scalers finished the handover, no pause left"
+}
+
 if (( $# == 0 )); then
-  set -- coldstart restart holder-pod bad-image crash partition pause broker replicas scaler-down standby
+  set -- coldstart restart holder-pod bad-image crash partition pause broker replicas scaler-down standby handover-crash
 fi
 for s in "$@"; do
   "scenario_${s//-/_}"
