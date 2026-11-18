@@ -56,8 +56,13 @@ helm_template --namespace "$NS" \
   --set scaledObject.replicas="${REPLICAS:-1}" --set standby="${STANDBY:-false}" --set logLevel=debug \
   "${auth[@]}" \
   | kc "$cluster" -n "$NS" apply -f - >/dev/null
-# shellcheck disable=SC2016 # the literal is the variable name for envsubst
-CLUSTER="$cluster" envsubst '$CLUSTER' < manifests/singleton.yaml | kc "$cluster" -n "$NS" apply -f - >/dev/null
+# The workload once: its manifest says replicas 0, and KEDA owns the count
+# from then on. Applying it again would scale a running workload to zero and
+# start a new pod, which a redeploy of the chart must not do.
+if ! kc "$cluster" -n "$NS" get deploy singleton >/dev/null 2>&1; then
+  # shellcheck disable=SC2016 # the literal is the variable name for envsubst
+  CLUSTER="$cluster" envsubst '$CLUSTER' < manifests/singleton.yaml | kc "$cluster" -n "$NS" apply -f - >/dev/null
+fi
 if [[ ${WAIT:-true} == true ]]; then
   kc "$cluster" -n "$NS" rollout status "deploy/$RELEASE" --timeout=120s >/dev/null
 fi
