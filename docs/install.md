@@ -49,7 +49,7 @@ One Helm release per cluster, the same lease everywhere, a different
 `site` in each cluster:
 
 ```bash
-helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.4.0 \
+helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.5.0 \
   -n kfklease --create-namespace \
   --set brokers=kafka-1:9092,kafka-2:9092 \
   --set topic=orders-singleton \
@@ -81,19 +81,18 @@ helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.4.0 \
 | `podSecurityContext`, `securityContext` | the pod's and the container's, empty by default. The image runs as nonroot and writes nothing, so the restricted Pod Security Standard fits; `values.yaml` has an example |
 | `affinity` | empty by default, which spreads the scaler pods over nodes with a preferred anti-affinity; anything set replaces that |
 
-Upgrading from 0.3.0: `holderPrefix` is replaced by `site`, which is
-required, and `scaledObject.target` is renamed to
-`scaledObject.targetRef.name`; a release that still sets an old value
-fails to render with a message that names the new one. `cooldownPeriod`
-is 60 s where it was 0, and a failover to another cluster waits
-`takeoverDelay` (95 s by default) after the old term ends. A new topic gets
-three replicas where it used to get the broker's
-`default.replication.factor`: on a Kafka cluster with fewer than three
-brokers, set `replicationFactor` to the number of brokers. The scaler runs
-two pods per cluster where it ran one, rolled one at a time
-(`RollingUpdate`) where it was recreated, with a PodDisruptionBudget;
-`replicaCount: 1` keeps one pod, which a drain or an upgrade then takes
-away before its successor is up.
+Upgrading from 0.4.0: no value of the chart changes, and the lease topic
+stays as it is. Upgrade every cluster: the fixes are in what a scaler
+writes, and a scaler of 0.4.0 can still leave the records in the log that
+mislead a reader; the two versions take part in one lease in the meantime.
+Three things behave differently. A boolean `KFKLEASE_*` variable set in a
+manifest of your own must be `true` or `false` (or what `strconv.ParseBool`
+reads): any other value, an empty one included, stops the scaler where it
+was read as false. A scaler whose lease topic is deleted and created again
+exits and restarts where it stayed up and held nothing. And with a
+`takeoverDelay` set below the TTL, another cluster takes a released lease
+over only when the old term would have run out, not `takeoverDelay` after
+the release.
 
 The workload itself is yours, in the same namespace. Its
 replica count belongs to KEDA from now on, so leave `replicas` out or set
