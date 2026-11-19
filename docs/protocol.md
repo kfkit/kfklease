@@ -401,13 +401,15 @@ A sixth run adds the handover. Each site has a workload that runs while
 one of its nodes says the site holds and for 1.5 TTLs after, and a pause
 that takes it down within a TTL, now and then within six TTLs. Sites switch
 in and out of standby node by node, about a TTL apart, as a rolling update
-does; a node in standby with a handover pauses the workload and asks for
-the yield once it is down; a pause is lifted when a node starts to say its
-site holds, or when another site holds the latest term. Yields get lost
+does. Each node runs `lease.HandoverDriver`, the decisions the scaler's
+handover carries out against KEDA: a node in standby with a handover pauses
+the workload and asks for the yield once it is down; a pause is lifted when
+a node starts to say its site holds, or when another site holds the latest
+term. Yields get lost
 and land late like any record, and nodes write bogus yields: for a term of
 another site, for their own term while they hold it, for a term that is not
 the latest. The workloads of two sites never run at once, the beliefs keep
-the properties above, and in 100 runs about 300 yields bring about 60
+the properties above, and in 100 runs about 500 yields bring about 90
 takeovers within the delay, the fastest 0.2 s after the term's end.
 `agent_test.go` pins rules 11 and 12 down: a yield after a release, after
 an expiry, later than the natural end; yields by another site, by the
@@ -430,9 +432,11 @@ in standby, a term kept in standby or a claim in flight believed in
 standby; for the handover: the site, epoch and ended checks on a yield, the
 natural-end bound, forgetting the term on an uncertain view, a handover out
 of standby, a yield asked for before the workload is down, lifting the
-pause for as long as a site belief lasts rather than when it starts, the
-last one in `scaler/handover_test.go`) fails
-at least one of these tests; that was checked by mutation, by hand.
+pause for as long as a site belief lasts rather than when it starts, not
+lifting a pause a previous process left, taking a term whose holder is
+unknown for another site's, the last four in `lease/handover_test.go` and
+`scaler/handover_test.go`; a field written for a kind that does not carry
+it) fails at least one of these tests; that was checked by mutation, by hand.
 
 ## The client
 

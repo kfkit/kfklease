@@ -65,6 +65,11 @@ and this project adheres to
 
 - `View.AllowSkew`: how far apart two partition leaders' clocks may be.
   Participants pass their margin.
+- Library: `lease.HandoverDriver`, the decisions of the handover without
+  the I/O (when to pause, when to ask for the yield, when to lift the
+  pause), which `scaler.Handover` now carries out; `lease.State.LastSite`;
+  `scaler.LogLease`, the lease as the log says, shared by
+  `kfklease-scaler status` and the metrics.
 - Docs: "When the partition leader dies" in docs/install.md: what a hard
   failure of the lease partition's leader costs at the default TTL (the
   term and its epoch, not the workload), measured, and the two ways to

@@ -13,6 +13,7 @@ runs a workload in one cluster at a time. The map:
 |---|---|---|
 | `lease/view.go` | the fold: log records in, lease state out. Pure | nothing |
 | `lease/agent.go` | the writer rules: when to claim, renew, release, believe. Pure, takes the clock as an argument | view |
+| `lease/handover.go` | the handover driver's decisions: when to pause a site's workload, ask for the yield, lift the pause. Pure; the scaler carries them out, the simulation drives the same code | nothing |
 | `lease/candidate.go` | the Kafka client around the agent, and `Config`, `Status`, `Auth` | franz-go |
 | `lease/auth.go` | TLS, mTLS, SASL | franz-go |
 | `scaler/` | KEDA external-push gRPC server, HTTP `/metrics` and `/status`, the workload probe of the health gate | lease |
