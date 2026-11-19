@@ -250,21 +250,365 @@ func TestAgentHoleMakesViewUncertain(t *testing.T) {
 	h.wantSilent(at(3))
 }
 
-func TestAgentReleaseDropsBeliefFirst(t *testing.T) {
+// A stop: the belief goes first, the release second, and nothing is claimed
+// afterwards.
+func TestAgentStopDropsBeliefFirstThenReleases(t *testing.T) {
 	h := newHarness(t, 0)
 	epoch := h.acquire(at(0))
-	rec, ok := h.a.release(at(1))
-	if !ok || rec.Kind != Release || rec.Epoch != epoch {
-		t.Fatalf("release = (%+v, %v)", rec, ok)
-	}
+	h.a.stop(at(1))
 	h.wantBelief(at(1), false)
-	if _, ok := h.a.release(at(1)); ok {
-		t.Fatal("released twice")
+	if h.a.stopDone(at(1)) {
+		t.Fatal("done before the release was written")
 	}
-	// Not believing: the next tick claims again once the log says free.
-	h.land(at(1.1), rec)
+	rec := h.wantSend(at(1), Release)
+	if rec.Epoch != epoch {
+		t.Fatalf("released epoch %d, want %d", rec.Epoch, epoch)
+	}
+	if h.a.stopDone(at(1.05)) {
+		t.Fatal("done before the release was acknowledged")
+	}
+	off := h.land(at(1.1), rec)
+	if err := h.a.acked(at(1.15), off, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !h.a.stopDone(at(1.15)) {
+		t.Fatal("not done after the release was acknowledged")
+	}
+	// The log says free, and a stopping agent still claims nothing.
 	h.read(at(1.2))
-	h.wantSend(at(1.3), Claim)
+	h.wantSilent(at(1.3))
+}
+
+// Rule 2 holds for a stop too: the release waits for the renew in flight,
+// and goes out once that was read back and accepted.
+func TestAgentStopWaitsForTheRecordInFlight(t *testing.T) {
+	h := newHarness(t, 0)
+	epoch := h.acquire(at(0))
+	renew := h.wantSend(at(3), Renew)
+	h.a.stop(at(3.5))
+	h.wantBelief(at(3.5), false)
+	h.wantSilent(at(3.5))
+	if h.a.stopDone(at(3.5)) {
+		t.Fatal("done with a release owed")
+	}
+	off := h.land(at(3.6), renew)
+	if err := h.a.acked(at(3.65), off, nil); err != nil {
+		t.Fatal(err)
+	}
+	h.read(at(3.7))
+	if rec := h.wantSend(at(3.7), Release); rec.Epoch != epoch {
+		t.Fatalf("released epoch %d, want %d", rec.Epoch, epoch)
+	}
+}
+
+// A renew that is still in flight when the belief would have run out
+// leaves the stop nothing to write: the release would land behind a renew
+// nobody read back, and two such records look like an anchor to a reader
+// that starts there. The term runs out by itself.
+func TestAgentStopWritesNoReleaseBehindALateRenew(t *testing.T) {
+	h := newHarness(t, 0)
+	h.acquire(at(0)) // the belief lasts until 8, the term until 10.1
+	renew := h.wantSend(at(3), Renew)
+	h.a.stop(at(3.5))
+	h.wantSilent(at(7.9))
+	if h.a.stopDone(at(7.9)) {
+		t.Fatal("done while the release may still be written")
+	}
+	if !h.a.stopDone(at(8)) {
+		t.Fatal("not done once the belief would have run out")
+	}
+	h.wantSilent(at(8.1))
+	// The renew lands after the term ran out. Read back and rejected, it
+	// still brings no release.
+	off := h.land(at(15), renew)
+	if err := h.a.acked(at(15.05), off, nil); err != nil {
+		t.Fatal(err)
+	}
+	h.read(at(15.1))
+	h.wantSilent(at(15.2))
+}
+
+// The same for every release: standby gave the belief up with a renew in
+// flight, the renew landed after the term ran out and was rejected, and no
+// release follows it.
+func TestAgentNoReleaseAfterARejectedRenew(t *testing.T) {
+	h := newHarness(t, 0)
+	h.acquire(at(0))
+	renew := h.wantSend(at(3), Renew)
+	h.a.setStandby(at(4), true)
+	h.wantBelief(at(4), false)
+	h.wantSilent(at(4.1)) // rule 2
+	off := h.land(at(12), renew)
+	if err := h.a.acked(at(12.05), off, nil); err != nil {
+		t.Fatal(err)
+	}
+	h.read(at(12.1))
+	h.wantSilent(at(12.2))
+}
+
+// A release is written only before the deadline the belief had: standby
+// gave the belief up while the view was uncertain, and by the time the
+// view is certain again the term may be over.
+func TestAgentNoReleasePastTheDeadline(t *testing.T) {
+	h := newHarness(t, 0)
+	h.acquire(at(0))
+	h.a.view.Gap()
+	h.a.setStandby(at(1), true)
+	h.wantSilent(at(1.1)) // uncertain
+	h.a.view = NewViewFromStart(agTTL)
+	h.a.nextOffset = 0
+	h.read(at(8.5)) // certain again, the term is this agent's, the deadline (8) has passed
+	h.wantSilent(at(8.6))
+}
+
+// A renew the client gave up on may still land, unread. The term is
+// sealed: no further renew and no release, so that two records of one term
+// always mean the first was read back. The belief lasts until its
+// deadline.
+func TestAgentSealsTheTermAfterARenewItGaveUpOn(t *testing.T) {
+	h := newHarness(t, 0)
+	h.acquire(at(0))
+	h.wantSend(at(3), Renew)
+	if err := h.a.acked(at(4), 0, errors.New("delivery timeout")); err != nil {
+		t.Fatal(err)
+	}
+	h.wantBelief(at(7.9), true)
+	h.wantSilent(at(7)) // no second renew
+	h.a.stop(at(7.5))
+	h.wantBelief(at(7.5), false)
+	h.wantSilent(at(7.5)) // and no release
+	if !h.a.stopDone(at(7.5)) {
+		t.Fatal("a sealed term owes no release")
+	}
+
+	// The other order: the belief given up first, the renew in flight
+	// given up on after.
+	h = newHarness(t, 0)
+	h.acquire(at(0))
+	h.wantSend(at(3), Renew)
+	h.a.setStandby(at(3.5), true)
+	if err := h.a.acked(at(4), 0, errors.New("delivery timeout")); err != nil {
+		t.Fatal(err)
+	}
+	h.wantSilent(at(4.1))
+}
+
+// landAt appends a record with a broker time of its own: a partition
+// leader whose clock is off.
+func (h *agentHarness) landAt(broker time.Time, rec Record) int64 {
+	rec.Offset = int64(len(h.log))
+	rec.Timestamp = broker.Add(h.skew)
+	h.log = append(h.log, rec)
+	return rec.Offset
+}
+
+// A release is written only for a term the log still shows as live and
+// this participant's, whatever the deadline says: a new partition leader
+// whose clock runs ahead ends a term early.
+func TestAgentNoReleaseForATermTheLogShowsOver(t *testing.T) {
+	t.Run("the renew in flight was rejected", func(t *testing.T) {
+		h := newHarness(t, 0)
+		h.acquire(at(0)) // the term runs until 10.1 by the broker
+		renew := h.wantSend(at(3), Renew)
+		h.a.setStandby(at(3.5), true)
+		// It lands at 3.6 on a leader that says 11.6.
+		off := h.landAt(at(11.6), renew)
+		if err := h.a.acked(at(3.65), off, nil); err != nil {
+			t.Fatal(err)
+		}
+		h.read(at(3.7))
+		h.wantSilent(at(3.8)) // well before the deadline of 8
+	})
+	t.Run("another holds", func(t *testing.T) {
+		h := newHarness(t, 0)
+		h.acquire(at(0))
+		h.a.view.Gap() // the belief is given up on a view that is not certain
+		h.a.setStandby(at(1), true)
+		h.wantSilent(at(1.1))
+		h.a.view, h.a.nextOffset = NewViewFromStart(agTTL), 0
+		// On a leader that says 11, another participant's claim is
+		// accepted at 2.
+		h.landAt(at(11), Record{Kind: Claim, Holder: "other", TTL: agTTL})
+		h.read(at(2.1))
+		h.wantSilent(at(2.2))
+	})
+}
+
+// A stop with a claim in flight waits for it: accepted, the term is
+// released at once and never believed.
+func TestAgentStopReleasesAClaimInFlight(t *testing.T) {
+	h := newHarness(t, 0)
+	claim := h.wantSend(at(0), Claim)
+	h.a.stop(at(0.05))
+	if h.a.stopDone(at(0.05)) {
+		t.Fatal("done with a claim in flight")
+	}
+	off := h.land(at(0.1), claim)
+	if err := h.a.acked(at(0.15), off, nil); err != nil {
+		t.Fatal(err)
+	}
+	h.read(at(0.2))
+	h.wantBelief(at(0.2), false)
+	if rec := h.wantSend(at(0.2), Release); rec.Epoch != off {
+		t.Fatalf("released epoch %d, want %d", rec.Epoch, off)
+	}
+}
+
+// A participant claims only when it has read the log up to its end: before
+// that it knows an old state of the lease, or none.
+func TestAgentClaimsOnlyWhenCaughtUp(t *testing.T) {
+	t.Run("nothing read yet", func(t *testing.T) {
+		// A compacted topic starts at offset 0 whatever was removed, so the
+		// view is certain from the start: of a lease that is free.
+		h := newSiteHarness(t, 0, 30*time.Second)
+		h.a.highWater = 5000
+		h.wantSilent(at(0.9))
+	})
+	t.Run("replaying", func(t *testing.T) {
+		// Its own site released long ago; a thousand records follow.
+		h := newSiteHarness(t, 0, 30*time.Second)
+		off := h.land(at(0), Record{Kind: Claim, Holder: "eu/old", TTL: agTTL})
+		h.land(at(1), Record{Kind: Release, Holder: "eu/old", Epoch: off, TTL: agTTL})
+		h.read(at(100))
+		h.a.fetched(at(100), 1002)
+		h.wantSilent(at(100.1))
+	})
+	t.Run("caught up", func(t *testing.T) {
+		h := newSiteHarness(t, 0, 30*time.Second)
+		off := h.land(at(0), Record{Kind: Claim, Holder: "eu/old", TTL: agTTL})
+		h.land(at(1), Record{Kind: Release, Holder: "eu/old", Epoch: off, TTL: agTTL})
+		h.read(at(100))
+		h.wantSend(at(100.1), Claim)
+	})
+}
+
+// A release ends the term in the log, but a replica of the holder's site
+// that read the last renewal and missed the release answers "my site
+// holds" until the term's natural end. Another site waits that out,
+// however short its takeover delay.
+func TestAgentTakeoverWaitsOutAReleasedTermsNaturalEnd(t *testing.T) {
+	const delay = 3 * time.Second // shorter than the ttl
+	sibling := newSiteHarness(t, 0, delay)
+	other := newSiteHarness(t, 0, delay)
+	other.a.cfg.Site, other.a.cfg.Holder = "us", "us/them"
+	for _, h := range []*agentHarness{sibling, other} {
+		h.land(at(0), Record{Kind: Claim, Holder: "eu/holder", TTL: agTTL})
+		h.read(at(0.1))
+		h.tick(at(0.1))
+		h.land(at(3), Record{Kind: Renew, Holder: "eu/holder", Epoch: 0, TTL: agTTL}) // the term runs until 13
+		h.tick(at(2.9))
+		h.read(at(3.1))
+		h.tick(at(3.1))
+	}
+	// The holder releases at 4. The sibling is cut off and never reads it.
+	other.land(at(4), Record{Kind: Release, Holder: "eu/holder", Epoch: 0, TTL: agTTL})
+	other.read(at(4.1))
+	if !sibling.a.siteHolding(at(10.9)) {
+		t.Fatal("the sibling does not answer for its site")
+	}
+	// 4 + delay has long passed; the sibling answers until 11.1 (the read
+	// at 3.1, the term's 10 s, less the margin).
+	for s := 7.1; s < 14.4; s += 0.5 {
+		other.wantSilent(at(s))
+		if sibling.a.siteHolding(at(s)) && s > 13 {
+			t.Fatalf("at %vs the sibling still answers", s)
+		}
+	}
+	// 13 (the natural end) plus two poll intervals of 0.75 s.
+	other.wantSend(at(14.7), Claim)
+}
+
+// A gap of a TTL between two records proves the lease free only on top of
+// what the brokers' clocks may be apart: the record before the gap may
+// carry the time of a leader running behind.
+func TestViewSilenceAllowsForBrokerSkew(t *testing.T) {
+	sec := func(s float64) time.Time { return t0.Add(time.Duration(s * float64(time.Second))) }
+	// The whole log: a holds from 0 and renews at 9.5 on a leader whose
+	// clock runs 1 s ahead of the next one's.
+	log := []Record{
+		{Offset: 0, Timestamp: sec(0), Kind: Claim, Holder: "a", TTL: testTTL},
+		{Offset: 1, Timestamp: sec(9.5), Kind: Renew, Holder: "a", Epoch: 0, TTL: testTTL},
+		{Offset: 2, Timestamp: sec(8.6), Kind: Claim, Holder: "b", TTL: testTTL}, // rejected; 9.6 by the old leader
+		{Offset: 3, Timestamp: sec(18.7), Kind: Renew, Holder: "a", Epoch: 0, TTL: testTTL},
+	}
+	full := NewViewFromStart(testTTL)
+	for _, r := range log {
+		if _, err := full.Apply(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if s := full.State(); s.Holder != "a" || !s.HeldAt(full.Clock()) {
+		t.Fatalf("full history: %+v, want a holding", s)
+	}
+	for _, tc := range []struct {
+		skew time.Duration
+		free bool
+	}{{0, true}, {time.Second, false}} {
+		late := NewView(testTTL)
+		late.AllowSkew(tc.skew)
+		for _, r := range log[2:] {
+			if _, err := late.Apply(r); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if free := late.Certain() && late.State().Holder == ""; free != tc.free {
+			t.Fatalf("skew %v: reader from offset 2 calls the lease free = %v, want %v", tc.skew, free, tc.free)
+		}
+	}
+}
+
+// The log this participant follows was replaced by another: the topic was
+// deleted and created again, or acknowledged records were lost.
+func TestAgentNoticesAReplacedLog(t *testing.T) {
+	value := func(r Record) []byte {
+		t.Helper()
+		v, err := EncodeValue(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	t.Run("a newer record at an offset already passed", func(t *testing.T) {
+		h := newHarness(t, 0)
+		h.acquire(at(0))
+		for i := 1; i <= 3; i++ {
+			h.renewAt(float64(3 * i))
+		}
+		rec := value(Record{Kind: Claim, Holder: "other", TTL: agTTL})
+		if err := h.a.record(at(20), 0, at(20).Add(h.skew), rec); !errors.Is(err, ErrLogReplaced) {
+			t.Fatalf("record at offset 0 with a later timestamp: %v, want ErrLogReplaced", err)
+		}
+	})
+	t.Run("a record read twice", func(t *testing.T) {
+		h := newHarness(t, 0)
+		h.acquire(at(0))
+		first := h.log[0]
+		if err := h.a.record(at(1), first.Offset, first.Timestamp, value(first)); err != nil {
+			t.Fatalf("duplicate: %v", err)
+		}
+		h.wantBelief(at(1), true)
+	})
+	t.Run("an own record acknowledged where another was read", func(t *testing.T) {
+		h := newHarness(t, 0)
+		h.acquire(at(0))
+		h.renewAt(3)
+		h.wantSend(at(6), Renew)
+		// The new log is empty: the renew lands at offset 0.
+		if err := h.a.acked(at(6.1), 0, nil); !errors.Is(err, ErrLogReplaced) {
+			t.Fatalf("acknowledged at offset 0, read up to %d: %v, want ErrLogReplaced", h.a.nextOffset, err)
+		}
+	})
+	t.Run("read back before the acknowledgement", func(t *testing.T) {
+		h := newHarness(t, 0)
+		h.acquire(at(0))
+		rec := h.wantSend(at(3), Renew)
+		off := h.land(at(3.1), rec)
+		h.read(at(3.2))
+		if err := h.a.acked(at(3.3), off, nil); err != nil {
+			t.Fatalf("the usual race: %v", err)
+		}
+		h.wantBelief(at(10.9), true)
+	})
 }
 
 func TestAgentBacksOffAfterRejectedClaim(t *testing.T) {
@@ -425,11 +769,12 @@ func TestAgentTakeoverDelay(t *testing.T) {
 		{"another site's term expired", 0, func(h *agentHarness) { claim(h, 0, "us/x"); claim(h, 1, "us/y") }, 40.1, 40.3},
 		{"the own site's term expired", 0, func(h *agentHarness) { claim(h, 0, "eu/old"); claim(h, 1, "us/y") }, 10.1, 10.3},
 		// Nothing was read for a ttl plus margin after the renew at 1: the
-		// unknown term ended by 11 at the latest.
+		// unknown term ended by 13 at the latest, a ttl after the renew and
+		// the margin for the brokers' clocks on top.
 		{"unknown holder, settled by silence", 1, func(h *agentHarness) {
 			claim(h, 0, "eu/old")
 			h.land(at(1), Record{Kind: Renew, Holder: "eu/old", Epoch: 0, TTL: agTTL})
-		}, 41.1, 41.3},
+		}, 43.1, 43.3},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -532,13 +877,17 @@ func TestAgentTakesOverOnlyWhenCaughtUp(t *testing.T) {
 	h.wantSilent(at(31.3))
 	h.read(at(31.4))
 	h.wantSilent(at(31.5))
-	// The own site is not held to it.
+	// The own site waits for the record too: it may be a new term of
+	// anyone. Here it is a renew of the term that was released, rejected.
 	h = newSiteHarness(t, 0, 30*time.Second)
 	h.land(at(0), Record{Kind: Claim, Holder: "eu/x", TTL: agTTL})
 	h.land(at(1), Record{Kind: Release, Holder: "eu/x", Epoch: 0})
 	h.read(at(1.2))
 	h.a.fetched(at(1.3), int64(len(h.log))+1)
-	h.wantSend(at(1.3), Claim)
+	h.wantSilent(at(1.3))
+	h.land(at(1.31), Record{Kind: Renew, Holder: "eu/x", Epoch: 0, TTL: agTTL})
+	h.read(at(1.4))
+	h.wantSend(at(1.4), Claim)
 }
 
 func TestAgentStandbyNeverClaims(t *testing.T) {
@@ -872,16 +1221,16 @@ func TestAgentYield(t *testing.T) {
 
 	// A yield read on a view that is not certain does not count: the
 	// claim that started the term is gone, so the view settles by silence
-	// (at 2.2 + ttl + margin), on a term that ended by 1 + ttl at the
-	// latest, and the delay counts from there.
+	// (at 2.2 + ttl + margin), on a term that ended by 1 + ttl + margin at
+	// the latest, and the delay counts from there.
 	h = newSiteHarness(t, 1, delay)
 	h.land(at(0), rec(Claim, "us/x", 0))
 	h.land(at(1), rec(Release, "us/x", 0))
 	h.land(at(2), rec(Yield, "us/x", 0))
 	h.read(at(2.2))
 	h.wantSilent(at(14.3))
-	h.wantSilent(at(41.1))
-	h.wantSend(at(41.3), Claim)
+	h.wantSilent(at(43.1))
+	h.wantSend(at(43.3), Claim)
 }
 
 // The handover on the side that yields: in standby, once its site's term

@@ -5,9 +5,18 @@ package lease
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 )
+
+// ErrLogReplaced means the log this participant follows is not the one it
+// read before: an offset it has passed now holds another record. The topic
+// was deleted and created again, or the partition lost acknowledged
+// records. Nothing the participant knows can be trusted; Run returns the
+// error and a new process starts over from the log as it is.
+var ErrLogReplaced = errors.New("lease: the log was replaced or truncated")
 
 // agent is the decision core of a participant: the writer rules from
 // docs/protocol.md on top of a View. It does no I/O and reads no clock. The
@@ -45,14 +54,26 @@ type agent struct {
 	// site's current run of terms began, as far as this participant saw
 	// it, lastSiteHeld the last tick at which the site held, and
 	// lastHealthy the last time the workload was reported healthy.
-	// cooldownUntil holds claims back after the gate tripped; releaseDue is
-	// the release it owes, or one owed by standby or an early claim,
-	// waiting for its turn under the one-request-in-flight rule.
+	// cooldownUntil holds claims back after the gate tripped.
 	heldSince     time.Time
 	lastSiteHeld  time.Time
 	lastHealthy   time.Time
 	cooldownUntil time.Time
-	releaseDue    bool
+
+	// releaseBy is set while the term epoch is owed a release: the belief
+	// was given up (the health gate, standby, a stop, a claim that must not
+	// be kept) and the record waits for its turn under the
+	// one-request-in-flight rule. It is the deadline that belief had: past
+	// it nothing is written for the term, as for a renew. Zero for none.
+	releaseBy time.Time
+	// sealed: a record of the term epoch was given up on and may still
+	// land, unread. Nothing more is written for the term, so that two
+	// records of one term in the log always mean the writer read the first
+	// one back; the belief lasts until its deadline.
+	sealed bool
+	// stopping: the participant was told to stop. It claims nothing, and
+	// what is left to do is the release it owes, see stop.
+	stopping bool
 
 	// ready is set once the view has been certain with the log read up to
 	// its end offset: from then on the agent knows who holds the lease, or
@@ -88,6 +109,9 @@ type agent struct {
 	// lastRecordAt is paired with the broker time of that record, to
 	// estimate the broker's clock between records.
 	lastRecordBroker time.Time
+	// maxBroker is the latest broker time of any record read, for telling a
+	// record seen twice from another record at an offset already passed.
+	maxBroker time.Time
 }
 
 // verdict is the fold's outcome of an own record, and for an accepted
@@ -139,6 +163,9 @@ func newAgent(cfg Config, log *slog.Logger, start, end int64, now time.Time) *ag
 		a.view = NewViewFromStart(cfg.TTL)
 		a.noteReady()
 	}
+	// The margin covers the skew between the brokers' clocks, among other
+	// things; see docs/protocol.md.
+	a.view.AllowSkew(cfg.Margin)
 	return a
 }
 
@@ -171,20 +198,31 @@ func (a *agent) fetched(now time.Time, highWater int64) {
 	a.noteReady()
 }
 
+// caughtUp reports whether every record up to the log's end offset, as last
+// reported, was read.
+func (a *agent) caughtUp() bool { return a.nextOffset >= a.highWater }
+
 // noteReady sets ready once the view is certain and has caught up with the
 // log. A view of the whole history is certain before it has read a single
 // record, and knows nothing yet.
 func (a *agent) noteReady() {
-	a.ready = a.ready || (a.view.Certain() && a.nextOffset >= a.highWater)
+	a.ready = a.ready || (a.view.Certain() && a.caughtUp())
 }
 
 // record applies the next record of the log: its offset, its broker
 // timestamp and its value. Duplicates are skipped, holes make the view
-// uncertain, and an undecodable value is logged and ignored.
+// uncertain, and an undecodable value is logged and ignored. A record at an
+// offset already passed that is newer than everything read so far is not a
+// duplicate: the log was replaced (ErrLogReplaced).
 func (a *agent) record(now time.Time, offset int64, ts time.Time, value []byte) error {
 	if offset < a.nextOffset {
+		if ts.After(a.maxBroker) {
+			return fmt.Errorf("%w: offset %d, read up to %d before, holds a record of %v, later than any read (%v)",
+				ErrLogReplaced, offset, a.nextOffset, ts, a.maxBroker)
+		}
 		return nil
 	}
+	a.maxBroker = later(a.maxBroker, ts)
 	if offset > a.nextOffset {
 		a.log.Warn("hole in the log", "expected", a.nextOffset, "got", offset)
 		a.view.Gap()
@@ -354,24 +392,35 @@ func (a *agent) ownRecord(now time.Time, offset int64, kind Kind, v verdict) {
 }
 
 // acked reports the broker's answer to the record in flight: its offset,
-// or an error when it did not land within the delivery timeout.
-func (a *agent) acked(now time.Time, offset int64, err error) {
+// or an error when the client gave up on it. A record given up on may
+// still land; see sealed. An offset already passed at which this record
+// was not read means the log was replaced (ErrLogReplaced).
+func (a *agent) acked(now time.Time, offset int64, err error) error {
 	in := a.inflight
 	if in == nil {
-		return
+		return nil
 	}
 	if err != nil {
 		a.log.Warn("produce failed", "kind", in.kind, "err", err)
 		a.inflight = nil
-		if in.kind == Claim {
+		switch in.kind {
+		case Claim:
 			a.nextClaimAt = now.Add(a.cfg.RenewEvery)
+		case Renew:
+			a.sealed = true
 		}
-		return
+		return nil
 	}
 	in.offset = offset
 	if v, ok := a.ownOutcomes[offset]; ok {
 		a.settle(now, v)
+		return nil
 	}
+	if offset < a.nextOffset {
+		return fmt.Errorf("%w: own %v acknowledged at offset %d, read up to %d before, and the record read there was another",
+			ErrLogReplaced, in.kind, offset, a.nextOffset)
+	}
+	return nil
 }
 
 // settle applies the fold's verdict on the record in flight to the belief.
@@ -389,17 +438,18 @@ func (a *agent) settle(now time.Time, v verdict) {
 		// Another site held a short term while the claim was on its way,
 		// and its workload may still run. The term is ours in the log, so
 		// end it at once rather than let it block everyone for a TTL.
-		a.epoch = in.offset
-		a.releaseDue = true
+		a.newTerm(in)
+		a.releaseBy = a.beliefFrom(in.sentAt)
 		a.log.Warn("claim landed within the takeover delay after another site's term, releasing", "epoch", in.offset)
-	case in.kind == Claim && out == Accepted && a.standby:
-		// Sent before standby was switched on. Never believed, so that
-		// nothing reports holding for a moment; released at once.
-		a.epoch = in.offset
-		a.releaseDue = true
-		a.log.Info("claim landed in standby, releasing", "epoch", in.offset)
+	case in.kind == Claim && out == Accepted && (a.standby || a.stopping):
+		// Sent before standby was switched on, or before the stop. Never
+		// believed, so that nothing reports holding for a moment; released
+		// at once.
+		a.newTerm(in)
+		a.releaseBy = a.beliefFrom(in.sentAt)
+		a.log.Info("claim landed in standby or after the stop, releasing", "epoch", in.offset)
 	case in.kind == Claim && out == Accepted:
-		a.epoch = in.offset
+		a.newTerm(in)
 		a.extendBelief(in.sentAt)
 		a.siteStarted(now)
 		a.log.Info("acquired", "epoch", a.epoch)
@@ -409,8 +459,13 @@ func (a *agent) settle(now time.Time, v verdict) {
 		a.nextClaimAt = now.Add(wait)
 		a.log.Debug("claim rejected", "log_holder", s.Holder, "log_epoch", s.Epoch, "retry_in", wait)
 	case in.kind == Renew && out == Accepted:
-		if a.believing(now) {
+		switch {
+		case a.believing(now):
 			a.extendBelief(in.sentAt)
+		case !a.releaseBy.IsZero():
+			// The belief was given up while the renew was on its way; the
+			// renew extended the term, and the release it is owed with it.
+			a.releaseBy = a.beliefFrom(in.sentAt)
 		}
 	case in.kind == Renew:
 		a.log.Warn("renew rejected", "epoch", a.epoch)
@@ -418,13 +473,45 @@ func (a *agent) settle(now time.Time, v verdict) {
 	}
 }
 
+// newTerm notes that the claim in flight started a term of this
+// participant.
+func (a *agent) newTerm(in *inflight) {
+	a.epoch = in.offset
+	a.sealed = false
+}
+
 func (a *agent) believing(now time.Time) bool { return now.Before(a.deadline) }
 
-// extendBelief sets the deadline from the send time of an accepted record:
-// the record landed after it was sent, so the term in the log outlives the
-// belief by at least the margin.
+// beliefFrom is the deadline of a belief that rests on an accepted record
+// sent at sentAt: the record landed after it was sent, so the term in the
+// log outlives the belief by at least the margin.
+func (a *agent) beliefFrom(sentAt time.Time) time.Time {
+	return sentAt.Add(a.cfg.TTL - a.cfg.Margin)
+}
+
 func (a *agent) extendBelief(sentAt time.Time) {
-	a.deadline = sentAt.Add(a.cfg.TTL - a.cfg.Margin)
+	a.deadline = a.beliefFrom(sentAt)
+}
+
+// giveUp ends the belief at once and owes its term a release: the record
+// lets the others take over without waiting for the term to run out. tick
+// writes it when rule 2 lets it, if it still may; see mayRelease.
+func (a *agent) giveUp() {
+	a.releaseBy = a.deadline
+	a.dropBelief()
+}
+
+// mayRelease reports whether the release owed until by may be written at
+// now. Like a renew it goes out only before the deadline of the belief it
+// follows, and only for a term the log shows as this participant's and
+// live as of the last record read, with no record of the term given up on
+// (sealed). So a release always follows a record of its term that its
+// writer read back and found accepted, which is what the readers' anchor
+// rule takes two records of one term to mean.
+func (a *agent) mayRelease(now, by time.Time) bool {
+	s := a.view.State()
+	return now.Before(by) && !a.sealed &&
+		s.Holder == a.cfg.Holder && s.Epoch == a.epoch && s.HeldAt(a.view.Clock())
 }
 
 func (a *agent) dropBelief() {
@@ -482,8 +569,7 @@ func (a *agent) checkHealth(now time.Time) {
 		return
 	}
 	a.log.Warn("workload unhealthy, releasing", "epoch", a.epoch, "unhealthy_for", d, "cooldown", gate.Cooldown)
-	a.dropBelief()
-	a.releaseDue = true
+	a.giveUp()
 }
 
 // setStandby switches standby on or off. In standby the agent follows the
@@ -501,9 +587,40 @@ func (a *agent) setStandby(now time.Time, on bool) {
 	a.log.Info("standby on")
 	a.dropSite()
 	if a.believing(now) {
-		a.dropBelief()
-		a.releaseDue = true
+		a.giveUp()
 	}
+}
+
+// stop tells the agent that its participant is going away: it claims
+// nothing from now on, and a term it holds ends at once, the belief now
+// and the release when rule 2 lets it. The caller keeps feeding the agent
+// and sending what tick returns until stopDone.
+func (a *agent) stop(now time.Time) {
+	a.stopping = true
+	if a.believing(now) {
+		a.giveUp()
+	}
+}
+
+// stopDone reports whether a stopping agent has nothing left to wait for:
+// no release it owes and may still write, no claim in flight whose term it
+// would have to release, and no release on its way that the broker has not
+// acknowledged. A renew in flight is waited for only for the release that
+// follows it.
+func (a *agent) stopDone(now time.Time) bool {
+	if now.Before(a.releaseBy) {
+		return false
+	}
+	in := a.inflight
+	switch {
+	case in == nil:
+		return true
+	case in.kind == Release:
+		return in.offset >= 0
+	case in.kind == Claim:
+		return !now.Before(a.beliefFrom(in.sentAt))
+	}
+	return true
 }
 
 // tick measures silence, expires the belief and decides what to write. The
@@ -523,10 +640,10 @@ func (a *agent) tick(now time.Time) (Record, bool) {
 	}
 	defer func() {
 		a.lastTickAt = now
-		a.caughtUpAtTick = a.connected && a.view.Certain() && a.nextOffset >= a.highWater
+		a.caughtUpAtTick = a.connected && a.view.Certain() && a.caughtUp()
 	}()
 
-	if a.connected && a.nextOffset >= a.highWater && !a.view.Certain() {
+	if a.connected && a.caughtUp() && !a.view.Certain() {
 		since := a.caughtUpAt
 		if a.lastRecordAt.After(since) {
 			since = a.lastRecordAt
@@ -549,11 +666,14 @@ func (a *agent) tick(now time.Time) (Record, bool) {
 		return Record{}, false
 	}
 	switch {
-	case a.releaseDue:
+	case !a.releaseBy.IsZero():
 		// The belief is gone already; the record only lets the others
 		// take over without waiting for the term to run out.
-		a.releaseDue = false
-		return a.send(now, Release), true
+		by := a.releaseBy
+		a.releaseBy = time.Time{}
+		if a.mayRelease(now, by) {
+			return a.send(now, Release), true
+		}
 	case a.yieldDue >= 0:
 		due := a.yieldDue
 		a.yieldDue = -1
@@ -562,62 +682,84 @@ func (a *agent) tick(now time.Time) (Record, bool) {
 			return a.sendFor(now, Yield, epoch), true
 		}
 	case a.believing(now):
-		if now.Sub(a.lastSend) >= a.cfg.RenewEvery {
+		if !a.sealed && now.Sub(a.lastSend) >= a.cfg.RenewEvery {
 			return a.send(now, Renew), true
 		}
-	case !a.standby && now.After(a.nextClaimAt) && !now.Before(a.cooldownUntil) && a.mayClaim(now):
+	case !a.standby && !a.stopping && now.After(a.nextClaimAt) && !now.Before(a.cooldownUntil) && a.mayClaim(now):
 		return a.send(now, Claim), true
 	}
 	return Record{}, false
 }
 
-// mayClaim is the claim rule on a certain view: the lease is free by the
-// broker's clock, and the term that ended last was this participant's
-// site's or ended TakeoverDelay ago. A site's own participants take over
-// at once, so a restarted scaler keeps its site's workload; another site
-// waits until that workload has had time to stop, and only on a view that
-// has caught up with the log: a reader that is behind may have missed a new
-// term of that site. A term the view does not know the holder of (silence)
-// counts as another site's.
+// mayClaim is the claim rule on a certain view that has caught up with the
+// log: the lease is free by the broker's clock, and the term that ended
+// last was this participant's site's or ended TakeoverDelay ago. A site's
+// own participants take over at once, so a restarted scaler keeps its
+// site's workload; another site waits until that workload has had time to
+// stop. A reader that is behind knows an old state of the lease: it may
+// have missed a new term, of that site or of any other, and a view of the
+// whole history that has read nothing yet has missed all of them. A term
+// the view does not know the holder of (silence) counts as another site's.
 func (a *agent) mayClaim(now time.Time) bool {
 	s := a.view.State()
 	brokerNow := a.brokerNow(now)
-	if s.HeldAt(brokerNow) {
+	if !a.caughtUp() || s.HeldAt(brokerNow) {
 		return false
 	}
 	from := a.takeoverFrom(s)
-	return from.IsZero() || (a.nextOffset >= a.highWater && !brokerNow.Before(from))
+	return from.IsZero() || !brokerNow.Before(from)
 }
 
 // takeoverFrom is the broker time from which this participant may take the
 // lease over after the term s describes: zero, at once, after a term of its
-// own site, on a log with no term yet, or without a delay; TakeoverDelay
-// after the end of the term otherwise, or earlier with a yield, see
-// yieldFrom.
+// own site, on a log with no term yet, or without a delay; otherwise
+// TakeoverDelay after the end of the term and not while a replica of that
+// site may still answer for it (answeredUntil), or earlier with a yield,
+// see yieldFrom.
 func (a *agent) takeoverFrom(s State) time.Time {
 	if s.Expires.IsZero() || (s.Last != "" && SiteOf(s.Last) == a.cfg.Site) || a.cfg.TakeoverDelay == 0 {
 		return time.Time{}
 	}
-	from := s.Expires.Add(a.cfg.TakeoverDelay)
+	from := later(s.Expires.Add(a.cfg.TakeoverDelay), a.answeredUntil(s))
 	if y, ok := a.yieldFrom(s); ok && y.Before(from) {
 		from = y
 	}
 	return from
 }
 
+// answeredUntil is the latest broker time at which a participant of the
+// site that held the term s describes may still answer for it (followSite):
+// the term's natural end, the end its last accepted claim or renew gave it,
+// plus the two poll intervals a read may lag and still count as fresh. A
+// release ends the term earlier in the log, but a replica of that site that
+// read the last renewal and missed the release answers "my site holds"
+// until then, and two sites must not say so at once: no other site claims
+// before, whatever the takeover delay. A view that does not know the
+// natural end (it became certain on the release itself) takes the latest
+// it can be, a TTL after the release; after silence the end the view
+// knows is that latest moment already.
+func (a *agent) answeredUntil(s State) time.Time {
+	end := s.Expires
+	switch {
+	case s.Epoch < 0:
+	case a.termEnd.epoch == s.Epoch:
+		end = a.termEnd.at
+	default:
+		end = s.Expires.Add(a.cfg.TTL)
+	}
+	return end.Add(2 * a.cfg.pollEvery())
+}
+
 // yieldFrom is the end of the takeover delay after the term s describes
 // when its site has yielded it: the site's workload has stopped, so
 // another site may start its own without waiting for it. Not before the
-// yield, and not before the term would have run out unrenewed, plus the
-// two poll intervals a read may lag and still count as fresh: a replica of
-// that site that read the last renewal and missed the release answers
-// KEDA "my site holds" until then (followSite), and KEDA must not be told
-// so by both sites at once.
+// yield, and not before a replica of that site may still answer for the
+// term (answeredUntil).
 func (a *agent) yieldFrom(s State) (time.Time, bool) {
 	if s.Epoch < 0 || a.yielded.epoch != s.Epoch || a.termEnd.epoch != s.Epoch {
 		return time.Time{}, false
 	}
-	return later(a.yielded.at, a.termEnd.at.Add(2*a.cfg.pollEvery())), true
+	return later(a.yielded.at, a.answeredUntil(s)), true
 }
 
 // handover reports the term this participant's site owes the other sites a
@@ -628,7 +770,7 @@ func (a *agent) yieldFrom(s State) (time.Time, bool) {
 // now; once it has, requestYield.
 func (a *agent) handover(now time.Time) (int64, bool) {
 	s := a.view.State()
-	if !a.standby || a.cfg.TakeoverDelay == 0 || !a.ready || !a.view.Certain() || a.nextOffset < a.highWater ||
+	if !a.standby || a.cfg.TakeoverDelay == 0 || !a.ready || !a.view.Certain() || !a.caughtUp() ||
 		s.Epoch < 0 || s.Last == "" || SiteOf(s.Last) != a.cfg.Site || a.yielded.epoch == s.Epoch {
 		return -1, false
 	}
@@ -656,18 +798,6 @@ func (a *agent) sendFor(now time.Time, kind Kind, epoch int64) Record {
 	a.inflight = &inflight{kind: kind, sentAt: now, offset: -1}
 	a.lastSend = now
 	return a.newRecord(kind, epoch)
-}
-
-// release gives the lease up: the belief goes first, and the returned
-// record, if any, goes second. A release that never lands only costs the
-// others a wait of one TTL.
-func (a *agent) release(now time.Time) (Record, bool) {
-	if !a.believing(now) {
-		return Record{}, false
-	}
-	epoch := a.epoch
-	a.dropBelief()
-	return a.newRecord(Release, epoch), true
 }
 
 func (a *agent) newRecord(kind Kind, epoch int64) Record {

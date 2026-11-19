@@ -28,7 +28,8 @@ rules:
       {{- end }}
     verbs: [get, patch]
   {{- range $sos }}
-  # The target's pod selector, from its scale subresource.
+  # The replicas asked of the target and its pod selector, from its scale
+  # subresource.
   - apiGroups: [{{ include "kfklease.apiGroup" .targetRef.apiVersion | quote }}]
     resources: [{{ include "kfklease.targetResource" .targetRef }}/scale]
     resourceNames: [{{ .targetRef.name }}]

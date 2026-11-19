@@ -54,14 +54,16 @@ type Record struct {
 	// protocol.
 	Timestamp time.Time
 	Kind      Kind
-	// Holder identifies the writer. It must be unique per process
-	// incarnation, not per host.
+	// Holder identifies the writer. It must be unique among the
+	// participants alive at one time; it may repeat across restarts of a
+	// process. See Config.Holder.
 	Holder string
 	// Epoch names the term a Renew, Release or Yield refers to. Ignored for
 	// Claim.
 	Epoch int64
-	// TTL is how long the term stays live after this record. Ignored for
-	// Yield.
+	// TTL is how long the term stays live after a Claim or Renew. A
+	// Release carries it and the fold does not read it; a Yield does not
+	// carry it.
 	TTL time.Duration
 }
 
@@ -85,6 +87,8 @@ func (r Record) term() (string, int64) {
 
 const wireVersion = 1
 
+// wireRecord is the message value. Which kind carries which field is the
+// Records table of docs/protocol.md; EncodeValue is what writes it.
 type wireRecord struct {
 	Version int    `json:"v"`
 	Kind    string `json:"kind"`

@@ -39,16 +39,29 @@ clock skew between brokers.
 
 ## Records
 
-| Kind      | Fields                 | Meaning                                  |
-|-----------|------------------------|------------------------------------------|
-| `claim`   | `holder`, `ttl_ms`     | start a new term                         |
-| `renew`   | `holder`, `epoch`, `ttl_ms` | extend the term `epoch`             |
-| `release` | `holder`, `epoch`      | end the term `epoch` now                 |
-| `yield`   | `holder`, `epoch`      | the writer's site has stopped its workload after the term `epoch`; see [Handover](#handover) |
+A record's value is a JSON object. Every kind carries `v`, the version of
+the format, now 1, its `kind` and the `holder` that wrote it, and besides:
 
-`holder` is unique per process incarnation, not per host: a restarted process
-must not inherit the term of its previous life, because it has no idea when
-that term runs out.
+| Kind      | Fields            | Meaning                                  |
+|-----------|-------------------|------------------------------------------|
+| `claim`   | `ttl_ms`          | start a new term                         |
+| `renew`   | `epoch`, `ttl_ms` | extend the term `epoch`                  |
+| `release` | `epoch`, `ttl_ms` | end the term `epoch` now; the fold does not read its `ttl_ms` |
+| `yield`   | `epoch`           | the writer's site has stopped its workload after the term `epoch`; see [Handover](#handover) |
+
+A field that is zero is left out and reads back as zero: `epoch` 0 is the
+term of a claim at offset 0. This table is the wire format;
+`EncodeValue` in `lease/record.go` writes it.
+
+`holder` must be unique among the participants alive at one time. It may
+repeat when a process restarts, as the chart's `<site>/<pod name>` does
+when a container restarts in its pod. What has to hold is that a restarted
+process does not act on a term of its previous life, because it has no idea
+when that term runs out. Writer rule 3 below gives that: a belief starts
+only from a claim the process sent in this life and read back, matched by
+the offset the broker acknowledged, and it is kept in memory only. A term
+under its own id that it did not claim in this life is to it a term like
+any other: it waits for it to end.
 
 The TTL is a property of the lease, identical for all participants. Records
 asking for more than the lease TTL are rejected by everyone.
@@ -75,12 +88,18 @@ the last record it saw plus a TTL.
 
 Using the claim's offset as the epoch makes it a fencing token that is unique,
 grows with every term, and is known to anyone who sees the record, without
-any history. (Deleting and recreating the topic resets it. Don't.)
+any history. (Deleting and recreating the topic resets it. Don't. The
+participants notice and stop; see [The client](#the-client).)
 
 ## Writer rules
 
-1. Act only on a *certain* view of the log (see below).
-2. One produce request in flight at a time.
+1. Act only on a *certain* view of the log (see below), and claim only on
+   one that has read the log up to its end offset: a reader that is behind
+   knows an old state of the lease, and one that has read nothing yet knows
+   none.
+2. One produce request in flight at a time. A record the client gave up on
+   (a delivery timeout) may still land, unread: its term gets no further
+   record, and the belief in it lasts until its deadline.
 3. The belief "I hold the lease" starts and is extended only when the
    writer's own fold accepts its own record, read back from the log.
 4. The local deadline of that belief is `send time + ttl − margin`, measured
@@ -94,8 +113,17 @@ Rule 4 is what makes freezes safe: a process suspended between the decision
 and the send wakes up with a deadline in the past. Its record may still land
 and may even be accepted, but the writer no longer acts on that term.
 
-A candidate may claim whenever it likes. A premature claim is simply rejected
-by the fold; it costs a record, not safety.
+A release is a record of a term like a renew, and goes out under the same
+conditions: nothing else in flight, before the deadline of the belief it
+ends, and for a term the writer's view shows as its own and live. A writer
+that gave its belief up while a renew was in flight waits for the renew; if
+that is rejected, or the deadline passes first, there is no release and the
+term runs out by itself. This is what the anchor rule below rests on: two
+records of one term in the log mean the writer read the first one back and
+found it accepted.
+
+A claim that turns out premature is simply rejected by the fold; it costs a
+record, not safety.
 
 The same freedom covers giving up. With a health gate
 (`lease.Config.Health`), a holder whose workload has not been reported
@@ -124,8 +152,12 @@ a takeover delay `D` (`lease.Config.TakeoverDelay`):
    is free, as before.
 7. A candidate of another site claims only once the broker's clock, as it
    estimates it from the last record it read, is `D` past the end of that
-   term, and only when it has read up to the log's end offset: a reader that
-   is behind may have missed a new term of that site. A term whose holder
+   term, and never before the term's *natural end*, the end its last
+   accepted claim or renew gave it, plus two poll intervals: a release ends
+   a term early in the log, but a participant of that site that read the
+   last renewal and missed the release goes on answering for its site
+   until then (rule 9). A view that knows the release and not the renewals
+   takes a TTL after the release for the natural end. A term whose holder
    the view does not know counts as another site's; if not a single record
    of an existing history is left, the delay counts from the silence that
    made the view certain, on the local clock.
@@ -174,12 +206,14 @@ before the landing. Rule 9 can only start from the read, which comes after
 it: a site belief outlives the term in the log by however long the record
 took to reach the reader. Rule 10 keeps that to a fetch round trip, and
 what makes it safe across sites is rule 7: another site claims only `D`
-after the term ended, by the broker's clock, so a site belief would have to
-lag by `D` (95 s under the chart) to meet another site's term. That is why
-rule 9 needs a delay. The simulation checks it with a delay of half a TTL
-too, where the delay covers almost nothing of a stale read and only
-rule 10 keeps a reader that wakes up from a pause from answering for a
-term long gone; without rule 10 that case overlaps.
+after the term ended, by the broker's clock, and never before its natural
+end plus the two poll intervals of rule 10, so a site belief would have to
+lag by more than that to meet another site's term. That is why rule 9 needs
+a delay. The simulation checks it with a delay of half a TTL too, where the
+delay covers almost nothing: there the natural end keeps another site away
+from a term that was released while a participant of its site did not look,
+and rule 10 keeps a reader that wakes up from a pause from answering for a
+term long gone. Without either, that case overlaps.
 
 The health gate counts per site, too. Every participant whose site holds
 the lease probes the workload, and one that finds it unhealthy for
@@ -244,6 +278,11 @@ term:
 - a client clock running slow by a factor of 1−d makes a deadline of
   `ttl − margin` last `(ttl − margin) / (1 − d)` of real time.
 
+The readers meet the first of the two as well: timestamps step when the
+leader changes, so the gap between two records can read longer than it
+was. A view counts a silence between two records only when it is the margin
+longer than a TTL (`View.AllowSkew`).
+
 So the margin has to cover both, and the produce and consume latency of a
 renewal on top:
 
@@ -266,14 +305,16 @@ only through a state it can prove:
   free before its first record.
 - **Silence.** No `claim` or `renew` for a whole TTL means the lease is free:
   any live term needs a valid record within the last TTL. This applies to the
-  gap between two consecutive records (by broker timestamps) and to the end of
-  the log (the reader sits at the end for a TTL of real time and nothing
-  arrives).
+  gap between two consecutive records (by broker timestamps, with the margin
+  on top for what two leaders' clocks may be apart) and to the end of the
+  log (the reader sits at the end for a TTL and the margin of real time and
+  nothing arrives).
 - **Anchor.** A record of a term that is followed by a `renew` or `release` of
-  the same term was valid. By rules 2, 3 and 5 the writer decided on the later
-  record after reading the earlier one back, while still believing the term
-  was live. Had the earlier record been rejected, that belief would already
-  have run out. From a proven record the state is known exactly, and the
+  the same term was valid. By rules 2, 3 and 5 and the rule for a release,
+  the writer decided on the later record after reading the earlier one back,
+  while the deadline that record gave it had not passed. Had the earlier
+  record been rejected, there would be no such deadline; had the client
+  given up on it, the term would have got no further record. From a proven record the state is known exactly, and the
   reader replays everything after it.
 
 Any hole in the partition offsets (the compacted part of the log, a seek)
@@ -295,22 +336,26 @@ acknowledgements, and the tests feed it the same things from a fake log.
 consumers, produce requests that land up to two TTLs late, delivery timeouts
 after which the record lands anyway, acknowledgements that arrive after the
 record was read back, processes frozen for up to three TTLs, nodes cut off
-from the log for up to two TTLs, and participants that join late and see
-only a tail of the log with holes in it. Clocks are perfect and the margin
-is zero, so any overlap is a protocol bug. It checks that
+from the log for up to two TTLs, processes stopped at any moment, a record
+in flight or not, that come back as a new process under the same holder id,
+and participants that join late and see only a tail of the log with holes
+in it. Clocks are perfect and the margin is zero, so any overlap is a
+protocol bug. It checks that
 
 - no two agents ever believe they hold the lease at the same instant, and
   no agents of two sites ever believe their sites hold it at the same
   instant (rule 9, with the takeover delay of the sites and with one of
   half a TTL);
 - a reader started at any offset, once certain, has exactly the state of a
-  reader that saw the whole log;
+  reader that saw the whole log: in every run of every flavour below, from
+  every offset of its log;
 - candidates do not spam the log with claims they can see are hopeless.
 
 A second run of the same simulation gives the partition leaders clocks off
 by up to a fifth of a TTL and the clients clocks off by up to ten percent,
 and checks both halves of the margin rule above: with a zero margin some
-runs overlap, with the margin from the formula none do.
+runs overlap, with the margin from the formula none do, and the readers
+agree from every offset although the leaders' clocks step every other TTL.
 
 `lease/agent_test.go` pins down the rules one at a time: the deadline counts
 from the send time whatever the landing and read-back times; the belief needs
@@ -318,9 +363,15 @@ both the acknowledgement and the read-back, in either order; a record the
 client gave up on is never taken for the one in flight; a term that ended in
 the log ends the belief; nothing is written on an uncertain view; silence is
 measured only while fetches succeed; a hole makes the view uncertain; a
-release drops the belief before the record is written; the health gate
-counts from the start of the term, drops the belief when it fires, waits
-for the record in flight before releasing, and holds claims back for the
+stop drops the belief before the release is written, waits for the record
+in flight, writes no release behind a renew that is still out when the
+belief would have run out, and releases a claim that lands after it; no
+release follows a renew that was rejected, a renew the client gave up on, a
+deadline that has passed or a term the log shows as another's; a claim
+waits for the log to be read to its end; an offset already passed that
+holds another record stops the participant; the health gate counts from
+the start of the term, drops the belief when it fires, waits for the
+record in flight before releasing, and holds claims back for the
 cooldown.
 
 A third run of the simulation turns the health gate on, with workloads that
@@ -330,7 +381,8 @@ term, no claim within the cooldown, and the gate firing several times per
 run.
 
 A fourth run puts the nodes in two sites with a takeover delay of three
-TTLs: no overlap; no claim of another site accepted within the delay after
+TTLs, and cuts a whole site off from the log now and then for up to twice
+that: no overlap; no claim of another site accepted within the delay after
 the end of a term, by the broker's clock, unless it is given up without a
 single renewal (rule 8); and many takeovers by the same site within the
 delay, after releases and after terms that ran out. `agent_test.go` pins
@@ -369,7 +421,11 @@ term with a late renew, halving the silence period, taking the deadline from
 the acknowledgement time, believing on the acknowledgement alone, matching own
 records by kind instead of offset, ignoring holes, claiming without looking,
 dropping the takeover delay, the own-site exemption, the end-offset check,
-the wait on a log without history, the release of an early claim, a claim
+the wait on a log without history, the natural end of a released term, a
+claim before the log is read to its end, a release past its deadline or
+behind a record in flight, the seal on a term with a record given up on,
+the skew allowed for a silence between two records, the release of an
+early claim, a claim
 in standby, a term kept in standby or a claim in flight believed in
 standby; for the handover: the site, epoch and ended checks on a yield, the
 natural-end bound, forgetting the term on an uncertain view, a handover out
@@ -394,29 +450,39 @@ at least one of these tests; that was checked by mutation, by hand.
   record it gave up on (delivery timeout) can never be mistaken for the one
   in flight;
 - a stop releases the lease: the belief is dropped first, the record is
-  written second. With sites, the release lets the next pod of the same
-  site claim at once;
+  written second, after the record in flight, if any, was read back, and
+  not at all once the belief would have run out. With sites, the release
+  lets the next pod of the same site claim at once;
+- it stops with `ErrLogReplaced` when the log is not the one it read
+  before: an offset it has passed holds a newer record, an own record is
+  acknowledged where another was read, or the broker no longer knows the
+  topic id. That is a topic deleted and created again, or a partition that
+  lost acknowledged records; a new process starts from the log as it is;
 - `Candidate.Yield` writes a yield through the loop, if the handover it
   names still stands when the loop picks it up.
 
 `lease/candidate_integration_test.go` runs it against a broker: one holder
 among two candidates, handover after a release (tens of milliseconds) and
 after a crash (about one TTL, never before the crashed holder's deadline),
+a holder stopped with a renew stalled on its way, whose release does not
+land behind the next holder's claim, two participants that stop when their
+topic is recreated,
 a late reader agreeing with the holder, epochs growing across terms, a
 holder switched to standby handing over from its release, a handover
 through a yield well within the takeover delay, and `Inspect` reading a
 held and a released lease without writing.
 
 `test/e2e` runs the whole thing, scaler and KEDA included, on two k3s
-clusters: cold start, a scaler restart that keeps the workload's pods, crash,
-partition, freeze, a broker outage that ends with the lease on the same site,
-N replicas, a scaler that is gone, a cluster put in standby with the
-handover, and a handover whose scalers are killed between the pause and the
-yield, with a check that the workload never runs in both clusters at once.
+clusters, with a check in every scenario that the workload never runs in
+both clusters at once and that no two epochs ever wrote at the same time.
+The scenarios are listed in
+[test/e2e/README.md](../test/e2e/README.md#scenarios).
 
 ## Not covered yet
 
 - System suspend: on Linux the monotonic clock does not advance during
   suspend, so a suspended holder can wake up still believing. Container
   pauses are covered by the freeze scenario on the stand.
+- A topic that is deleted and not created again: the participants keep
+  trying, as they do without a connection.
 - Several leases sharing a partition.

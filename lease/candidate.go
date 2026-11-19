@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -41,8 +42,10 @@ type Config struct {
 	// site of Holder, see SiteOf.
 	Site string
 	// Holder identifies this participant in the log as "<site>/<name>". It
-	// must be unique per process incarnation: a restarted process must not
-	// inherit the term of its previous life. Empty means
+	// must be unique among the participants alive at one time. It may
+	// repeat when a process restarts, as a pod name does: a restarted
+	// process never acts on a term of its previous life, because it
+	// believes only a claim it sent and read back in this life. Empty means
 	// "<site>/<hostname>-<random>", or "<hostname>/<random>" without a Site.
 	Holder string
 	// TakeoverDelay is how long a participant waits, after a term of
@@ -380,9 +383,13 @@ func (c *Candidate) signal() {
 }
 
 // Run takes part in the lease until ctx is done. If the candidate holds the
-// lease at that point it releases it first. Run returns nil after a clean
-// stop and an error when it cannot go on: the topic is missing or
-// misconfigured, or the broker rejects the client.
+// lease at that point it stops believing at once and releases the term
+// before it returns: after the record it has in flight, if any, was read
+// back, and not at all once the belief would have run out anyway (see
+// stop in agent.go). Run returns nil after a clean stop and an error when
+// it cannot go on: the topic is missing or misconfigured, the broker
+// rejects the client, or the log is no longer the one it read
+// (ErrLogReplaced: the topic was deleted and created again).
 //
 // Losing the connection to Kafka is not an error: the candidate keeps
 // trying, stops believing it holds the lease when its deadline passes, and
@@ -432,7 +439,6 @@ func (c *Candidate) Run(ctx context.Context) error {
 	if errors.Is(err, errCrash) {
 		return nil
 	}
-	r.shutdown()
 	return err
 }
 
@@ -509,8 +515,19 @@ func listBounds(ctx context.Context, adm *kadm.Client, topic string, partition i
 }
 
 func (r *run) loop(ctx context.Context) error {
+	// A record outlives ctx: a stop does not take back the one in flight,
+	// it waits for it and writes the release behind it.
+	live := context.WithoutCancel(ctx)
+	// stopBy is zero until ctx is done; from then on the loop only winds
+	// the agent down, for a TTL at most.
+	var stopBy time.Time
+	released := int64(-1) // the epoch of the release the stop wrote
 	for {
-		pollCtx, cancel := context.WithTimeout(ctx, r.cfg.pollEvery())
+		base := ctx
+		if !stopBy.IsZero() {
+			base = live
+		}
+		pollCtx, cancel := context.WithTimeout(base, r.cfg.pollEvery())
 		fetches := r.cl.PollFetches(pollCtx)
 		cancel()
 		if fetches.IsClientClosed() {
@@ -524,15 +541,18 @@ func (r *run) loop(ctx context.Context) error {
 		for {
 			select {
 			case res := <-r.results:
-				r.a.acked(time.Now(), res.offset, res.err)
+				if errors.Is(res.err, kerr.UnknownTopicID) {
+					return fmt.Errorf("%w: topic %q: %w", ErrLogReplaced, r.cfg.Topic, res.err)
+				}
+				if err := r.a.acked(time.Now(), res.offset, res.err); err != nil {
+					return fmt.Errorf("topic %q: %w", r.cfg.Topic, err)
+				}
 			default:
 				break drain
 			}
 		}
 
 		select {
-		case <-ctx.Done():
-			return nil
 		case <-r.c.testCrash:
 			return errCrash
 		default:
@@ -543,27 +563,53 @@ func (r *run) loop(ctx context.Context) error {
 			r.a.healthy(healthyAt)
 		}
 		now := time.Now()
+		if stopBy.IsZero() && ctx.Err() != nil {
+			stopBy = now.Add(r.cfg.TTL)
+			r.a.stop(now)
+		}
 		r.a.setStandby(now, standby)
 		if yieldEpoch >= 0 {
 			r.a.requestYield(now, yieldEpoch)
 		}
 		if rec, ok := r.a.tick(now); ok {
-			r.produce(ctx, rec)
+			if rec.Kind == Release && !stopBy.IsZero() {
+				released = rec.Epoch
+			}
+			r.produce(live, rec)
 		}
 		r.publish(now)
+		if stopBy.IsZero() {
+			continue
+		}
+		switch done := r.a.stopDone(now); {
+		case done && released >= 0:
+			r.log.Info("released", "epoch", released)
+			return nil
+		case done:
+			return nil
+		case !now.Before(stopBy):
+			r.log.Warn("stopped with a record still in flight")
+			return nil
+		}
 	}
 }
 
 func (r *run) consume(fetches kgo.Fetches) error {
 	now := time.Now()
-	fetches.EachError(func(_ string, _ int32, err error) {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			return
-		}
-		r.a.fetchFailed(err)
-	})
-
 	var err error
+	fetches.EachError(func(_ string, _ int32, ferr error) {
+		switch {
+		case errors.Is(ferr, context.DeadlineExceeded) || errors.Is(ferr, context.Canceled):
+		case errors.Is(ferr, kerr.UnknownTopicID):
+			err = fmt.Errorf("%w: topic %q: %w", ErrLogReplaced, r.cfg.Topic, ferr)
+		default:
+			r.a.fetchFailed(ferr)
+		}
+	})
+	if err != nil {
+		return err
+	}
+
 	fetches.EachPartition(func(fp kgo.FetchTopicPartition) {
 		if fp.Err != nil || fp.Topic != r.cfg.Topic || fp.Partition != r.cfg.Partition {
 			return
@@ -577,7 +623,9 @@ func (r *run) consume(fetches kgo.Fetches) error {
 				err = fmt.Errorf("lease: topic %q does not use LogAppendTime", r.cfg.Topic)
 				return
 			}
-			err = r.a.record(now, kr.Offset, kr.Timestamp, kr.Value)
+			if err = r.a.record(now, kr.Offset, kr.Timestamp, kr.Value); err != nil {
+				err = fmt.Errorf("topic %q: %w", r.cfg.Topic, err)
+			}
 		}
 	})
 	if err == nil {
@@ -607,28 +655,6 @@ func (r *run) kafkaRecord(rec Record) (*kgo.Record, error) {
 		return nil, err
 	}
 	return &kgo.Record{Topic: r.cfg.Topic, Partition: r.cfg.Partition, Key: []byte(recordKey), Value: value}, nil
-}
-
-// shutdown gives the lease up if the participant believes it holds it.
-func (r *run) shutdown() {
-	now := time.Now()
-	rec, ok := r.a.release(now)
-	r.publish(now)
-	if !ok {
-		return
-	}
-	kr, err := r.kafkaRecord(rec)
-	if err != nil {
-		r.log.Error("encode record", "err", err)
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), r.cfg.TTL)
-	defer cancel()
-	if err := r.cl.ProduceSync(ctx, kr).FirstErr(); err != nil {
-		r.log.Warn("release not written", "epoch", rec.Epoch, "err", err)
-		return
-	}
-	r.log.Info("released", "epoch", rec.Epoch)
 }
 
 func (r *run) publish(now time.Time) {

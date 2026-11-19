@@ -37,7 +37,7 @@ func (y *yieldSource) yielded() []int64 {
 // fakeWorkload records the calls and fails them on request.
 type fakeWorkload struct {
 	mu       sync.Mutex
-	pods     int
+	left     int // what Remaining reports
 	fail     error
 	calls    []string
 	podCalls int
@@ -45,11 +45,11 @@ type fakeWorkload struct {
 
 func (f *fakeWorkload) Pause(context.Context, string) error   { return f.call("pause") }
 func (f *fakeWorkload) Unpause(context.Context, string) error { return f.call("unpause") }
-func (f *fakeWorkload) Pods(context.Context, string) (int, error) {
+func (f *fakeWorkload) Remaining(context.Context, string) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.podCalls++
-	return f.pods, f.fail
+	return f.left, f.fail
 }
 
 func (f *fakeWorkload) call(name string) error {
@@ -62,9 +62,9 @@ func (f *fakeWorkload) call(name string) error {
 	return nil
 }
 
-func (f *fakeWorkload) set(pods int, fail error) {
+func (f *fakeWorkload) set(left int, fail error) {
 	f.mu.Lock()
-	f.pods, f.fail = pods, fail
+	f.left, f.fail = left, fail
 	f.mu.Unlock()
 }
 
@@ -76,16 +76,23 @@ func (f *fakeWorkload) got() ([]string, int) {
 
 func startHandover(t *testing.T, st lease.Status) (*yieldSource, *fakeWorkload) {
 	t.Helper()
+	wl := &fakeWorkload{left: 2}
+	return startHandoverOf(t, st, wl), wl
+}
+
+// startHandoverOf runs the handover of site "eu" for ScaledObject "conn" on
+// wl until the test ends.
+func startHandoverOf(t *testing.T, st lease.Status, wl Workload) *yieldSource {
+	t.Helper()
 	src := &yieldSource{fakeSource: fakeSource{changed: make(chan struct{}, 1)}}
 	src.setStatus(st)
-	wl := &fakeWorkload{pods: 2}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	h := Handover{Source: src, Workload: wl, ScaledObject: "conn", Site: "eu", Interval: 2 * time.Millisecond,
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	go func() { h.Run(ctx); close(done) }()
 	t.Cleanup(func() { cancel(); <-done })
-	return src, wl
+	return src
 }
 
 func eventually(t *testing.T, what string, cond func() bool) {
@@ -127,6 +134,37 @@ func TestHandoverPausesWaitsAndYields(t *testing.T) {
 	settle()
 	if calls, _ := wl.got(); !slices.Equal(calls, []string{"pause"}) || len(src.yielded()) != n {
 		t.Fatalf("calls = %q, yields %v after the handover", calls, src.yielded())
+	}
+}
+
+// Against the API, with the Kube that ships: no yield while the target's
+// scale still asks for replicas, whatever its pod count. No pod at this
+// instant is a rollout, a pod restart or a KEDA that has not applied the
+// pause yet, and the pod comes back next to the other site's.
+func TestHandoverNoYieldWhileReplicasAreWanted(t *testing.T) {
+	k, api := newFakeKube(t)
+	st := ownTermEnded
+	st.Handover, st.HandoverEpoch = true, 7
+	src := startHandoverOf(t, st, k)
+	// A look is three requests, the first one four. After nine more, at
+	// least one whole look at the workload as it is now was made and acted
+	// on.
+	looks := func() {
+		t.Helper()
+		from := api.requests()
+		eventually(t, "more looks at the workload", func() bool { return api.requests() >= from+9 })
+	}
+	for _, sc := range []struct{ replicas, pods int }{{3, 3}, {3, 0}, {1, 0}, {1, 2}, {1, 0}} {
+		api.setScale(sc.replicas, sc.pods)
+		looks()
+		if y := src.yielded(); len(y) != 0 {
+			t.Fatalf("yielded %v with spec.replicas %d and %d pods", y, sc.replicas, sc.pods)
+		}
+	}
+	api.setScale(0, 0)
+	eventually(t, "yield", func() bool { return len(src.yielded()) > 0 })
+	if y := src.yielded(); y[0] != 7 {
+		t.Fatalf("yielded %v, want epoch 7", y)
 	}
 }
 

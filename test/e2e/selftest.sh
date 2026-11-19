@@ -7,7 +7,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-# shellcheck disable=SC2317 # called by scenarios.sh, through export -f
+# shellcheck disable=SC2317,SC2329 # called by scenarios.sh, through export -f
 {
   scenario_selftest_ok() { echo "   ok"; }
   # What a GNU-only `date -d` did on macOS: the command substitution is

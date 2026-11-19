@@ -130,8 +130,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            # The lease belongs to the site; the holder id is unique per
-            # process incarnation: a new pod gets a new name.
+            # The lease belongs to the site; the holder id is unique among
+            # the pods running at one time. A container that restarts keeps
+            # it, which is fine: a process never acts on a term of its
+            # previous life.
             - name: KFKLEASE_SITE
               value: {{ .Values.site | quote }}
             - name: KFKLEASE_HOLDER

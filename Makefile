@@ -15,9 +15,19 @@ integration:
 	KFKLEASE_MTLS_BROKERS=localhost:19095 KFKLEASE_CERTS_DIR=$(CURDIR)/test/e2e/.out/certs \
 	$(GO) test -race -count=1 -run Integration -v ./lease/
 
+# shellcheck is required in CI and optional on a developer's machine.
+# SCRIPTDIR lets it follow `source ./lib.sh` from any working directory.
 lint:
 	test -z "$$(gofmt -l .)"
 	$(GO) vet ./...
+	@if command -v shellcheck >/dev/null; then \
+		echo 'shellcheck -x -P SCRIPTDIR test/e2e/*.sh'; \
+		shellcheck -x -P SCRIPTDIR test/e2e/*.sh; \
+	elif [ -n "$$CI" ]; then \
+		echo 'lint: shellcheck is not installed' >&2; exit 1; \
+	else \
+		echo 'lint: shellcheck is not installed, the scripts are NOT checked (CI checks them)' >&2; \
+	fi
 	test/e2e/selftest.sh
 
 image:
