@@ -38,6 +38,19 @@ func (s State) HeldAt(t time.Time) bool {
 	return s.Holder != "" && t.Before(s.Expires)
 }
 
+// heldBy reports whether the term epoch of holder is the one that holds the
+// lease at broker time t: what a renew or a release of that term needs to
+// take effect, and what a writer needs to see before it writes either.
+func (s State) heldBy(holder string, epoch int64, t time.Time) bool {
+	return s.Holder == holder && s.Epoch == epoch && s.HeldAt(t)
+}
+
+// LastSite returns the site of the holder of the latest term, and false
+// when the view does not know that holder, as after silence.
+func (s State) LastSite() (site string, ok bool) {
+	return SiteOf(s.Last), s.Last != ""
+}
+
 // Outcome is the verdict on an applied record.
 type Outcome uint8
 
@@ -193,14 +206,13 @@ func (v *View) Apply(r Record) (Outcome, error) {
 	if r.Offset <= v.lastOffset {
 		return Rejected, fmt.Errorf("lease: offset %d after %d", r.Offset, v.lastOffset)
 	}
-	switch r.Kind {
-	case Claim, Renew, Release:
-	case Yield:
+	switch _, known := kinds[r.Kind]; {
+	case !known:
+		return Rejected, fmt.Errorf("lease: cannot apply %v", r.Kind)
+	case r.Kind == Yield:
 		// Not part of the fold: it neither moves the clock nor breaks a
 		// silence, so the state is what it would be without it.
 		return Rejected, nil
-	default:
-		return Rejected, fmt.Errorf("lease: cannot apply %v", r.Kind)
 	}
 
 	prev, hadPrev := v.clock, v.seen
@@ -274,20 +286,19 @@ func (v *View) fold(r Record) Outcome {
 	if !v.validTTL(r) {
 		return Rejected
 	}
-	held := v.state.HeldAt(r.Timestamp)
 	switch r.Kind {
 	case Claim:
-		if held {
+		if v.state.HeldAt(r.Timestamp) {
 			return Rejected
 		}
 		v.state = State{Holder: r.Holder, Epoch: r.Offset, Expires: r.Timestamp.Add(r.TTL), Last: r.Holder}
 	case Renew:
-		if !held || v.state.Holder != r.Holder || v.state.Epoch != r.Epoch {
+		if !v.state.heldBy(r.Holder, r.Epoch, r.Timestamp) {
 			return Rejected
 		}
 		v.state.Expires = r.Timestamp.Add(r.TTL)
 	case Release:
-		if !held || v.state.Holder != r.Holder || v.state.Epoch != r.Epoch {
+		if !v.state.heldBy(r.Holder, r.Epoch, r.Timestamp) {
 			return Rejected
 		}
 		v.state.Holder = ""

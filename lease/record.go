@@ -5,6 +5,7 @@ package lease
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -31,19 +32,40 @@ const (
 	Yield
 )
 
+// kinds is the one table of record kinds: the name of each, on the wire and
+// in the logs, and which of the fields its value carries, as in the Records
+// table of docs/protocol.md. A kind that is not in it is not a kind: it is
+// neither encoded nor applied.
+var kinds = map[Kind]struct {
+	name       string
+	epoch, ttl bool
+}{
+	Claim:   {name: "claim", ttl: true},
+	Renew:   {name: "renew", epoch: true, ttl: true},
+	Release: {name: "release", epoch: true, ttl: true},
+	Yield:   {name: "yield", epoch: true},
+}
+
 func (k Kind) String() string {
-	switch k {
-	case Claim:
-		return "claim"
-	case Renew:
-		return "renew"
-	case Release:
-		return "release"
-	case Yield:
-		return "yield"
+	if spec, ok := kinds[k]; ok {
+		return spec.name
 	}
 	return fmt.Sprintf("kind(%d)", uint8(k))
 }
+
+// kindNamed returns the kind with the given name on the wire.
+func kindNamed(name string) (Kind, bool) {
+	for k, spec := range kinds {
+		if spec.name == name {
+			return k, true
+		}
+	}
+	return 0, false
+}
+
+// errEmptyHolder is what a record without a writer is refused with, written
+// or read.
+var errEmptyHolder = errors.New("lease: empty holder")
 
 // Record is one entry of a lease log: a message on the lease topic together
 // with the metadata assigned by the broker.
@@ -88,7 +110,8 @@ func (r Record) term() (string, int64) {
 const wireVersion = 1
 
 // wireRecord is the message value. Which kind carries which field is the
-// Records table of docs/protocol.md; EncodeValue is what writes it.
+// Records table of docs/protocol.md, restated in kinds: EncodeValue writes
+// by it and DecodeValue reads by it.
 type wireRecord struct {
 	Version int    `json:"v"`
 	Kind    string `json:"kind"`
@@ -100,23 +123,22 @@ type wireRecord struct {
 // EncodeValue returns the message value for r. Offset and Timestamp are not
 // part of the value: the broker assigns them.
 func EncodeValue(r Record) ([]byte, error) {
-	switch r.Kind {
-	case Claim, Renew, Release, Yield:
-	default:
+	spec, ok := kinds[r.Kind]
+	if !ok {
 		return nil, fmt.Errorf("lease: cannot encode %v", r.Kind)
 	}
 	if r.Holder == "" {
-		return nil, fmt.Errorf("lease: empty holder")
+		return nil, errEmptyHolder
 	}
 	w := wireRecord{
 		Version: wireVersion,
-		Kind:    r.Kind.String(),
+		Kind:    spec.name,
 		Holder:  r.Holder,
 	}
-	if r.Kind != Yield {
+	if spec.ttl {
 		w.TTLMs = r.TTL.Milliseconds()
 	}
-	if r.Kind != Claim {
+	if spec.epoch {
 		w.Epoch = r.Epoch
 	}
 	return json.Marshal(w)
@@ -132,27 +154,21 @@ func DecodeValue(b []byte) (Record, error) {
 	if w.Version != wireVersion {
 		return Record{}, fmt.Errorf("lease: unsupported record version %d", w.Version)
 	}
-	r := Record{
-		Holder: w.Holder,
-		Epoch:  w.Epoch,
-		TTL:    time.Duration(w.TTLMs) * time.Millisecond,
-	}
-	switch w.Kind {
-	case "claim":
-		r.Kind = Claim
-		r.Epoch = 0
-	case "renew":
-		r.Kind = Renew
-	case "release":
-		r.Kind = Release
-	case "yield":
-		r.Kind = Yield
-		r.TTL = 0
-	default:
+	kind, ok := kindNamed(w.Kind)
+	if !ok {
 		return Record{}, fmt.Errorf("lease: unknown record kind %q", w.Kind)
 	}
-	if r.Holder == "" {
-		return Record{}, fmt.Errorf("lease: empty holder")
+	if w.Holder == "" {
+		return Record{}, errEmptyHolder
+	}
+	// A field its kind does not carry is not read, whatever the value says.
+	r := Record{Kind: kind, Holder: w.Holder}
+	spec := kinds[kind]
+	if spec.epoch {
+		r.Epoch = w.Epoch
+	}
+	if spec.ttl {
+		r.TTL = time.Duration(w.TTLMs) * time.Millisecond
 	}
 	return r, nil
 }

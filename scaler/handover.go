@@ -79,7 +79,8 @@ func (h Handover) Run(ctx context.Context) {
 	for {
 		s := h.Source.Status()
 		rising := s.SiteHolding && !wasSiteHolding
-		otherHolds := s.Certain && s.Lease.Last != "" && lease.SiteOf(s.Lease.Last) != h.Site
+		lastSite, known := s.Lease.LastSite()
+		otherHolds := s.Certain && known && lastSite != h.Site
 		switch {
 		case rising || (otherHolds && mayBePaused):
 			if err := h.Workload.Unpause(ctx, h.ScaledObject); err != nil {

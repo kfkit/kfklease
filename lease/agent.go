@@ -258,8 +258,7 @@ func (a *agent) record(now time.Time, offset int64, ts time.Time, value []byte) 
 		a.ownRecord(now, rec.Offset, rec.Kind, verdict{out, early})
 	}
 	if a.believing(now) && a.view.Certain() {
-		s := a.view.State()
-		if s.Holder != a.cfg.Holder || s.Epoch != a.epoch || !s.HeldAt(a.view.Clock()) {
+		if s := a.view.State(); !s.heldBy(a.cfg.Holder, a.epoch, a.view.Clock()) {
 			a.log.Warn("term ended in the log", "epoch", a.epoch, "log_holder", s.Holder, "log_epoch", s.Epoch)
 			a.dropBelief()
 		}
@@ -293,7 +292,8 @@ func (a *agent) followTerm(rec Record, out Outcome) {
 // term of s: written by a participant of the site that held it, naming it,
 // after it ended, and with the term's natural end known.
 func (a *agent) yieldCounts(y Record, s State, at time.Time) bool {
-	return s.Epoch >= 0 && y.Epoch == s.Epoch && s.Last != "" && SiteOf(y.Holder) == SiteOf(s.Last) &&
+	site, known := s.LastSite()
+	return s.Epoch >= 0 && y.Epoch == s.Epoch && known && SiteOf(y.Holder) == site &&
 		!s.HeldAt(at) && a.termEnd.epoch == s.Epoch
 }
 
@@ -301,6 +301,7 @@ func (a *agent) forgetTerm() {
 	a.termEnd, a.yielded = noEpoch, noEpoch
 }
 
+// later returns x when it is after y, otherwise y.
 func later(x, y time.Time) time.Time {
 	if x.After(y) {
 		return x
@@ -509,9 +510,7 @@ func (a *agent) giveUp() {
 // writer read back and found accepted, which is what the readers' anchor
 // rule takes two records of one term to mean.
 func (a *agent) mayRelease(now, by time.Time) bool {
-	s := a.view.State()
-	return now.Before(by) && !a.sealed &&
-		s.Holder == a.cfg.Holder && s.Epoch == a.epoch && s.HeldAt(a.view.Clock())
+	return now.Before(by) && !a.sealed && a.view.State().heldBy(a.cfg.Holder, a.epoch, a.view.Clock())
 }
 
 func (a *agent) dropBelief() {
@@ -532,20 +531,14 @@ func (a *agent) brokerNow(now time.Time) time.Time {
 
 // healthy reports that the workload was seen healthy at now.
 func (a *agent) healthy(now time.Time) {
-	if now.After(a.lastHealthy) {
-		a.lastHealthy = now
-	}
+	a.lastHealthy = later(now, a.lastHealthy)
 }
 
 // unhealthyFor is how long the site's workload has gone without a healthy
 // report, counted from the later of the start of the site's terms and the
 // last report: a workload gets FailAfter to come up where it was moved.
 func (a *agent) unhealthyFor(now time.Time) time.Duration {
-	since := a.heldSince
-	if a.lastHealthy.After(since) {
-		since = a.lastHealthy
-	}
-	return now.Sub(since)
+	return now.Sub(later(a.lastHealthy, a.heldSince))
 }
 
 // checkHealth applies the health gate while the site holds: when its
@@ -644,10 +637,7 @@ func (a *agent) tick(now time.Time) (Record, bool) {
 	}()
 
 	if a.connected && a.caughtUp() && !a.view.Certain() {
-		since := a.caughtUpAt
-		if a.lastRecordAt.After(since) {
-			since = a.lastRecordAt
-		}
+		since := later(a.lastRecordAt, a.caughtUpAt)
 		if now.Sub(since) >= a.cfg.TTL+a.cfg.Margin && a.view.Quiet(a.cfg.TTL) {
 			a.log.Info("lease is free: nothing written for a ttl")
 			a.ready = true
@@ -655,9 +645,7 @@ func (a *agent) tick(now time.Time) (Record, bool) {
 				// Not one record left of a history that existed: whoever
 				// held the lease last, its term ended during this silence
 				// at the latest. Count the takeover delay from now.
-				if at := now.Add(a.cfg.TakeoverDelay); at.After(a.nextClaimAt) {
-					a.nextClaimAt = at
-				}
+				a.nextClaimAt = later(now.Add(a.cfg.TakeoverDelay), a.nextClaimAt)
 			}
 		}
 	}
@@ -717,7 +705,7 @@ func (a *agent) mayClaim(now time.Time) bool {
 // site may still answer for it (answeredUntil), or earlier with a yield,
 // see yieldFrom.
 func (a *agent) takeoverFrom(s State) time.Time {
-	if s.Expires.IsZero() || (s.Last != "" && SiteOf(s.Last) == a.cfg.Site) || a.cfg.TakeoverDelay == 0 {
+	if s.Expires.IsZero() || a.ownSite(s) || a.cfg.TakeoverDelay == 0 {
 		return time.Time{}
 	}
 	from := later(s.Expires.Add(a.cfg.TakeoverDelay), a.answeredUntil(s))
@@ -725,6 +713,13 @@ func (a *agent) takeoverFrom(s State) time.Time {
 		from = y
 	}
 	return from
+}
+
+// ownSite reports whether the latest term s names was this participant's
+// site's. A term the view does not know the holder of is not.
+func (a *agent) ownSite(s State) bool {
+	site, known := s.LastSite()
+	return known && site == a.cfg.Site
 }
 
 // answeredUntil is the latest broker time at which a participant of the
@@ -771,7 +766,7 @@ func (a *agent) yieldFrom(s State) (time.Time, bool) {
 func (a *agent) handover(now time.Time) (int64, bool) {
 	s := a.view.State()
 	if !a.standby || a.cfg.TakeoverDelay == 0 || !a.ready || !a.view.Certain() || !a.caughtUp() ||
-		s.Epoch < 0 || s.Last == "" || SiteOf(s.Last) != a.cfg.Site || a.yielded.epoch == s.Epoch {
+		s.Epoch < 0 || !a.ownSite(s) || a.yielded.epoch == s.Epoch {
 		return -1, false
 	}
 	brokerNow := a.brokerNow(now)
