@@ -8,12 +8,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
-	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 // The stand's broker has a SASL_PLAINTEXT listener (PLAIN user "kfklease",
@@ -26,27 +24,14 @@ const (
 	saslPassword = "kfklease-secret"
 )
 
-func optionalBrokers(t *testing.T, name string) []string {
-	t.Helper()
-	v := os.Getenv(name)
-	if v == "" {
-		t.Skipf("%s not set", name)
-	}
-	return strings.Split(v, ",")
-}
-
 // upsertScram gives saslUser a SCRAM credential through the plaintext
 // admin listener.
 func upsertScram(t *testing.T, mechanism kadm.ScramMechanism) {
 	t.Helper()
-	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers(t)...))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cl.Close()
+	_, adm := adminClient(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	resp, err := kadm.NewClient(cl).AlterUserSCRAMs(ctx, nil, []kadm.UpsertSCRAM{{
+	resp, err := adm.AlterUserSCRAMs(ctx, nil, []kadm.UpsertSCRAM{{
 		User: saslUser, Mechanism: mechanism, Iterations: 4096, Password: saslPassword,
 	}})
 	if err != nil {
@@ -61,20 +46,9 @@ func upsertScram(t *testing.T, mechanism kadm.ScramMechanism) {
 // expects it to hold the lease within a ttl.
 func acquiresWith(t *testing.T, bs []string, auth Auth) {
 	t.Helper()
-	c, err := NewCandidate(Config{Brokers: bs, Topic: randomTopic(t), CreateTopic: true, TopicSettings: itTopic, TTL: itTTL, Margin: itMargin, Auth: auth})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- c.Run(ctx) }()
-	defer func() {
-		cancel()
-		if err := <-done; err != nil {
-			t.Errorf("Run: %v", err)
-		}
-	}()
-	waitFor(t, 2*itTTL, "holding", func() bool { return c.Status().Holding })
+	p := startConfig(t, Config{Brokers: bs, Topic: randomTopic(t), CreateTopic: true, TopicSettings: itTopic, TTL: itTTL, Margin: itMargin, Auth: auth})
+	waitFor(t, 2*itTTL, "holding", func() bool { return p.Status().Holding })
+	p.stop(t)
 }
 
 // failsWith expects Run to give up with an error rather than hang when the

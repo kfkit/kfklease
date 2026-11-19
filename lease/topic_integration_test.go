@@ -10,19 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
-
-func adminClient(t *testing.T) (*kgo.Client, *kadm.Client) {
-	t.Helper()
-	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers(t)...))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(cl.Close)
-	return cl, kadm.NewClient(cl)
-}
 
 // A new topic gets the settings of a lease log, each set on the topic
 // itself rather than inherited from the broker.
