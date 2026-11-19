@@ -7,9 +7,13 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -291,5 +295,81 @@ func TestHTTPSiteHolding(t *testing.T) {
 	_, body = get(t, srv, "/metrics")
 	if metric(t, body, "kfklease_holding") != "0" || metric(t, body, "kfklease_site_holding") != "1" {
 		t.Fatalf("metrics:\n%s", body)
+	}
+}
+
+// jsonKeys returns the JSON field names of a struct type, the omitempty
+// ones included.
+func jsonKeys(t reflect.Type) []string {
+	var keys []string
+	for i := range t.NumField() {
+		name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
+		if name == "" {
+			name = t.Field(i).Name
+		}
+		keys = append(keys, name)
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+func sortedKeys(m map[string]any) []string { return slices.Sorted(maps.Keys(m)) }
+
+// The /status sample in docs/install.md shows exactly the fields of
+// StatusResponse, so the doc cannot drift from the code again: a field
+// added to or dropped from the struct fails here until the sample follows.
+// The sample is the answer of a scaler as the binary runs it, with a topic
+// and a certain view, so the two omitempty fields, topic and lease, are in
+// it; the handler's own answer in that state is checked against the same
+// set, which keeps a field from hiding behind an omitempty.
+func TestStatusSampleInDocs(t *testing.T) {
+	doc, err := os.ReadFile("../docs/install.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, after, found := strings.Cut(string(doc), "`GET /status`")
+	if !found {
+		t.Fatal("docs/install.md does not mention `GET /status`")
+	}
+	_, after, found = strings.Cut(after, "```json\n")
+	sample, _, closed := strings.Cut(after, "```")
+	if !found || !closed {
+		t.Fatal("no json block after `GET /status` in docs/install.md")
+	}
+	var inDoc map[string]any
+	if err := json.Unmarshal([]byte(sample), &inDoc); err != nil {
+		t.Fatalf("the sample is not JSON: %v\n%s", err, sample)
+	}
+	// The values have the types the fields have.
+	dec := json.NewDecoder(strings.NewReader(sample))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(new(StatusResponse)); err != nil {
+		t.Errorf("the sample does not decode into StatusResponse: %v", err)
+	}
+
+	want := jsonKeys(reflect.TypeFor[StatusResponse]())
+	if got := sortedKeys(inDoc); !slices.Equal(got, want) {
+		t.Errorf("fields of the sample:\n  %v\nfields of StatusResponse:\n  %v", got, want)
+	}
+	inLease, _ := inDoc["lease"].(map[string]any)
+	wantLease := jsonKeys(reflect.TypeFor[LeaseResponse]())
+	if got := sortedKeys(inLease); !slices.Equal(got, wantLease) {
+		t.Errorf("fields of the sample's lease:\n  %v\nfields of LeaseResponse:\n  %v", got, wantLease)
+	}
+
+	src := &fakeSource{changed: make(chan struct{}, 1)}
+	src.setStatus(lease.Status{Certain: true, Ready: true, AsOf: time.Now()})
+	h, err := NewHTTPLeases([]Lease{{Topic: "orders", Holder: "eu/pod", Source: src}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(h.Handler())
+	defer srv.Close()
+	var served map[string]any
+	if err := json.Unmarshal([]byte(getBody(t, srv, "/status")), &served); err != nil {
+		t.Fatal(err)
+	}
+	if got := sortedKeys(served); !slices.Equal(got, want) {
+		t.Errorf("fields the handler wrote:\n  %v\nfields of StatusResponse:\n  %v", got, want)
 	}
 }

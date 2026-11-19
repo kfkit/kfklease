@@ -82,7 +82,7 @@ else, at one replica or at N:
 triggers:
   - type: external-push
     metadata:
-      scalerAddress: kfklease-scaler.kfklease.svc:9090
+      scalerAddress: kfklease.kfklease.svc:9090
 ```
 
 The chart installs the scaler, its service and that ScaledObject; one
@@ -155,12 +155,9 @@ else franz-go supports (AWS MSK IAM, custom mechanisms) goes through
 
 The scaler serves HTTP on `:9091` (`service.httpPort`):
 
-- `/metrics`, Prometheus: `kfklease_holding`, `kfklease_epoch`,
-  `kfklease_belief_remaining_seconds`, `kfklease_certain`,
-  `kfklease_lease_held`, `kfklease_lease_as_of_seconds`,
-  `kfklease_lease_holder_info{holder,site}` (who holds it, as the log says),
-  `kfklease_health_cooldown_seconds`, `kfklease_standby_mode` and
-  `kfklease_transitions_total{to="holding"|"standby"}`. The pod carries
+- `/metrics`, Prometheus: what this participant believes, what it tells
+  KEDA and who holds the lease as the log says; the metrics are listed in
+  [docs/install.md](docs/install.md#metrics). The pod carries
   `prometheus.io/*` annotations; `metrics.serviceMonitor.enabled` adds a
   ServiceMonitor for the Prometheus Operator.
 - `/status`, JSON: the same, plus the log's view of the lease and `ready`
@@ -171,7 +168,8 @@ The scaler serves HTTP on `:9091` (`service.httpPort`):
 
 The binary is configured by flags or environment: `KFKLEASE_BROKERS`,
 `KFKLEASE_TOPIC`, `KFKLEASE_TTL`, `KFKLEASE_SITE`, `KFKLEASE_HOLDER`
-(`<site>/<name>`, unique per process; the chart uses the pod name),
+(`<site>/<name>`, unique among the participants running at one time; the
+chart uses the pod name),
 `KFKLEASE_TAKEOVER_DELAY`, `KFKLEASE_STANDBY`. The two-cluster stand the chart is tested on is in
 [test/e2e](test/e2e).
 
@@ -242,7 +240,7 @@ The end-to-end stand with two Kubernetes clusters is described in
 - [x] KEDA external scaler
 - [x] Container image
 - [x] Helm chart
-- [x] Failure-mode tests: crash, partition, freeze, broker restart
+- [x] Failure-mode tests on the two-cluster stand: [the scenarios](test/e2e/README.md#scenarios)
 - [x] N replicas of any scalable target; fail closed when the scaler is gone
 - [x] Optional health gate: fail over when the workload cannot run where the lease is held
 - [x] Several leases, one per topic, served by one scaler

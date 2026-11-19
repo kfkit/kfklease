@@ -35,7 +35,6 @@ and this project adheres to
   partition lost acknowledged records, stops with `lease.ErrLogReplaced`
   (the scaler exits and restarts). It used to stay up, ready and holding
   nothing, for good.
-
 - The handover writes its yield only when KEDA has scaled the target to
   zero and no pod is left. "No pod right now" was enough before, which is
   also what a rollout or a pod restart looks like for a moment.
@@ -45,6 +44,22 @@ and this project adheres to
   `TRUE`, `t`, ...). Anything else, an empty value included, stops the
   scaler with status 2; it used to be read as false without a word, so
   `KFKLEASE_STANDBY=1` left a cluster claiming.
+- Docs: the `scalerAddress` in the README is the one the chart renders
+  (`kfklease.kfklease.svc:9090`); the `/status` sample in docs/install.md
+  shows every field, and a test keeps it so; the Records table in
+  docs/protocol.md matches the wire format (`v`, and `ttl_ms` on a
+  release). The scenarios are listed in test/e2e/README.md and the metrics
+  in docs/install.md, and nowhere else.
+
+### Changed
+
+- `make lint` runs `shellcheck -x` over the stand's scripts. In CI a
+  missing shellcheck fails it; elsewhere the scripts are skipped with a
+  message.
+- Docs and the library's comments: a holder id has to be unique among the
+  participants alive at one time, where they asked for one per process
+  incarnation. It may repeat when a process restarts, as the chart's
+  `<site>/<pod name>` does. The behaviour is the same.
 
 ### Added
 

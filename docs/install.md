@@ -374,20 +374,26 @@ The scaler exposes it at `GET /status` on port 9091:
 
 ```json
 {
+  "topic": "orders-singleton",
   "holder": "eu-west/kfklease-7d9c4-x2k8p",
   "holding": true,
   "epoch": 1842,
-  "deadline_in_seconds": 7.3,
   "site_holding": true,
   "site_epoch": 1842,
+  "deadline_in_seconds": 7.3,
   "certain": true,
+  "ready": true,
   "lease": {"holder": "eu-west/kfklease-7d9c4-x2k8p", "epoch": 1842, "expires": "2026-09-24T10:15:32Z"},
   "as_of": "2026-09-24T10:15:22Z",
-  "standby": false
+  "health_cooldown_in_seconds": 0,
+  "standby": false,
+  "handover": false
 }
 ```
 
-It also carries the lease's `topic`. A scaler with
+These are all the fields; a test keeps the sample and the scaler's answer
+in step. `lease` is what the log says and is there while `certain` is
+true. A scaler with
 [several leases](#several-leases-one-scaler) needs to be told which:
 `GET /status?topic=connect-billing`; without `topic` it answers 400 and
 names the topics it serves, and an unknown one is a 404.
@@ -451,8 +457,10 @@ takes the lease and starts the workload. Without a fallback, KEDA marks
 the ScaledObject not ready and leaves the replicas alone, and both clusters
 run the workload until the scaler is back.
 
-The chart therefore renders KEDA's `fallback` with `replicas: 0`. By the
-KEDA v2.17 source (`pkg/scaling/executor/scale_scaledobjects.go`), a scale
+The chart therefore renders KEDA's `fallback` with `replicas: 0`. By
+KEDA's source (`pkg/scaling/executor/scale_scaledobjects.go`, read at the
+version the stand pins in
+[test/e2e/manifests/keda.yaml](../test/e2e/manifests/keda.yaml)), a scale
 loop that gets an error from the scaler and no active answer then scales
 the target to `idleReplicaCount`, once `cooldownPeriod` has passed since
 the last active answer. The bound on the old cluster stopping on its own

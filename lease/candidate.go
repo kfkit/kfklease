@@ -42,8 +42,10 @@ type Config struct {
 	// site of Holder, see SiteOf.
 	Site string
 	// Holder identifies this participant in the log as "<site>/<name>". It
-	// must be unique per process incarnation: a restarted process must not
-	// inherit the term of its previous life. Empty means
+	// must be unique among the participants alive at one time. It may
+	// repeat when a process restarts, as a pod name does: a restarted
+	// process never acts on a term of its previous life, because it
+	// believes only a claim it sent and read back in this life. Empty means
 	// "<site>/<hostname>-<random>", or "<hostname>/<random>" without a Site.
 	Holder string
 	// TakeoverDelay is how long a participant waits, after a term of

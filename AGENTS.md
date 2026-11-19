@@ -19,7 +19,7 @@ runs a workload in one cluster at a time. The map:
 | `cmd/kfklease-scaler` | the binary: flags with `KFKLEASE_*` fallbacks | scaler |
 | `charts/kfklease` | one release per cluster | |
 | `examples/heartbeat` | a workload that fences by epoch, and the report that checks it | scaler's `/status` |
-| `test/e2e` | the stand: two k3s clusters with KEDA and one Kafka, five failure scenarios | Docker |
+| `test/e2e` | the stand: two k3s clusters with KEDA and one Kafka, and the failure scenarios; `test/e2e/README.md` lists them | Docker |
 | `docs/protocol.md` | why the lease is safe. Change it when the rules change | |
 
 ## Rules
@@ -36,7 +36,8 @@ runs a workload in one cluster at a time. The map:
   cannot reach.
 - **DRY, and Go as Go is written.** One place for each rule. Builtin
   `min`/`max`, `errors.Join`, `slices`, table tests. `gofmt`, `go vet`,
-  `shellcheck -x` on every script.
+  `shellcheck -x` on every script: `make lint` runs all three, and fails
+  in CI when shellcheck is missing.
 - **Secrets never touch values or code.** The chart points at Kubernetes
   Secrets: certificates as mounted files (re-read per connection), SASL
   credentials as environment variables. No `fromEnv` toggles, no
@@ -63,9 +64,10 @@ test itself; the agent was extracted so it checks the agent.
 - `make integration`: against the Kafka container from the stand, over
   plaintext, SASL PLAIN/SCRAM and mTLS. Wrong credentials must fail, not
   hang.
-- `test/e2e/scenarios.sh`: cold start, crash, partition, freeze, broker
-  outage, each ending with the heartbeat check: no two epochs ever wrote at
-  once, nothing stale got past the fence, by the broker's clock.
+- `test/e2e/scenarios.sh`: the scenarios in the table of
+  `test/e2e/README.md`, the one list of them, each ending with the
+  heartbeat check: no two epochs ever wrote at once, nothing stale got past
+  the fence, by the broker's clock.
 - When a rule changes, break it on purpose and confirm a test fails. Every
   rule in `agent.go` and `view.go` has been checked this way; keep it so.
 - A scenario that depends on timing is a scenario that will fail on a slow
@@ -110,8 +112,15 @@ every scenario also covers both ways of handing secrets to the scaler.
   the first merges; resolve by hand, `update-branch` cannot.
 - `setup-go` installs exactly the `go` directive's version with
   `GOTOOLCHAIN=local`; the `toolchain` line in `go.mod` is what it honours.
-- Releases: a `chore: vX.Y.Z` PR bumps `charts/kfklease/Chart.yaml` and
-  the README, then a signed tag `vX.Y.Z` on `main`. `release.yml` builds
+- Releases: a `chore: vX.Y.Z` PR bumps every file that carries the
+  version, then a signed tag `vX.Y.Z` on `main`. The files:
+  `charts/kfklease/Chart.yaml` (`version` and `appVersion`), `README.md`
+  (the status line and `--version` in the install command),
+  `docs/install.md` (`--version` in the install command) and
+  `CHANGELOG.md` (a `## [X.Y.Z] - date` heading under `## Unreleased`,
+  which stays, empty). A release that breaks something also rewrites the
+  "Upgrading from" notes in `README.md` and `docs/install.md`, which name
+  the previous version. `release.yml` builds
   the multi-arch image and the chart into GHCR, signs the image with cosign
   and writes the release. The actions in `release.yml` run only on tags, so
   a Dependabot bump of them is verified by the next release.

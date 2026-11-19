@@ -39,16 +39,29 @@ clock skew between brokers.
 
 ## Records
 
-| Kind      | Fields                 | Meaning                                  |
-|-----------|------------------------|------------------------------------------|
-| `claim`   | `holder`, `ttl_ms`     | start a new term                         |
-| `renew`   | `holder`, `epoch`, `ttl_ms` | extend the term `epoch`             |
-| `release` | `holder`, `epoch`      | end the term `epoch` now                 |
-| `yield`   | `holder`, `epoch`      | the writer's site has stopped its workload after the term `epoch`; see [Handover](#handover) |
+A record's value is a JSON object. Every kind carries `v`, the version of
+the format, now 1, its `kind` and the `holder` that wrote it, and besides:
 
-`holder` is unique per process incarnation, not per host: a restarted process
-must not inherit the term of its previous life, because it has no idea when
-that term runs out.
+| Kind      | Fields            | Meaning                                  |
+|-----------|-------------------|------------------------------------------|
+| `claim`   | `ttl_ms`          | start a new term                         |
+| `renew`   | `epoch`, `ttl_ms` | extend the term `epoch`                  |
+| `release` | `epoch`, `ttl_ms` | end the term `epoch` now; the fold does not read its `ttl_ms` |
+| `yield`   | `epoch`           | the writer's site has stopped its workload after the term `epoch`; see [Handover](#handover) |
+
+A field that is zero is left out and reads back as zero: `epoch` 0 is the
+term of a claim at offset 0. This table is the wire format;
+`EncodeValue` in `lease/record.go` writes it.
+
+`holder` must be unique among the participants alive at one time. It may
+repeat when a process restarts, as the chart's `<site>/<pod name>` does
+when a container restarts in its pod. What has to hold is that a restarted
+process does not act on a term of its previous life, because it has no idea
+when that term runs out. Writer rule 3 below gives that: a belief starts
+only from a claim the process sent in this life and read back, matched by
+the offset the broker acknowledged, and it is kept in memory only. A term
+under its own id that it did not claim in this life is to it a term like
+any other: it waits for it to end.
 
 The TTL is a property of the lease, identical for all participants. Records
 asking for more than the lease TTL are rejected by everyone.
@@ -460,11 +473,10 @@ through a yield well within the takeover delay, and `Inspect` reading a
 held and a released lease without writing.
 
 `test/e2e` runs the whole thing, scaler and KEDA included, on two k3s
-clusters: cold start, a scaler restart that keeps the workload's pods, crash,
-partition, freeze, a broker outage that ends with the lease on the same site,
-N replicas, a scaler that is gone, a cluster put in standby with the
-handover, and a handover whose scalers are killed between the pause and the
-yield, with a check that the workload never runs in both clusters at once.
+clusters, with a check in every scenario that the workload never runs in
+both clusters at once and that no two epochs ever wrote at the same time.
+The scenarios are listed in
+[test/e2e/README.md](../test/e2e/README.md#scenarios).
 
 ## Not covered yet
 
