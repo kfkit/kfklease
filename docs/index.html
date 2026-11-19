@@ -13,17 +13,12 @@
   docs/protocol.md, not the real code.
 -->
 <style>
+  /* One theme, dark, whatever the system asks for. */
   :root {
-    --bg: #fff1e8; --fg: #1d2b53; --muted: #5f574f; --rule: #c2c3c7;
-    --accent: #7e2553; --panel: #ffffff; --key: #ab5236;
-    --screen: #0e1428; --screen-edge: #1d2b53;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #0b0f1e; --fg: #fff1e8; --muted: #c2c3c7; --rule: #2a3350;
-      --accent: #ffec27; --panel: #131a30; --key: #ffa300;
-      --screen: #060912; --screen-edge: #29366f;
-    }
+    color-scheme: dark;
+    --bg: #0b0f1e; --fg: #fff1e8; --muted: #c2c3c7; --rule: #2a3350;
+    --accent: #ffec27; --panel: #131a30; --key: #ffa300;
+    --screen: #060912; --screen-edge: #29366f;
   }
   * { box-sizing: border-box; }
   html { scroll-snap-type: y proximity; scroll-behavior: smooth; }
