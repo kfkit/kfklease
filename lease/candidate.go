@@ -455,24 +455,20 @@ func (r *run) bootstrap(ctx context.Context) error {
 
 // partitionBounds returns the partition's start and end offsets. A topic
 // that was just created has no leader for a moment, so it retries for a
-// while before giving up.
+// while before giving up: whatever the failure, and with the client made to
+// forget what it knows of the topic before each new try.
 func (r *run) partitionBounds(ctx context.Context) (start, end kadm.ListedOffset, err error) {
 	adm := kadm.NewClient(r.cl)
-	deadline := time.Now().Add(max(r.cfg.TTL, 10*time.Second))
-	for {
+	err = untilReady(ctx, max(r.cfg.TTL, topicReadyWait), func() error {
 		start, end, err = listBounds(ctx, adm, r.cfg.Topic, r.cfg.Partition)
-		if err == nil || time.Now().After(deadline) {
-			return start, end, err
-		}
+		return err
+	}, func(err error) bool {
 		r.log.Debug("partition not ready", "err", err)
 		r.cl.PurgeTopicsFromClient(r.cfg.Topic)
 		r.cl.AddConsumePartitions(r.cfg.consumeFromStart())
-		select {
-		case <-ctx.Done():
-			return start, end, ctx.Err()
-		case <-time.After(200 * time.Millisecond):
-		}
-	}
+		return true
+	})
+	return start, end, err
 }
 
 func listBounds(ctx context.Context, adm *kadm.Client, topic string, partition int32) (start, end kadm.ListedOffset, err error) {
