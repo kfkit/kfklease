@@ -17,7 +17,7 @@ import (
 )
 
 type yieldSource struct {
-	fakeSource
+	*fakeSource
 	ymu    sync.Mutex
 	yields []int64
 }
@@ -84,7 +84,7 @@ func startHandover(t *testing.T, st lease.Status) (*yieldSource, *fakeWorkload) 
 // wl until the test ends.
 func startHandoverOf(t *testing.T, st lease.Status, wl Workload) *yieldSource {
 	t.Helper()
-	src := &yieldSource{fakeSource: fakeSource{changed: make(chan struct{}, 1)}}
+	src := &yieldSource{fakeSource: newFakeSource()}
 	src.setStatus(st)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -93,17 +93,6 @@ func startHandoverOf(t *testing.T, st lease.Status, wl Workload) *yieldSource {
 	go func() { h.Run(ctx); close(done) }()
 	t.Cleanup(func() { cancel(); <-done })
 	return src
-}
-
-func eventually(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
-		}
-		time.Sleep(time.Millisecond)
-	}
 }
 
 // settle lets the driver look a few more times.

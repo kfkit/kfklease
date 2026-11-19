@@ -7,7 +7,6 @@ import (
 	"context"
 	"net"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -17,48 +16,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/kfkit/kfklease/internal/externalscaler"
-	"github.com/kfkit/kfklease/lease"
 )
-
-type fakeSource struct {
-	mu      sync.Mutex
-	st      lease.Status
-	changed chan struct{}
-	// unknown makes the source a participant that has not read the log
-	// yet; otherwise Status reports Ready.
-	unknown bool
-}
-
-func (f *fakeSource) Status() lease.Status {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	s := f.st
-	s.Ready = s.Ready || !f.unknown
-	return s
-}
-
-func (f *fakeSource) setUnknown(unknown bool) {
-	f.mu.Lock()
-	f.unknown = unknown
-	f.mu.Unlock()
-	select {
-	case f.changed <- struct{}{}:
-	default:
-	}
-}
-
-func (f *fakeSource) Changed() <-chan struct{} { return f.changed }
-
-// set makes the source the holder, or no participant of its site.
-func (f *fakeSource) set(holding bool) {
-	f.setStatus(lease.Status{Holding: holding, Epoch: 7, SiteHolding: holding, SiteEpoch: 7})
-}
-
-// setSibling makes another participant of the source's site the holder,
-// or nobody.
-func (f *fakeSource) setSibling(holding bool) {
-	f.setStatus(lease.Status{SiteHolding: holding, SiteEpoch: 9})
-}
 
 func serve(t *testing.T, src Source, heartbeat time.Duration) externalscaler.ExternalScalerClient {
 	t.Helper()
@@ -80,7 +38,7 @@ func serve(t *testing.T, src Source, heartbeat time.Duration) externalscaler.Ext
 }
 
 func TestUnaryCalls(t *testing.T) {
-	src := &fakeSource{changed: make(chan struct{}, 1)}
+	src := newFakeSource()
 	cl := serve(t, src, time.Hour)
 	ctx := context.Background()
 	ref := &externalscaler.ScaledObjectRef{Name: "singleton", Namespace: "default"}
@@ -123,7 +81,7 @@ func TestUnaryCalls(t *testing.T) {
 }
 
 func TestTopicMismatch(t *testing.T) {
-	src := &fakeSource{changed: make(chan struct{}, 1)}
+	src := newFakeSource()
 	cl := serve(t, src, time.Hour)
 	ref := &externalscaler.ScaledObjectRef{Name: "x", ScalerMetadata: map[string]string{"topic": "other"}}
 	_, err := cl.IsActive(context.Background(), ref)
@@ -137,7 +95,7 @@ func TestTopicMismatch(t *testing.T) {
 }
 
 func TestStreamPushesChangesAndHeartbeats(t *testing.T) {
-	src := &fakeSource{changed: make(chan struct{}, 1)}
+	src := newFakeSource()
 	cl := serve(t, src, 200*time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -176,8 +134,8 @@ func TestStreamPushesChangesAndHeartbeats(t *testing.T) {
 }
 
 func TestSeveralLeases(t *testing.T) {
-	a := &fakeSource{changed: make(chan struct{}, 1)}
-	b := &fakeSource{changed: make(chan struct{}, 1)}
+	a := newFakeSource()
+	b := newFakeSource()
 	srv, err := NewLeases([]Lease{{Topic: "connect-a", Source: a}, {Topic: "connect-b", Source: b}}, time.Hour)
 	if err != nil {
 		t.Fatal(err)
@@ -246,7 +204,7 @@ func TestSeveralLeases(t *testing.T) {
 }
 
 func TestNewLeasesRefuses(t *testing.T) {
-	src := &fakeSource{changed: make(chan struct{}, 1)}
+	src := newFakeSource()
 	for name, tc := range map[string]struct {
 		leases    []Lease
 		heartbeat time.Duration
@@ -266,7 +224,8 @@ func TestNewLeasesRefuses(t *testing.T) {
 // A scaler that just started does not know who holds the lease: it answers
 // with an error, pushes nothing, and answers once it knows.
 func TestNotReadyIsAnError(t *testing.T) {
-	src := &fakeSource{changed: make(chan struct{}, 1), unknown: true}
+	src := newFakeSource()
+	src.unknown = true
 	cl := serve(t, src, 100*time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
