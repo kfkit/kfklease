@@ -625,9 +625,13 @@ term has ended, a scaler pod of the cluster
 1. sets KEDA's `autoscaling.keda.sh/paused-replicas: "0"` on the
    ScaledObject, so KEDA scales the workload to zero now rather than after
    `cooldownPeriod`;
-2. counts the target's pods, terminating ones included, through the
-   selector of its scale subresource, once a second;
-3. once there are none, writes a `yield` record for the term to the lease
+2. looks at the target's scale subresource once a second and waits for
+   two things: KEDA has applied the pause, so the scale asks for zero
+   replicas, and no pod matches its selector, terminating ones included.
+   No pod alone is not enough: in the middle of a rollout or a pod restart
+   there is none for a moment, and while replicas are asked for the
+   target's controller creates the next one;
+3. once both hold, writes a `yield` record for the term to the lease
    topic.
 
 Another cluster reads the yield as the end of its takeover delay, but
@@ -635,9 +639,10 @@ claims no earlier than a TTL after the old term's last renewal (plus half a
 renewal interval): until then a scaler replica of the old cluster that
 missed the release could still answer KEDA "my site holds". The handover
 gives up when `takeoverDelay` has passed since the term ended; by then the
-other cluster claims anyway. A handover that does not finish (a pod that
-never terminates, an API error) writes no yield, and the other cluster
-waits the full delay, as without the handover.
+other cluster claims anyway. A handover that does not finish (a KEDA that
+does not apply the pause, a pod that never terminates, an API error) writes
+no yield, and the other cluster waits the full delay, as without the
+handover.
 
 The pause is lifted when the cluster holds the lease again, and once
 another cluster holds it, so a scaler stopped half-way through a handover
@@ -652,7 +657,7 @@ namespace, nothing cluster-wide:
 | Resource | Verbs | Why |
 |---|---|---|
 | `scaledobjects.keda.sh`, by name: the release's own | `get`, `patch` | pause and lift; read the target from KEDA's `status.scaleTargetGVKR` |
-| `<target>/scale` in the target's group, by name | `get` | the target's pod selector |
+| `<target>/scale` in the target's group, by name | `get` | the replicas asked of the target and its pod selector |
 | `pods` | `list` | whether any pod of the target is left |
 
 The target's resource is its kind in lower case with an `s`

@@ -25,7 +25,10 @@ var _ HandoverSource = (*lease.Candidate)(nil)
 type Workload interface {
 	Pause(ctx context.Context, scaledObject string) error
 	Unpause(ctx context.Context, scaledObject string) error
-	Pods(ctx context.Context, scaledObject string) (int, error)
+	// Remaining is 0 once the workload is down and stays down: its target
+	// is scaled to zero and none of its pods is left, terminating ones
+	// included. Anything else is a positive count.
+	Remaining(ctx context.Context, scaledObject string) (int, error)
 }
 
 var _ Workload = (*Kube)(nil)
@@ -41,7 +44,7 @@ type Handover struct {
 	// Site is this participant's site.
 	Site string
 	// Interval is how often Run looks at the lease and, during a handover,
-	// counts the workload's pods.
+	// at what remains of the workload.
 	Interval time.Duration
 	Log      *slog.Logger
 }
@@ -51,9 +54,9 @@ type Handover struct {
 //   - while the lease reports a handover (lease.Status.Handover: in standby,
 //     the site's term ended and no yield for it is in the log yet), it sets
 //     KEDA's paused-replicas annotation to "0", so the workload goes now
-//     rather than after the ScaledObject's cooldownPeriod, counts the
-//     target's pods until there are none left, terminating ones included,
-//     and then has the lease write a yield;
+//     rather than after the ScaledObject's cooldownPeriod, waits until
+//     KEDA has scaled the target to zero and none of its pods is left,
+//     terminating ones included, and then has the lease write a yield;
 //   - it removes the annotation when this participant starts to say that
 //     its site holds the lease, and whenever another site holds the latest
 //     term, so that a scaler stopped half-way through a handover cannot
@@ -102,7 +105,7 @@ func (h Handover) Run(ctx context.Context) {
 }
 
 // stop pauses the workload for the handover of epoch and asks for the yield
-// once no pod is left.
+// once nothing of it remains.
 func (h Handover) stop(ctx context.Context, epoch int64, pausedFor, yieldedFor *int64) {
 	if *pausedFor != epoch {
 		if err := h.Workload.Pause(ctx, h.ScaledObject); err != nil {
@@ -112,7 +115,7 @@ func (h Handover) stop(ctx context.Context, epoch int64, pausedFor, yieldedFor *
 		h.Log.Info("handover: workload paused", "scaled_object", h.ScaledObject, "epoch", epoch)
 		*pausedFor = epoch
 	}
-	n, err := h.Workload.Pods(ctx, h.ScaledObject)
+	n, err := h.Workload.Remaining(ctx, h.ScaledObject)
 	switch {
 	case err != nil:
 		h.Log.Warn("handover: cannot count the workload's pods", "scaled_object", h.ScaledObject, "epoch", epoch, "err", err)

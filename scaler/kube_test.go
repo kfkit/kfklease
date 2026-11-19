@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -25,9 +26,13 @@ type fakeAPI struct {
 	gvkr    string // the scaleTargetGVKR status, as JSON; empty for none
 	scaleAt string // the path of the target's scale subresource
 	sel     string
-	pods    int
-	patches []string
-	tokens  []string
+	// replicas is the scale's spec.replicas; pods are the pods the selector
+	// matches, all of them terminating if terminating is set.
+	replicas    int
+	pods        int
+	terminating bool
+	patches     []string
+	tokens      []string
 }
 
 func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -56,17 +61,38 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		fmt.Fprintf(w, `{"spec":{"scaleTargetRef":{"name":"conn"}},"status":%s}`, status)
 	case r.Method == http.MethodGet && r.URL.Path == f.scaleAt:
-		fmt.Fprintf(w, `{"status":{"replicas":3,"selector":%q}}`, f.sel)
-	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/namespaces/ns/pods" && r.URL.Query().Get("labelSelector") == f.sel:
-		items := make([]string, f.pods)
-		for i := range items {
-			items[i] = `{"metadata":{"name":"p"}}`
+		// As the API server writes a Scale: spec.replicas is left out at
+		// zero.
+		spec := "{}"
+		if f.replicas != 0 {
+			spec = fmt.Sprintf(`{"replicas":%d}`, f.replicas)
 		}
+		fmt.Fprintf(w, `{"kind":"Scale","spec":%s,"status":{"replicas":%d,"selector":%q}}`, spec, f.pods, f.sel)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/namespaces/ns/pods" && r.URL.Query().Get("labelSelector") == f.sel:
+		pod := `{"metadata":{"name":"p"}}`
+		if f.terminating {
+			pod = `{"metadata":{"name":"p","deletionTimestamp":"2026-11-19T10:00:00Z"}}`
+		}
+		items := slices.Repeat([]string{pod}, f.pods)
 		fmt.Fprintf(w, `{"items":[%s]}`, strings.Join(items, ","))
 	default:
 		w.WriteHeader(http.StatusForbidden)
 		fmt.Fprintf(w, `{"kind":"Status","message":"%s %s is forbidden"}`, r.Method, r.URL.String())
 	}
+}
+
+// setScale changes the workload while a handover looks at it.
+func (f *fakeAPI) setScale(replicas, pods int) {
+	f.mu.Lock()
+	f.replicas, f.pods = replicas, pods
+	f.mu.Unlock()
+}
+
+// requests is how many requests the API has answered.
+func (f *fakeAPI) requests() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.tokens)
 }
 
 func newFakeKube(t *testing.T) (*Kube, *fakeAPI) {
@@ -76,7 +102,9 @@ func newFakeKube(t *testing.T) (*Kube, *fakeAPI) {
 		gvkr:    `{"group":"apps","version":"v1","kind":"Deployment","resource":"deployments"}`,
 		scaleAt: "/apis/apps/v1/namespaces/ns/deployments/conn/scale",
 		sel:     "app=conn,tier in (a,b)",
-		pods:    3,
+		// A workload that runs.
+		replicas: 3,
+		pods:     3,
 	}
 	srv := httptest.NewServer(api)
 	t.Cleanup(srv.Close)
@@ -114,41 +142,55 @@ func TestKubePauseAndUnpause(t *testing.T) {
 	}
 }
 
-func TestKubePods(t *testing.T) {
+// The workload is down only when its target is scaled to zero and no pod is
+// left. Either alone is not that: replicas asked for with no pod is a
+// rollout, a pod restart or a KEDA that has not acted on the pause yet, and
+// the pod comes back; a pod with no replicas asked for is still running.
+func TestKubeRemaining(t *testing.T) {
 	k, api := newFakeKube(t)
 	ctx := context.Background()
-	n, err := k.Pods(ctx, "conn")
-	if err != nil || n != 3 {
-		t.Fatalf("pods = %d, %v; want 3", n, err)
-	}
-	api.pods = 0
-	if n, err := k.Pods(ctx, "conn"); err != nil || n != 0 {
-		t.Fatalf("pods = %d, %v; want 0", n, err)
+	for _, tt := range []struct {
+		name           string
+		replicas, pods int
+		terminating    bool
+		want           int
+	}{
+		{"running", 3, 3, false, 3},
+		{"replicas asked for, no pod", 1, 0, false, 1},
+		{"scaled to zero, a pod terminating", 0, 1, true, 1},
+		{"scaled to zero, a pod running", 0, 1, false, 1},
+		{"scaled down, more pods terminating", 1, 3, true, 3},
+		{"scaled to zero, no pod: down", 0, 0, false, 0},
+	} {
+		api.replicas, api.pods, api.terminating = tt.replicas, tt.pods, tt.terminating
+		if n, err := k.Remaining(ctx, "conn"); err != nil || n != tt.want {
+			t.Errorf("%s: remaining = %d, %v; want %d", tt.name, n, err, tt.want)
+		}
 	}
 
 	// A target in the core group, a custom resource elsewhere: the paths
 	// follow KEDA's status.
 	api.gvkr = `{"group":"","version":"v1","kind":"ReplicationController","resource":"replicationcontrollers"}`
 	api.scaleAt = "/api/v1/namespaces/ns/replicationcontrollers/conn/scale"
-	if _, err := k.Pods(ctx, "conn"); err != nil {
+	if _, err := k.Remaining(ctx, "conn"); err != nil {
 		t.Fatal(err)
 	}
 	api.gvkr = `{"group":"kafka.strimzi.io","version":"v1beta2","kind":"KafkaConnect","resource":"kafkaconnects"}`
 	api.scaleAt = "/apis/kafka.strimzi.io/v1beta2/namespaces/ns/kafkaconnects/conn/scale"
-	if _, err := k.Pods(ctx, "conn"); err != nil {
+	if _, err := k.Remaining(ctx, "conn"); err != nil {
 		t.Fatal(err)
 	}
 
 	// No count without a target KEDA has resolved, nor without a selector:
 	// an empty one would count every pod of the namespace.
 	api.gvkr = ""
-	if _, err := k.Pods(ctx, "conn"); err == nil || !strings.Contains(err.Error(), "no scale target") {
+	if _, err := k.Remaining(ctx, "conn"); err == nil || !strings.Contains(err.Error(), "no scale target") {
 		t.Fatalf("err = %v, want no scale target", err)
 	}
 	api.gvkr = `{"group":"apps","version":"v1","kind":"Deployment","resource":"deployments"}`
 	api.scaleAt = "/apis/apps/v1/namespaces/ns/deployments/conn/scale"
 	api.sel = ""
-	if _, err := k.Pods(ctx, "conn"); err == nil || !strings.Contains(err.Error(), "no selector") {
+	if _, err := k.Remaining(ctx, "conn"); err == nil || !strings.Contains(err.Error(), "no selector") {
 		t.Fatalf("err = %v, want no selector", err)
 	}
 }

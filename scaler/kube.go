@@ -94,10 +94,15 @@ func (k *Kube) scaledObjectPath(so string) string {
 	return fmt.Sprintf("/apis/keda.sh/v1alpha1/namespaces/%s/scaledobjects/%s", url.PathEscape(k.Namespace), url.PathEscape(so))
 }
 
-// Pods counts the pods of ScaledObject so's target, terminating ones
-// included: the pods the target's scale subresource selects. The target's
-// resource comes from the status KEDA writes on the ScaledObject.
-func (k *Kube) Pods(ctx context.Context, so string) (int, error) {
+// Remaining is how much of ScaledObject so's target is left: the larger of
+// the replicas its scale subresource asks for (spec.replicas) and the count
+// of the pods that subresource selects, terminating ones included. It is 0
+// only when the target is scaled to zero and no pod is left. No pod alone
+// is not that: while replicas are asked for, the target's controller
+// creates one, as in the middle of a rollout or a pod restart, or before
+// KEDA has acted on a pause. The target's resource comes from the status
+// KEDA writes on the ScaledObject.
+func (k *Kube) Remaining(ctx context.Context, so string) (int, error) {
 	var obj struct {
 		Spec struct {
 			ScaleTargetRef struct {
@@ -124,6 +129,10 @@ func (k *Kube) Pods(ctx context.Context, so string) (int, error) {
 		base = "/api/" + gvkr.Version
 	}
 	var scale struct {
+		Spec struct {
+			// Left out by the API server when it is zero.
+			Replicas int `json:"replicas"`
+		} `json:"spec"`
 		Status struct {
 			Selector string `json:"selector"`
 		} `json:"status"`
@@ -143,7 +152,7 @@ func (k *Kube) Pods(ctx context.Context, so string) (int, error) {
 	if err := k.do(ctx, http.MethodGet, podsPath, nil, &pods); err != nil {
 		return 0, err
 	}
-	return len(pods.Items), nil
+	return max(scale.Spec.Replicas, len(pods.Items)), nil
 }
 
 // do sends one request; a body is a JSON merge patch.
