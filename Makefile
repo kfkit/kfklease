@@ -17,6 +17,7 @@ integration:
 	$(COMPOSE) up -d --wait kafka
 	KFKLEASE_BROKERS=$(BROKERS) \
 	KFKLEASE_SASL_BROKERS=localhost:$(KAFKA_HOST_SASL_PORT) \
+	KFKLEASE_SASL_USER=$(SASL_USER) KFKLEASE_SASL_PASSWORD=$(SASL_PASSWORD) \
 	KFKLEASE_MTLS_BROKERS=localhost:$(KAFKA_HOST_MTLS_PORT) KFKLEASE_CERTS_DIR=$(CURDIR)/test/e2e/.out/certs \
 	$(GO) test -race -count=1 -run Integration -v ./lease/
 

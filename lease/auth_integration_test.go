@@ -14,15 +14,27 @@ import (
 	"github.com/twmb/franz-go/pkg/kadm"
 )
 
-// The stand's broker has a SASL_PLAINTEXT listener (PLAIN user "kfklease",
-// SCRAM users created here) and an SSL listener that requires a client
-// certificate. KFKLEASE_SASL_BROKERS, KFKLEASE_MTLS_BROKERS and
-// KFKLEASE_CERTS_DIR point at them; `make integration` sets all three.
-
-const (
-	saslUser     = "kfklease"
-	saslPassword = "kfklease-secret"
+// The stand's broker has a SASL_PLAINTEXT listener (a PLAIN user, SCRAM
+// credentials for it created here) and an SSL listener that requires a
+// client certificate. KFKLEASE_SASL_BROKERS, KFKLEASE_MTLS_BROKERS and
+// KFKLEASE_CERTS_DIR point at them, KFKLEASE_SASL_USER and
+// KFKLEASE_SASL_PASSWORD name the user; `make integration` sets all five,
+// the user from test/e2e/.env, its one home.
+var (
+	saslUser     = os.Getenv("KFKLEASE_SASL_USER")
+	saslPassword = os.Getenv("KFKLEASE_SASL_PASSWORD")
 )
+
+// saslBrokers returns the SASL listener, or skips the test when it or the
+// user is not given.
+func saslBrokers(t *testing.T) []string {
+	t.Helper()
+	bs := optionalBrokers(t, "KFKLEASE_SASL_BROKERS")
+	if saslUser == "" || saslPassword == "" {
+		t.Skip("KFKLEASE_SASL_USER or KFKLEASE_SASL_PASSWORD not set")
+	}
+	return bs
+}
 
 // upsertScram gives saslUser a SCRAM credential through the plaintext
 // admin listener.
@@ -71,7 +83,7 @@ func failsWith(t *testing.T, bs []string, auth Auth) {
 }
 
 func TestIntegrationSASLPlain(t *testing.T) {
-	bs := optionalBrokers(t, "KFKLEASE_SASL_BROKERS")
+	bs := saslBrokers(t)
 	pw := filepath.Join(t.TempDir(), "password")
 	if err := os.WriteFile(pw, []byte(saslPassword+"\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -81,7 +93,7 @@ func TestIntegrationSASLPlain(t *testing.T) {
 }
 
 func TestIntegrationSASLScram(t *testing.T) {
-	bs := optionalBrokers(t, "KFKLEASE_SASL_BROKERS")
+	bs := saslBrokers(t)
 	upsertScram(t, kadm.ScramSha256)
 	upsertScram(t, kadm.ScramSha512)
 	acquiresWith(t, bs, Auth{SASL: SASL{Mechanism: MechanismScramSha256, Username: saslUser, Password: saslPassword}})
