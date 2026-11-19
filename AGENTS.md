@@ -83,6 +83,11 @@ k3s-b`, `scenarios.sh`, `docker compose down -v`. k3s-a authenticates over
 mTLS from a mounted Secret, k3s-b over SASL from environment variables, so
 every scenario also covers both ways of handing secrets to the scaler.
 
+- One home for each constant: `test/e2e/.env` for what compose and the
+  Makefile read as well (addresses, ports, the SASL user, image names),
+  `lib.sh` for the rest. The takeover delay is the chart's: `deploy.sh`
+  writes down what it rendered and the scenarios read that.
+
 - Do not tear the stand down in the same command as the scenarios: a
   failure with no logs left is a failure you get to reproduce.
 - `docker network disconnect` does not partition anything here (bridge

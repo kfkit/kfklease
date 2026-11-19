@@ -154,3 +154,7 @@ $RECYCLE.BIN/
 .nfs*
 # Log files created by default by the nohup command
 nohup.out
+
+# Not a secret and not local: the constants of the e2e stand. Last, so that
+# no `.env` pattern above ignores it.
+!/test/e2e/.env

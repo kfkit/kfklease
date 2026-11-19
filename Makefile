@@ -1,5 +1,8 @@
 GO ?= go
-BROKERS ?= localhost:19092
+# The stand's ports and image names: the file compose.yaml and the stand's
+# scripts read as well.
+include test/e2e/.env
+BROKERS ?= localhost:$(KAFKA_HOST_PORT)
 
 .PHONY: test integration lint image generate
 
@@ -11,8 +14,8 @@ test:
 integration:
 	docker compose -f test/e2e/compose.yaml up -d --wait kafka
 	KFKLEASE_BROKERS=$(BROKERS) \
-	KFKLEASE_SASL_BROKERS=localhost:19094 \
-	KFKLEASE_MTLS_BROKERS=localhost:19095 KFKLEASE_CERTS_DIR=$(CURDIR)/test/e2e/.out/certs \
+	KFKLEASE_SASL_BROKERS=localhost:$(KAFKA_HOST_SASL_PORT) \
+	KFKLEASE_MTLS_BROKERS=localhost:$(KAFKA_HOST_MTLS_PORT) KFKLEASE_CERTS_DIR=$(CURDIR)/test/e2e/.out/certs \
 	$(GO) test -race -count=1 -run Integration -v ./lease/
 
 # shellcheck is required in CI and optional on a developer's machine.
@@ -31,7 +34,7 @@ lint:
 	test/e2e/selftest.sh
 
 image:
-	docker build -t kfklease-scaler:dev .
+	docker build -t $(SCALER_IMAGE) .
 
 generate:
 	$(GO) generate ./...

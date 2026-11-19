@@ -20,10 +20,16 @@ source ./lib.sh
 # scenario raises it for its duration.
 want=1
 
-# A takeover by the other site comes a TTL after the holder's last renewal
-# at the latest, plus the takeover delay; TAKEOVER leaves two TTLs on top
-# for KEDA and the pod start.
-TAKEOVER=$(( TTL + TAKEOVER_DELAY + 2 * TTL ))
+# Another site waits TAKEOVER_DELAY seconds after the end of a term: the
+# delay the chart rendered, which deploy.sh wrote down. A takeover by the
+# other site comes a TTL after the holder's last renewal at the latest, plus
+# the takeover delay; TAKEOVER leaves two TTLs on top for KEDA and the pod
+# start. Neither is set before the first deploy.sh: selftest.sh runs this
+# file that way, and a scenario that begins fails.
+if [[ -s $TAKEOVER_DELAY_FILE ]]; then
+  TAKEOVER_DELAY=$(<"$TAKEOVER_DELAY_FILE")
+  TAKEOVER=$(( TTL + TAKEOVER_DELAY + 2 * TTL ))
+fi
 # A scenario ends with WATCH seconds in which nothing may move.
 WATCH=$(( 2 * TTL ))
 # A workload that stays is watched for KEDA's cooldown and ten seconds more.
@@ -153,6 +159,7 @@ now_rfc3339() {
 # cluster; o, the other one; since, the time from which the heartbeat report
 # is read at the end.
 begin() {
+  [[ -n ${TAKEOVER_DELAY:-} ]] || fail "no ${TAKEOVER_DELAY_FILE}: deploy.sh writes it" || return
   h=$(settle) || return
   o=$(other "$h")
   since=$(now_rfc3339)
@@ -173,7 +180,7 @@ begin_staying() {
 # overlap between epochs: the workload-level mutual exclusion check.
 heartbeats() {
   local since=$1 out
-  out=$(docker run --rm --network "${COMPOSE_PROJECT}_kfk" kfklease-heartbeat:dev report \
+  out=$(docker run --rm --network "$KFK_NETWORK" "$HEARTBEAT_IMAGE" report \
     --brokers "$KAFKA_ADDR:$KAFKA_PORT" --since "$since" --json)
   python3 - "$out" <<'PY'
 import sys, json
@@ -239,7 +246,7 @@ scenario_restart() {
   begin_staying || return
   # The holder releases on its way out and a new pod of the same site
   # claims at once; the other site would wait the takeover delay.
-  kc "$h" -n "$NS" delete pod -l app.kubernetes.io/name=kfklease --wait=false >/dev/null
+  kc "$h" -n "$NS" delete pod -l "$SCALER_PODS" --wait=false >/dev/null
   new_epoch "$h" "$before" "the pods were deleted" >/dev/null || return
   stays "$h" "$uids" || return
   heartbeats "$since"
@@ -266,7 +273,7 @@ scenario_holder_pod() {
 # scaler_pods <cluster> prints one line per scaler pod: name, image, ready,
 # and why its container waits, if it does.
 scaler_pods() {
-  kc "$1" -n "$NS" get pods -l app.kubernetes.io/name=kfklease -o json | python3 -c '
+  kc "$1" -n "$NS" get pods -l "$SCALER_PODS" -o json | python3 -c '
 import sys, json
 for p in json.load(sys.stdin)["items"]:
     c = (p["status"].get("containerStatuses") or [{}])[0]
@@ -291,7 +298,7 @@ scenario_bad_image() {
   echo "   the rollout is stuck:" && scaler_pods "$h" | sed 's/^/     /'
   stays "$h" "$uids" || return
   pods=$(scaler_pods "$h")
-  [[ $(grep -c ':dev True' <<<"$pods") == 2 ]] || fail "the old scaler pods did not stay ready: ${pods}" || return
+  [[ $(grep -cF "${SCALER_IMAGE} True" <<<"$pods") == 2 ]] || fail "the old scaler pods did not stay ready: ${pods}" || return
   (( $(held_epoch "$h") >= before )) || fail "${h} no longer holds the lease" || return
   ./deploy.sh "$h" >/dev/null
   heartbeats "$since"
@@ -472,7 +479,7 @@ scenario_scaler_down() {
 # lease_status prints `kfklease-scaler status` for the lease, read from
 # outside both clusters.
 lease_status() {
-  docker run --rm --network "${COMPOSE_PROJECT}_kfk" kfklease-scaler:dev status \
+  docker run --rm --network "$KFK_NETWORK" "$SCALER_IMAGE" status \
     -brokers "$KAFKA_ADDR:$KAFKA_PORT" -topic "$TOPIC" -ttl "${TTL}s" -log-level warn
 }
 
@@ -562,7 +569,7 @@ scenario_handover_crash() {
   wait_until "$(left "$t0" $(( 2 * TTL )))" "${h} did not stop its workload" runs "$h" 0 || return
   (( $(pods_left "$h") > 0 )) || fail "the finalizer did not hold the pod" || return
   echo "   ${h} paused and its pod is terminating; killing its scaler pods"
-  kc "$h" -n "$NS" delete pod -l app.kubernetes.io/name=kfklease --grace-period=0 --force >/dev/null 2>&1
+  kc "$h" -n "$NS" delete pod -l "$SCALER_PODS" --grace-period=0 --force >/dev/null 2>&1
   kc "$h" -n "$NS" rollout status "deploy/$RELEASE" --timeout=120s >/dev/null
   # A pod that still terminates is a pod that may still run: no yield, so
   # the other site does not start.

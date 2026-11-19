@@ -2,6 +2,7 @@
 # with the lease epoch five times a second while the local scaler believes
 # it holds the lease. KEDA owns its replica count through the chart's
 # ScaledObject: 1 while this cluster holds the lease, 0 otherwise.
+# deploy.sh fills in the ${...} with envsubst.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -19,13 +20,13 @@ spec:
       terminationGracePeriodSeconds: 2
       containers:
         - name: singleton
-          image: kfklease-heartbeat:dev
+          image: ${HEARTBEAT_IMAGE}
           imagePullPolicy: Never
           args: ["beat"]
           env:
             - name: CLUSTER
               value: ${CLUSTER}
             - name: HEARTBEAT_BROKERS
-              value: 172.30.0.10:9092
+              value: ${HEARTBEAT_BROKERS}
             - name: KFKLEASE_STATUS_URL
-              value: http://kfklease:9091/status
+              value: http://${RELEASE}:9091/status

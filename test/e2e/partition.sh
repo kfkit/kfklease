@@ -11,8 +11,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
-
-KAFKA_ADDR=172.30.0.10
+# shellcheck source=lib.sh
+source ./lib.sh
 
 action=${1:?usage: partition.sh cut|heal <service>}
 service=${2:?usage: partition.sh cut|heal <service>}

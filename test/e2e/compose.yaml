@@ -8,11 +8,18 @@
 # inside the node's network namespace. Do not use `docker network disconnect`
 # for that: bridge networks are not reliably isolated from each other on every
 # Docker engine, and flannel's vxlan backend panics when an interface vanishes.
-name: kfklease-e2e
+#
+# The project name, the broker's address and ports and its SASL user are in
+# .env, next to this file: compose reads it by itself, from any directory.
 
+# What the two clusters share. A merge replaces lists whole, so command,
+# volumes and ports are written out for each cluster.
 x-k3s: &k3s
   image: rancher/k3s:v1.35.8-k3s1
   privileged: true
+  environment:
+    K3S_KUBECONFIG_OUTPUT: /output/kubeconfig.yaml
+    K3S_KUBECONFIG_MODE: "644"
   tmpfs:
     - /run
     - /var/run
@@ -34,6 +41,10 @@ services:
   certs:
     image: alpine/openssl:3.5.4
     entrypoint: ["/bin/sh", "/gen-certs.sh"]
+    environment:
+      KAFKA_ADDR: ${KAFKA_ADDR:?}
+      SASL_USER: ${SASL_USER:?}
+      SASL_PASSWORD: ${SASL_PASSWORD:?}
     volumes:
       - ./gen-certs.sh:/gen-certs.sh:ro
       - ./.out/certs:/certs
@@ -48,10 +59,16 @@ services:
       KAFKA_PROCESS_ROLES: broker,controller
       # Three flavours of the same broker: plaintext, SASL and mTLS, each
       # on the kfk network for pods and on localhost for the host.
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,HOST://:19092,SASL://:9094,HOSTSASL://:19094,MTLS://:9095,HOSTMTLS://:19095
+      KAFKA_LISTENERS: "\
+        PLAINTEXT://:${KAFKA_PORT:?},CONTROLLER://:9093,HOST://:${KAFKA_HOST_PORT:?},\
+        SASL://:${KAFKA_SASL_PORT:?},HOSTSASL://:${KAFKA_HOST_SASL_PORT:?},\
+        MTLS://:${KAFKA_MTLS_PORT:?},HOSTMTLS://:${KAFKA_HOST_MTLS_PORT:?}"
       # Pods inside k3s cannot resolve compose service names, so the broker
       # advertises its static address on the kfk network.
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://172.30.0.10:9092,HOST://localhost:19092,SASL://172.30.0.10:9094,HOSTSASL://localhost:19094,MTLS://172.30.0.10:9095,HOSTMTLS://localhost:19095
+      KAFKA_ADVERTISED_LISTENERS: "\
+        PLAINTEXT://${KAFKA_ADDR:?}:${KAFKA_PORT:?},HOST://localhost:${KAFKA_HOST_PORT:?},\
+        SASL://${KAFKA_ADDR:?}:${KAFKA_SASL_PORT:?},HOSTSASL://localhost:${KAFKA_HOST_SASL_PORT:?},\
+        MTLS://${KAFKA_ADDR:?}:${KAFKA_MTLS_PORT:?},HOSTMTLS://localhost:${KAFKA_HOST_MTLS_PORT:?}"
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,HOST:PLAINTEXT,SASL:SASL_PLAINTEXT,HOSTSASL:SASL_PLAINTEXT,MTLS:SSL,HOSTMTLS:SSL
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
@@ -73,16 +90,16 @@ services:
     volumes:
       - ./.out/certs:/certs:ro
     ports:
-      - "127.0.0.1:19092:19092"
-      - "127.0.0.1:19094:19094"
-      - "127.0.0.1:19095:19095"
+      - "127.0.0.1:${KAFKA_HOST_PORT:?}:${KAFKA_HOST_PORT:?}"
+      - "127.0.0.1:${KAFKA_HOST_SASL_PORT:?}:${KAFKA_HOST_SASL_PORT:?}"
+      - "127.0.0.1:${KAFKA_HOST_MTLS_PORT:?}:${KAFKA_HOST_MTLS_PORT:?}"
     networks:
       kfk:
-        ipv4_address: 172.30.0.10
+        ipv4_address: ${KAFKA_ADDR:?}
     healthcheck:
       test:
         - CMD-SHELL
-        - /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1
+        - /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:${KAFKA_PORT:?} >/dev/null 2>&1
       interval: 5s
       timeout: 10s
       retries: 30
@@ -95,9 +112,6 @@ services:
       - --node-name=k3s-a
       - --flannel-backend=host-gw
       - --disable=traefik,servicelb,metrics-server,local-storage
-    environment:
-      K3S_KUBECONFIG_OUTPUT: /output/kubeconfig.yaml
-      K3S_KUBECONFIG_MODE: "644"
     volumes:
       - k3s-a:/var/lib/rancher/k3s
       - ./.out/k3s-a:/output
@@ -118,9 +132,6 @@ services:
       - --https-listen-port=6444
       - --flannel-backend=host-gw
       - --disable=traefik,servicelb,metrics-server,local-storage
-    environment:
-      K3S_KUBECONFIG_OUTPUT: /output/kubeconfig.yaml
-      K3S_KUBECONFIG_MODE: "644"
     volumes:
       - k3s-b:/var/lib/rancher/k3s
       - ./.out/k3s-b:/output

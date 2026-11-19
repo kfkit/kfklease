@@ -40,9 +40,14 @@ About 2 GB of memory for the whole stand.
 docker compose down -v         # tear down, drop cluster state
 ```
 
+The broker's address and ports, its SASL user and the image names are in
+`.env`: compose reads it, the scripts do through `lib.sh`, which holds the
+rest of the stand's constants, and so does the Makefile.
+
 `deploy.sh` renders `charts/kfklease` (helm, or the `alpine/helm` image when
 helm is not installed) with site `<cluster>`, the chart's two scaler pods, `cooldownPeriod` 30 s and
-`takeoverMargin` 5 s (so a takeover delay of 40 s), and the `singleton`
+`takeoverMargin` 5 s (so a takeover delay of 40 s, which the scenarios read
+from the render, in `.out/takeover-delay`), and the `singleton`
 deployment from `manifests/` as the scale target: one replica while the
 cluster holds the lease (`REPLICAS=3 ./deploy.sh ...` for three), zero
 otherwise. `singleton` runs the heartbeat
