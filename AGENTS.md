@@ -133,7 +133,9 @@ ways of handing secrets to the scaler.
   "Upgrading from" notes in `README.md` and `docs/install.md`, which name
   the previous version. `release.yml` builds
   the multi-arch image and the chart into GHCR, signs the image with cosign
-  and writes the release. The actions in `release.yml` run only on tags, so
+  and writes the release. After the tag, a `docs:` PR puts the release into
+  `docs/provenance/release-hashes.txt` and stamps it; `docs/provenance/README.md`
+  says how. The actions in `release.yml` run only on tags, so
   a Dependabot bump of them is verified by the next release.
 - GHCR packages are public because the organisation allows public package
   creation; a new package would still start private if that setting were
