@@ -810,25 +810,67 @@ type belief struct {
 	epoch    int64
 }
 
-// status is what the agent knows, with its beliefs: its own term, and its
+// at is the belief as it stands at now: itself before its deadline, none
+// from then on.
+func (b belief) at(now time.Time) belief {
+	if now.Before(b.deadline) {
+		return b
+	}
+	return belief{}
+}
+
+// status is what the agent knows and believes at now: the Status its
+// participant reports, and the beliefs it rests on, its own term and its
 // site's term held by another participant.
 func (a *agent) status(now time.Time) (s Status, own, site belief) {
-	s = Status{Certain: a.view.Certain(), AsOf: a.view.Clock(), Ready: a.ready, Standby: a.standby}
+	s = Status{Certain: a.view.Certain(), AsOf: a.view.Clock(), Ready: a.ready, CooldownUntil: a.cooldownUntil, HandoverEpoch: -1}
 	if s.Certain {
 		s.Lease = a.view.State()
 	}
-	if a.believing(now) {
-		own = belief{a.deadline, a.epoch}
-	}
-	if now.Before(a.siteDeadline) {
-		site = belief{a.siteDeadline, a.siteEpoch}
-	}
-	if now.Before(a.cooldownUntil) {
-		s.CooldownUntil = a.cooldownUntil
-	}
-	s.HandoverEpoch = -1
 	if epoch, ok := a.handover(now); ok {
 		s.Handover, s.HandoverEpoch = true, epoch
+	}
+	return statusAt(now, a.standby, s, belief{a.deadline, a.epoch}, belief{a.siteDeadline, a.siteEpoch})
+}
+
+// statusAt is the one projection from what an agent knows and believes to
+// the Status its participant reports at now. s carries what the agent knows:
+// the log's side of it, and the cooldown and the handover as of its last
+// look. own and site are the beliefs. standby is the switch as it was asked
+// for, which the agent may not have seen yet.
+//
+// The agent calls it with its own clock for what it publishes (status), and
+// Candidate.Status calls it again on what was published, with the clock at
+// the time of the call: a participant whose loop is stalled (a frozen
+// process waking up) never reports a belief it has outlived, and standby
+// hides a term before the loop has seen the switch. The rules:
+//
+//   - a belief counts until its deadline, and not at all in standby: the
+//     agent drops both as soon as it sees the switch (setStandby);
+//   - the participant's own term is its site's term too (siteHolding), with
+//     the same epoch and deadline;
+//   - a cooldown is reported only while it lasts;
+//   - a handover is for standby only (handover): the agent drops it as soon
+//     as it sees standby off.
+//
+// The beliefs come back as they stand at now, none for one that does not
+// count, so that the result can be projected again later.
+func statusAt(now time.Time, standby bool, s Status, own, site belief) (Status, belief, belief) {
+	s.Standby = standby
+	own, site = own.at(now), site.at(now)
+	if standby {
+		own, site = belief{}, belief{}
+	} else {
+		s.Handover, s.HandoverEpoch = false, -1
+	}
+	s.Holding, s.Epoch, s.Deadline = !own.deadline.IsZero(), own.epoch, own.deadline
+	siteTerm := site
+	if s.Holding {
+		siteTerm = own
+	}
+	s.SiteHolding, s.SiteEpoch, s.SiteDeadline = !siteTerm.deadline.IsZero(), siteTerm.epoch, siteTerm.deadline
+	if !now.Before(s.CooldownUntil) {
+		s.CooldownUntil = time.Time{}
 	}
 	return s, own, site
 }

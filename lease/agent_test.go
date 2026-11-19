@@ -1338,3 +1338,43 @@ func TestAgentHandover(t *testing.T) {
 		}
 	})
 }
+
+// The projection from what an agent published to the Status reported at a
+// later moment, as Candidate.Status calls it: with a clock the loop has not
+// reached and a standby switch it has not seen.
+func TestStatusAt(t *testing.T) {
+	own, site := belief{at(8), 5}, belief{at(6), 3}
+	known := Status{Certain: true, Ready: true, CooldownUntil: at(7), Handover: true, HandoverEpoch: 5}
+	for _, tc := range []struct {
+		name      string
+		now       time.Time
+		standby   bool
+		own, site belief
+		want      Status
+	}{
+		{"own term: the site's term too", at(1), false, own, belief{},
+			Status{Holding: true, Epoch: 5, Deadline: at(8), SiteHolding: true, SiteEpoch: 5, SiteDeadline: at(8), CooldownUntil: at(7), HandoverEpoch: -1}},
+		{"own term before the site's", at(1), false, own, site,
+			Status{Holding: true, Epoch: 5, Deadline: at(8), SiteHolding: true, SiteEpoch: 5, SiteDeadline: at(8), CooldownUntil: at(7), HandoverEpoch: -1}},
+		{"site's term only", at(1), false, belief{}, site,
+			Status{SiteHolding: true, SiteEpoch: 3, SiteDeadline: at(6), CooldownUntil: at(7), HandoverEpoch: -1}},
+		{"site's term outlived", at(6), false, belief{}, site,
+			Status{CooldownUntil: at(7), HandoverEpoch: -1}},
+		{"own term and cooldown outlived", at(8), false, own, belief{},
+			Status{HandoverEpoch: -1}},
+		{"standby: no belief, and the handover", at(1), true, own, site,
+			Status{Standby: true, CooldownUntil: at(7), Handover: true, HandoverEpoch: 5}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.want.Certain, tc.want.Ready = true, true
+			got, gotOwn, gotSite := statusAt(tc.now, tc.standby, known, tc.own, tc.site)
+			if got != tc.want {
+				t.Errorf("status:\n got %+v\nwant %+v", got, tc.want)
+			}
+			// Projected again from its own result, it stays what it is.
+			if again, _, _ := statusAt(tc.now, tc.standby, got, gotOwn, gotSite); again != got {
+				t.Errorf("projected twice:\n got %+v\nwant %+v", again, got)
+			}
+		})
+	}
+}

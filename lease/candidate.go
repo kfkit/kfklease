@@ -242,14 +242,15 @@ type Candidate struct {
 	cfg Config
 	log *slog.Logger
 
-	mu      sync.Mutex
-	status  Status // without Holding and Epoch, which depend on the clock
-	changed chan struct{}
-	// The beliefs: its own term and its site's, each until a deadline
-	// (monotonic). Status checks the deadlines itself, so that a Candidate
-	// whose loop is stalled (a frozen process waking up) never reports a
-	// belief it has outlived.
+	mu sync.Mutex
+	// status is what the loop published last, as of its own clock then,
+	// with the beliefs it rests on: its own term and its site's, each until
+	// a deadline (monotonic). Status projects them again at the time of the
+	// call (statusAt), so that a Candidate whose loop is stalled (a frozen
+	// process waking up) never reports a belief it has outlived.
+	status    Status
 	own, site belief
+	changed   chan struct{}
 
 	// healthyAt is the last ReportHealthy, for the loop to pick up.
 	healthyAt time.Time
@@ -283,34 +284,14 @@ func NewCandidate(cfg Config) (*Candidate, error) {
 // Holder returns this participant's identity in the log.
 func (c *Candidate) Holder() string { return c.cfg.Holder }
 
-// Status returns the current status. Holding is evaluated against the clock
-// at the time of the call.
+// Status returns the current status. Holding and what else depends on the
+// clock are evaluated at the time of the call, and standby is what
+// SetStandby asked for, whether the loop has seen it or not; the rules are
+// statusAt's.
 func (c *Candidate) Status() Status {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	s := c.status
-	s.Standby = c.standby
-	now := time.Now()
-	switch {
-	case c.standby:
-		// Neither belief; the loop drops them as soon as it sees standby.
-	case now.Before(c.own.deadline):
-		s.Holding = true
-		s.Epoch, s.Deadline = c.own.epoch, c.own.deadline
-		s.SiteHolding = true
-		s.SiteEpoch, s.SiteDeadline = s.Epoch, s.Deadline
-	case now.Before(c.site.deadline):
-		s.SiteHolding = true
-		s.SiteEpoch, s.SiteDeadline = c.site.epoch, c.site.deadline
-	}
-	if !now.Before(s.CooldownUntil) {
-		s.CooldownUntil = time.Time{}
-	}
-	if !c.standby {
-		// A handover is for standby only; the loop drops it as soon as it
-		// sees standby off.
-		s.Handover, s.HandoverEpoch = false, -1
-	}
+	s, _, _ := statusAt(time.Now(), c.standby, c.status, c.own, c.site)
 	return s
 }
 
