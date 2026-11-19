@@ -118,7 +118,10 @@ ways of handing secrets to the scaler.
   required checks and the branch must be up to date with `main`. Each job
   calls make (`lint` and `test`, `integration`, `image`, `chart-test`,
   `e2e`): a command line belongs in the Makefile or a script, not in the
-  workflow, so that what CI runs is what runs here. Stacked
+  workflow, so that what CI runs is what runs here. A pull request that
+  touches only documents (`test/changes.sh` says which paths those are)
+  skips integration, image, chart and e2e, which pass as skipped; unit
+  always runs. Stacked
   PRs that touch the same file (the README roadmap, say) conflict after
   the first merges; resolve by hand, `update-branch` cannot.
 - `setup-go` installs exactly the `go` directive's version with
