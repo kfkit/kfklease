@@ -3,7 +3,7 @@
 Distributed leases and leader election on top of Apache Kafka®, with a
 [KEDA](https://keda.sh) metric for lease-driven failover.
 
-> Status: v0.4: the protocol, the client, the KEDA scaler, broker
+> Status: v0.5: the protocol, the client, the KEDA scaler, broker
 > authentication, metrics, sites with standby and handover, and two scaler
 > replicas per site work and are tested on a two-cluster stand down to the
 > workload's own writes, but nothing has run in production yet.
@@ -93,7 +93,7 @@ release name and namespace, so the same command works in every cluster with
 a different `site`:
 
 ```bash
-helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.4.0 \
+helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.5.0 \
   -n kfklease --create-namespace \
   --set brokers=kafka:9092 --set topic=my-lease --set site=eu-west \
   --set scaledObject.targetRef.name=my-singleton
@@ -110,14 +110,12 @@ Each cluster runs two scaler pods by default (`replicaCount`): one holds
 the term, every one answers KEDA for the site, and losing one, or an
 upgrade to an image that does not pull, moves nothing.
 
-Upgrading from 0.3.0: `holderPrefix` is now `site`, which is required
-(`--set site=eu-west`); `scaledObject.target` is now
-`scaledObject.targetRef.name` (`--set scaledObject.targetRef.name=my-singleton`);
-the old values fail the render. `cooldownPeriod` is now 60 s and a
-failover waits `takeoverDelay`. Two scaler pods run per cluster
-(`replicaCount: 2`, `RollingUpdate`, a PodDisruptionBudget), and KEDA is
-told whether the site holds the lease; a workload that reads `/status`
-fences on `site_holding` and `site_epoch`. See [CHANGELOG.md](CHANGELOG.md).
+Upgrading from 0.4.0: no value of the chart changes. Upgrade every
+cluster: the fixes are in what a scaler writes, and one of 0.4.0 can still
+leave the records in the log that mislead a reader. A boolean `KFKLEASE_*`
+variable in a manifest of your own has to be `true` or `false` (or what
+`strconv.ParseBool` reads); anything else now stops the scaler where it
+was read as false. See [CHANGELOG.md](CHANGELOG.md).
 
 The chart pulls `ghcr.io/kfkit/kfklease-scaler` at the same version:
 linux/amd64 and linux/arm64, signed with cosign. The digest and the verify

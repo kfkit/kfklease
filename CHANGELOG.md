@@ -7,6 +7,24 @@ and this project adheres to
 
 ## Unreleased
 
+## [0.5.0] - 2026-11-19
+
+### Breaking
+
+- Boolean `KFKLEASE_*` variables (`KFKLEASE_STANDBY`, `KFKLEASE_TLS`,
+  `KFKLEASE_TLS_INSECURE_SKIP_VERIFY`, `KFKLEASE_CREATE_TOPIC`,
+  `KFKLEASE_FLUSH_EVERY_RECORD`) accept what their flags accept (`1`,
+  `TRUE`, `t`, ...). Anything else, an empty value included, stops the
+  scaler with status 2; it used to be read as false without a word, so
+  `KFKLEASE_STANDBY=1` left a cluster claiming. The chart renders `true`
+  or `false` and is not affected; a manifest of your own with another
+  value is.
+- Library: `scaler.Workload.Pods` is `Remaining`, and is 0 only when the
+  target is scaled to zero and no pod is left. An implementation of
+  `Workload` other than `scaler.Kube` has to follow.
+- Library: `lease.Candidate.Run` returns `lease.ErrLogReplaced` when the
+  lease topic was deleted and created again; it used to keep running.
+
 ### Fixed
 
 - A stop (`Run`'s context cancelled, a pod terminated) no longer writes a
@@ -38,12 +56,6 @@ and this project adheres to
 - The handover writes its yield only when KEDA has scaled the target to
   zero and no pod is left. "No pod right now" was enough before, which is
   also what a rollout or a pod restart looks like for a moment.
-- Boolean `KFKLEASE_*` variables (`KFKLEASE_STANDBY`, `KFKLEASE_TLS`,
-  `KFKLEASE_TLS_INSECURE_SKIP_VERIFY`, `KFKLEASE_CREATE_TOPIC`,
-  `KFKLEASE_FLUSH_EVERY_RECORD`) accept what their flags accept (`1`,
-  `TRUE`, `t`, ...). Anything else, an empty value included, stops the
-  scaler with status 2; it used to be read as false without a word, so
-  `KFKLEASE_STANDBY=1` left a cluster claiming.
 - Docs: the `scalerAddress` in the README is the one the chart renders
   (`kfklease.kfklease.svc:9090`); the `/status` sample in docs/install.md
   shows every field, and a test keeps it so; the Records table in
