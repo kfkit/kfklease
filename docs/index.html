@@ -99,6 +99,16 @@
     .controls > div:nth-child(n) { justify-content: flex-start; }
     .readout { grid-template-columns: 1fr; }
   }
+  /* The way out at the end: the repository and the releases, as buttons. */
+  .cta { display: flex; flex-wrap: wrap; gap: .8rem; margin: .4rem 0 1.4rem; }
+  a.cta-link {
+    display: inline-block; font-weight: 700; text-decoration: none; color: var(--fg);
+    background: var(--panel); border: 3px solid var(--fg); padding: .45rem .9rem;
+    box-shadow: 4px 4px 0 var(--rule);
+  }
+  a.cta-link:hover { background: var(--accent); color: var(--bg); }
+  a.cta-link:active { transform: translate(4px, 4px); box-shadow: none; }
+  a.cta-link:focus-visible { outline: 3px solid var(--key); outline-offset: 2px; }
 </style>
 </head>
 <body>
@@ -309,6 +319,10 @@
 <section class="slide" id="s15">
   <p class="kicker">14 &middot; go</p>
   <h2>One release per cluster</h2>
+  <p class="cta">
+    <a class="cta-link" href="https://github.com/kfkit/kfklease">Source on GitHub &#9654;</a>
+    <a class="cta-link" href="https://github.com/kfkit/kfklease/releases">Releases &#9654;</a>
+  </p>
 <pre><code>helm install kfklease oci://ghcr.io/kfkit/charts/kfklease \
   -n kfklease --create-namespace \
   --set brokers=kafka:9092 --set topic=my-lease \
@@ -336,6 +350,7 @@
   Written and maintained by <a rel="me" href="https://www.linkedin.com/in/ivan-abramov-8605078/">Ivan Abramov</a>.
   Apache-2.0. Apache Kafka&reg; is a registered trademark of The Apache Software Foundation;
   kfkit is not affiliated with or endorsed by the ASF.
+  Source: <a href="https://github.com/kfkit/kfklease">github.com/kfkit/kfklease</a>.
 </footer>
 
 <nav class="pager" aria-label="Slides">
