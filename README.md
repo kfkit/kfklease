@@ -223,7 +223,7 @@ in [docs/install.md](docs/install.md#choosing-ttl-and-margin).
 ### With Claude Code
 
 The repository carries a skill for whoever adopts kfklease with
-[Claude Code](https://claude.com/claude-code): what to find out before
+[Claude Code](https://claude.com/product/claude-code): what to find out before
 installing, what the numbers trade, how to fence, how to move a workload on
 purpose, and what not to do, each step pointing at the section of
 [docs/install.md](docs/install.md) it rests on.
