@@ -17,7 +17,7 @@ classify() {
     [[ -n $path ]] || continue
     seen=true
     case $path in
-      *.md | docs/* | LICENSE | NOTICE | .github/ISSUE_TEMPLATE/*) ;;
+      *.md | docs/* | LICENSE | NOTICE | .github/ISSUE_TEMPLATE/* | claude-plugin/* | .claude-plugin/*) ;;
       *) code=true ;;
     esac
   done

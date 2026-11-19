@@ -121,7 +121,8 @@ ways of handing secrets to the scaler.
   calls make (`lint` and `test`, `integration`, `image`, `chart-test`,
   `e2e`): a command line belongs in the Makefile or a script, not in the
   workflow, so that what CI runs is what runs here. A pull request that
-  touches only documents (`test/changes.sh` says which paths those are)
+  touches only documents (`test/changes.sh` says which paths those are:
+  the skill in `claude-plugin/` is one)
   skips integration, image, chart and e2e, which pass as skipped; unit
   always runs. Stacked
   PRs that touch the same file (the README roadmap, say) conflict after

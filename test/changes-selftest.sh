@@ -24,6 +24,7 @@ expect false README.md
 expect false README.md CHANGELOG.md AGENTS.md docs/install.md docs/protocol.md test/e2e/README.md
 expect false docs/provenance/release-hashes.txt docs/provenance/release-hashes.txt.ots
 expect false LICENSE NOTICE .github/ISSUE_TEMPLATE/task.yml .github/PULL_REQUEST_TEMPLATE.md
+expect false claude-plugin/skills/kfklease/SKILL.md claude-plugin/.claude-plugin/plugin.json .claude-plugin/marketplace.json
 expect true README.md lease/agent.go
 expect true charts/kfklease/values.yaml
 expect true charts/kfklease/templates/NOTES.txt
