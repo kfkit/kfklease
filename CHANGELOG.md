@@ -56,6 +56,9 @@ and this project adheres to
 - `make lint` runs `shellcheck -x` over the stand's scripts. In CI a
   missing shellcheck fails it; elsewhere the scripts are skipped with a
   message.
+- `make chart-test` runs the chart's tests and `make e2e` the stand from
+  nothing to the last scenario; CI calls make for every job, so what it
+  runs is what runs locally.
 - Docs and the library's comments: a holder id has to be unique among the
   participants alive at one time, where they asked for one per process
   incarnation. It may repeat when a process restarts, as the chart's
@@ -65,6 +68,11 @@ and this project adheres to
 
 - `View.AllowSkew`: how far apart two partition leaders' clocks may be.
   Participants pass their margin.
+- Library: `lease.HandoverDriver`, the decisions of the handover without
+  the I/O (when to pause, when to ask for the yield, when to lift the
+  pause), which `scaler.Handover` now carries out; `lease.State.LastSite`;
+  `scaler.LogLease`, the lease as the log says, shared by
+  `kfklease-scaler status` and the metrics.
 - Docs: "When the partition leader dies" in docs/install.md: what a hard
   failure of the lease partition's leader costs at the default TTL (the
   term and its epoch, not the workload), measured, and the two ways to

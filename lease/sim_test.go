@@ -195,9 +195,9 @@ type simNode struct {
 	trippedAt  time.Time
 
 	standby bool
-	// wasSiteHolding is siteHolding at the node's last step, for the
-	// handover driver, which lifts a pause when it turns true.
-	wasSiteHolding bool
+	// driver is the handover driver of the node's process, as the scaler
+	// runs one next to its participant: it goes with the process.
+	driver *HandoverDriver
 
 	// stopBy is set while the node is being stopped, as Run does it: the
 	// agent was told to stop and is driven on until it has nothing left to
@@ -574,21 +574,76 @@ func b2f(b bool) float64 {
 	return 0
 }
 
+// simSeeds is how many runs a flavour gets, seeds 1 to that: full, or short
+// with -short.
+func simSeeds(full, short int) int {
+	if testing.Short() {
+		return short
+	}
+	return full
+}
+
+// wantNoOverlap fails the run of seed when it had an instant at which who,
+// "two agents" or "two sites", believed they hold the lease.
+func wantNoOverlap(t *testing.T, seed uint64, overlapAt time.Time, who string) {
+	t.Helper()
+	if !overlapAt.IsZero() {
+		t.Fatalf("seed %d, t=%v: %s believe they hold the lease", seed, overlapAt.Sub(t0), who)
+	}
+}
+
+// simReference is the log of one run as the reference reader folds it, the
+// one that saw everything: its state and its clock after each record, the
+// terms it saw start and the records it rejected.
+type simReference struct {
+	states          []State
+	clocks          []time.Time
+	terms, rejected int
+}
+
+func simFold(t *testing.T, seed uint64, records []Record) simReference {
+	t.Helper()
+	ref := simReference{states: make([]State, len(records)), clocks: make([]time.Time, len(records))}
+	v := NewViewFromStart(simTTL)
+	for i, r := range records {
+		out, err := v.Apply(r)
+		if err != nil {
+			t.Fatalf("seed %d: %v", seed, err)
+		}
+		if out == Accepted && r.Kind == Claim {
+			ref.terms++
+		}
+		if out == Rejected {
+			ref.rejected++
+		}
+		ref.states[i], ref.clocks[i] = v.State(), v.Clock()
+	}
+	return ref
+}
+
+// simTermsAndReleases runs the flavour p, 100 runs or 20, holds every run
+// to safety, and returns the number of runs, the terms their reference
+// readers saw start and the releases of the kind the flavour is about, as
+// releases counts them in a run.
+func simTermsAndReleases(t *testing.T, p simParams, releases func(simStats) int) (seeds, terms, released int) {
+	t.Helper()
+	seeds = simSeeds(100, 20)
+	for seed := uint64(1); seed <= uint64(seeds); seed++ {
+		records, overlapAt, st := runSimStats(t, seed, p)
+		wantNoOverlap(t, seed, overlapAt, "two agents")
+		released += releases(st)
+		terms += simFold(t, seed, records).terms
+	}
+	return seeds, terms, released
+}
+
 // checkAgreement is the agreement property over one log: a reader started
 // at any offset, once certain, has the state of the reader that saw
 // everything, at every record from there on. skew is what the readers allow
 // for the brokers' clocks, as a participant does with its margin.
 func checkAgreement(t *testing.T, seed uint64, records []Record, skew time.Duration) {
 	t.Helper()
-	ref := NewViewFromStart(simTTL)
-	refStates := make([]State, len(records))
-	refClocks := make([]time.Time, len(records))
-	for i, r := range records {
-		if _, err := ref.Apply(r); err != nil {
-			t.Fatalf("seed %d: %v", seed, err)
-		}
-		refStates[i], refClocks[i] = ref.State(), ref.Clock()
-	}
+	ref := simFold(t, seed, records)
 	for start := range records {
 		late := NewView(simTTL)
 		late.AllowSkew(skew)
@@ -599,13 +654,13 @@ func checkAgreement(t *testing.T, seed uint64, records []Record, skew time.Durat
 			if !late.Certain() {
 				continue
 			}
-			got, want := late.State(), refStates[i]
+			got, want := late.State(), ref.states[i]
 			now := late.Clock()
 			if got.HeldAt(now) != want.HeldAt(now) || (want.HeldAt(now) && got != want) {
 				t.Fatalf("seed %d: reader from offset %d disagrees at offset %d: got %+v, want %+v; records from %d: %v",
 					seed, start, i, got, want, start, records[start:i+1])
 			}
-			if got == want && now.Equal(refClocks[i]) {
+			if got == want && now.Equal(ref.clocks[i]) {
 				// The same state at the same time: the same fold from
 				// here on.
 				break
@@ -614,22 +669,33 @@ func checkAgreement(t *testing.T, seed uint64, records []Record, skew time.Durat
 	}
 }
 
-// simHandover is the scaler's handover driver for node n: while its agent
-// reports a handover, pause the site's workload and, once it is down, ask
-// for the yield; lift the pause when the node starts to say its site holds,
-// or when another site holds the latest term.
+// simHandover is a look of node n's handover driver, the rules the scaler
+// runs (HandoverDriver), carried out on the site's workload: while the
+// node's agent reports a handover, pause the workload and, once it is down,
+// ask for the yield; lift the pause when the node starts to say its site
+// holds, or when another site holds the latest term.
 func simHandover(n *simNode, local time.Time, w *simWorkload, now time.Time, rng *rand.Rand) {
+	if n.driver == nil {
+		n.driver = NewHandoverDriver(n.a.cfg.Site)
+	}
 	s, _, _ := n.a.status(local)
-	siteHolding := n.a.siteHolding(local)
-	rising := siteHolding && !n.wasSiteHolding
-	n.wasSiteHolding = siteHolding
-	switch {
-	case rising || (s.Certain && s.Lease.Last != "" && SiteOf(s.Lease.Last) != n.a.cfg.Site):
-		w.paused = false
-	case s.Handover:
-		w.pause(now, rng)
-		if !w.running {
-			n.a.requestYield(local, s.HandoverEpoch)
+	for step := n.driver.Look(s); step.Do != HandoverNothing; {
+		switch step.Do {
+		case HandoverLift:
+			w.paused = false
+			step = n.driver.Lifted(true)
+		case HandoverPause:
+			w.pause(now, rng)
+			step = n.driver.Paused(true)
+		case HandoverCount:
+			remaining := 0
+			if w.running {
+				remaining = 1
+			}
+			step = n.driver.Remaining(remaining)
+		case HandoverYield:
+			n.a.requestYield(local, step.Epoch)
+			return
 		}
 	}
 }
@@ -649,37 +715,20 @@ func (n *simNode) bogusYield(local time.Time) Record {
 	case s.Last == "" || SiteOf(s.Last) == n.a.cfg.Site:
 		epoch--
 	}
-	return Record{Kind: Yield, Holder: n.a.cfg.Holder, Epoch: epoch}
+	return recordOf(Yield, n.a.cfg.Holder, epoch)
 }
 
 func TestSimulationSafetyAndAgreement(t *testing.T) {
-	seeds := 200
-	if testing.Short() {
-		seeds = 20
-	}
+	seeds := simSeeds(200, 20)
 	var terms, rejected, settled, lateReaders int
 	for seed := uint64(1); seed <= uint64(seeds); seed++ {
 		records, overlapAt := runSim(t, seed, simParams{})
-		if !overlapAt.IsZero() {
-			t.Fatalf("seed %d, t=%v: two agents believe they hold the lease", seed, overlapAt.Sub(t0))
-		}
+		wantNoOverlap(t, seed, overlapAt, "two agents")
 
 		// The reference reader saw everything.
-		ref := NewViewFromStart(simTTL)
-		refStates := make([]State, len(records))
-		for i, r := range records {
-			out, err := ref.Apply(r)
-			if err != nil {
-				t.Fatalf("seed %d: %v", seed, err)
-			}
-			if out == Accepted && r.Kind == Claim {
-				terms++
-			}
-			if out == Rejected {
-				rejected++
-			}
-			refStates[i] = ref.State()
-		}
+		ref := simFold(t, seed, records)
+		terms += ref.terms
+		rejected += ref.rejected
 
 		rng := rand.New(rand.NewPCG(seed, 7))
 		for range 25 {
@@ -693,7 +742,7 @@ func TestSimulationSafetyAndAgreement(t *testing.T) {
 				if !late.Certain() {
 					continue
 				}
-				got, want := late.State(), refStates[i]
+				got, want := late.State(), ref.states[i]
 				now := late.Clock()
 				if got.HeldAt(now) != want.HeldAt(now) || (want.HeldAt(now) && got != want) {
 					t.Fatalf("seed %d: reader from offset %d disagrees at offset %d: got %+v, want %+v", seed, start, i, got, want)
@@ -724,10 +773,7 @@ func TestSimulationSafetyAndAgreement(t *testing.T) {
 // The test shows the model bites (zero margin, overlap in some run) and
 // that the bound holds (that margin, no overlap in any run).
 func TestSimulationClockSkewNeedsMargin(t *testing.T) {
-	seeds := 200
-	if testing.Short() {
-		seeds = 40
-	}
+	seeds := simSeeds(200, 40)
 	cases := []struct {
 		name string
 		p    simParams
@@ -763,28 +809,7 @@ func TestSimulationClockSkewNeedsMargin(t *testing.T) {
 // cooldown. Safety still holds, an unhealthy holder lets go within
 // FailAfter (checkGate), and the gate actually fires.
 func TestSimulationHealthGate(t *testing.T) {
-	seeds := 100
-	if testing.Short() {
-		seeds = 20
-	}
-	var releases, terms int
-	for seed := uint64(1); seed <= uint64(seeds); seed++ {
-		records, overlapAt, st := runSimStats(t, seed, simParams{health: true})
-		if !overlapAt.IsZero() {
-			t.Fatalf("seed %d, t=%v: two agents believe they hold the lease", seed, overlapAt.Sub(t0))
-		}
-		releases += st.gateReleases
-		ref := NewViewFromStart(simTTL)
-		for _, r := range records {
-			out, err := ref.Apply(r)
-			if err != nil {
-				t.Fatalf("seed %d: %v", seed, err)
-			}
-			if out == Accepted && r.Kind == Claim {
-				terms++
-			}
-		}
-	}
+	seeds, terms, releases := simTermsAndReleases(t, simParams{health: true}, func(st simStats) int { return st.gateReleases })
 	t.Logf("%d runs: %d terms, %d releases by the health gate", seeds, terms, releases)
 	if releases < seeds*5 || terms < seeds*10 {
 		t.Fatalf("the gate is too tame to mean anything: %d releases, %d terms", releases, terms)
@@ -798,17 +823,12 @@ func TestSimulationHealthGate(t *testing.T) {
 // site's own nodes do take over within it, after a release or a term that
 // ran out.
 func TestSimulationSites(t *testing.T) {
-	seeds := 100
-	if testing.Short() {
-		seeds = 20
-	}
+	seeds := simSeeds(100, 20)
 	var sameSite, crossSite, early int
 	minCross := time.Duration(math.MaxInt64)
 	for seed := uint64(1); seed <= uint64(seeds); seed++ {
 		records, overlapAt := runSim(t, seed, simParams{sites: true})
-		if !overlapAt.IsZero() {
-			t.Fatalf("seed %d, t=%v: two agents believe they hold the lease", seed, overlapAt.Sub(t0))
-		}
+		wantNoOverlap(t, seed, overlapAt, "two agents")
 		ref := NewViewFromStart(simTTL)
 		earlyTerms := map[int64]bool{}
 		for _, r := range records {
@@ -850,28 +870,7 @@ func TestSimulationSites(t *testing.T) {
 // node in standby never believes and never claims, and standby does give
 // terms up.
 func TestSimulationStandby(t *testing.T) {
-	seeds := 100
-	if testing.Short() {
-		seeds = 20
-	}
-	var releases, terms int
-	for seed := uint64(1); seed <= uint64(seeds); seed++ {
-		records, overlapAt, st := runSimStats(t, seed, simParams{sites: true, standby: true})
-		if !overlapAt.IsZero() {
-			t.Fatalf("seed %d, t=%v: two agents believe they hold the lease", seed, overlapAt.Sub(t0))
-		}
-		releases += st.standbyReleases
-		ref := NewViewFromStart(simTTL)
-		for _, r := range records {
-			out, err := ref.Apply(r)
-			if err != nil {
-				t.Fatalf("seed %d: %v", seed, err)
-			}
-			if out == Accepted && r.Kind == Claim {
-				terms++
-			}
-		}
-	}
+	seeds, terms, releases := simTermsAndReleases(t, simParams{sites: true, standby: true}, func(st simStats) int { return st.standbyReleases })
 	t.Logf("%d runs: %d terms, %d releases in standby", seeds, terms, releases)
 	if releases < seeds || terms < seeds*5 {
 		t.Fatalf("too tame to mean anything: %d releases in standby, %d terms", releases, terms)
@@ -887,18 +886,13 @@ func TestSimulationStandby(t *testing.T) {
 // keeps a reader that wakes up from a pause from answering for a term long
 // gone; the case shows that rule bites.
 func TestSimulationSiteAnswers(t *testing.T) {
-	seeds := 100
-	if testing.Short() {
-		seeds = 20
-	}
+	seeds := simSeeds(100, 20)
 	for _, delay := range []time.Duration{simDelay, simTTL / 2} {
 		t.Run(delay.String(), func(t *testing.T) {
 			var answers int
 			for seed := uint64(1); seed <= uint64(seeds); seed++ {
 				_, overlapAt, st := runSimStats(t, seed, simParams{sites: true, delay: delay})
-				if !overlapAt.IsZero() {
-					t.Fatalf("seed %d, t=%v: two sites believe they hold the lease", seed, overlapAt.Sub(t0))
-				}
+				wantNoOverlap(t, seed, overlapAt, "two sites")
 				answers += st.siteAnswers
 			}
 			t.Logf("%d runs: %v of answers for the site by agents that do not hold the lease", seeds, time.Duration(answers)*simStep)
@@ -918,17 +912,12 @@ func TestSimulationSiteAnswers(t *testing.T) {
 // in. Safety holds for the beliefs and for the workloads, and handovers
 // do take effect well within the delay.
 func TestSimulationHandover(t *testing.T) {
-	seeds := 100
-	if testing.Short() {
-		seeds = 20
-	}
+	seeds := simSeeds(100, 20)
 	var yields, bogus, early int
 	fastest := time.Duration(math.MaxInt64)
 	for seed := uint64(1); seed <= uint64(seeds); seed++ {
 		records, overlapAt, st := runSimStats(t, seed, simParams{sites: true, handover: true})
-		if !overlapAt.IsZero() {
-			t.Fatalf("seed %d, t=%v: two agents or two sites believe they hold the lease", seed, overlapAt.Sub(t0))
-		}
+		wantNoOverlap(t, seed, overlapAt, "two agents or two sites")
 		if !st.workOverlapAt.IsZero() {
 			t.Fatalf("seed %d, t=%v: the workloads of two sites run at once", seed, st.workOverlapAt.Sub(t0))
 		}

@@ -23,7 +23,7 @@ func TestProbeReportsSuccessOnlyWhileTheSiteHolds(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	src := &fakeSource{changed: make(chan struct{}, 1)}
+	src := newFakeSource()
 	var healthy atomic.Int32
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -34,17 +34,6 @@ func TestProbeReportsSuccessOnlyWhileTheSiteHolds(t *testing.T) {
 	}()
 	defer func() { cancel(); <-done }()
 
-	waitUntil := func(what string, cond func() bool) {
-		t.Helper()
-		deadline := time.Now().Add(2 * time.Second)
-		for !cond() {
-			if time.Now().After(deadline) {
-				t.Fatalf("timed out waiting for %s", what)
-			}
-			time.Sleep(time.Millisecond)
-		}
-	}
-
 	// Not holding: nothing is probed.
 	time.Sleep(30 * time.Millisecond)
 	if hits.Load() != 0 || healthy.Load() != 0 {
@@ -52,29 +41,29 @@ func TestProbeReportsSuccessOnlyWhileTheSiteHolds(t *testing.T) {
 	}
 
 	src.set(true)
-	waitUntil("a healthy report", func() bool { return healthy.Load() >= 2 })
+	eventually(t, "a healthy report", func() bool { return healthy.Load() >= 2 })
 
 	// Failing statuses are not reported; a redirect status counts as
 	// healthy, as for a Kubernetes probe.
 	for _, c := range []int{http.StatusServiceUnavailable, http.StatusNotFound} {
 		code.Store(int32(c))
 		h0 := hits.Load()
-		waitUntil("the failing status to be seen", func() bool { return hits.Load() >= h0+2 })
+		eventually(t, "the failing status to be seen", func() bool { return hits.Load() >= h0+2 })
 		before := healthy.Load()
 		h1 := hits.Load()
-		waitUntil("more probes", func() bool { return hits.Load() >= h1+3 })
+		eventually(t, "more probes", func() bool { return hits.Load() >= h1+3 })
 		if got := healthy.Load(); got != before {
 			t.Fatalf("status %d reported healthy (%d -> %d)", c, before, got)
 		}
 	}
 	code.Store(http.StatusNotModified)
 	before := healthy.Load()
-	waitUntil("a healthy report after recovery", func() bool { return healthy.Load() > before })
+	eventually(t, "a healthy report after recovery", func() bool { return healthy.Load() > before })
 
 	// Another replica of the site holds the lease: probing goes on.
 	src.setSibling(true)
 	h1 := hits.Load()
-	waitUntil("probes while the site holds", func() bool { return hits.Load() >= h1+2 })
+	eventually(t, "probes while the site holds", func() bool { return hits.Load() >= h1+2 })
 
 	// Lease given up: probing stops.
 	src.set(false)
@@ -91,7 +80,7 @@ func TestProbeUnreachableIsNotHealthy(t *testing.T) {
 	url := srv.URL
 	srv.Close() // nothing listens there now
 
-	src := &fakeSource{changed: make(chan struct{}, 1)}
+	src := newFakeSource()
 	src.set(true)
 	var healthy atomic.Int32
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)

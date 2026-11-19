@@ -157,6 +157,21 @@ func (c *common) config(log *slog.Logger) lease.Config {
 	}
 }
 
+// perTopic splits the comma-separated value of a flag that takes one entry
+// per topic, in the order of -topic, an empty entry for a lease without.
+// An empty value is no entry for any of them; anything else has to have as
+// many entries as there are topics. what names the flag in the error.
+func perTopic(what, value string, topics []string) ([]string, error) {
+	if value == "" {
+		return make([]string, len(topics)), nil
+	}
+	entries := strings.Split(value, ",")
+	if len(entries) != len(topics) {
+		return nil, fmt.Errorf("%s: %d entries for %d topics; give one per topic, empty for none", what, len(entries), len(topics))
+	}
+	return entries, nil
+}
+
 func run(args []string) error {
 	fs := flag.NewFlagSet("kfklease-scaler", flag.ExitOnError)
 	c := commonFlags(fs)
@@ -190,12 +205,11 @@ func run(args []string) error {
 	if *replicas < 1 || *replicas > math.MaxInt16 || *minISR < 0 {
 		return fmt.Errorf("replication factor %d or min insync replicas %d out of range", *replicas, *minISR)
 	}
-	urls := make([]string, len(topics))
+	urls, err := perTopic("health url", *healthURL, topics)
+	if err != nil {
+		return err
+	}
 	if *healthURL != "" {
-		urls = strings.Split(*healthURL, ",")
-		if len(urls) != len(topics) {
-			return fmt.Errorf("health url: %d entries for %d topics; give one per topic, empty for none", len(urls), len(topics))
-		}
 		if *healthInterval <= 0 || *healthTimeout <= 0 || *healthFailAfter <= 0 || *healthCooldown <= 0 {
 			return errors.New("health interval, timeout, fail-after and cooldown must be positive")
 		}
@@ -203,12 +217,9 @@ func run(args []string) error {
 			return fmt.Errorf("health fail-after %v must be at least two probe intervals (%v)", *healthFailAfter, *healthInterval)
 		}
 	}
-	scaledObjects := make([]string, len(topics))
-	if *scaledObject != "" {
-		scaledObjects = strings.Split(*scaledObject, ",")
-		if len(scaledObjects) != len(topics) {
-			return fmt.Errorf("scaled object: %d entries for %d topics; give one per topic, empty for none", len(scaledObjects), len(topics))
-		}
+	scaledObjects, err := perTopic("scaled object", *scaledObject, topics)
+	if err != nil {
+		return err
 	}
 	var kube *scaler.Kube
 	if slices.ContainsFunc(scaledObjects, func(so string) bool { return so != "" }) {

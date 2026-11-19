@@ -242,14 +242,15 @@ type Candidate struct {
 	cfg Config
 	log *slog.Logger
 
-	mu      sync.Mutex
-	status  Status // without Holding and Epoch, which depend on the clock
-	changed chan struct{}
-	// The beliefs: its own term and its site's, each until a deadline
-	// (monotonic). Status checks the deadlines itself, so that a Candidate
-	// whose loop is stalled (a frozen process waking up) never reports a
-	// belief it has outlived.
+	mu sync.Mutex
+	// status is what the loop published last, as of its own clock then,
+	// with the beliefs it rests on: its own term and its site's, each until
+	// a deadline (monotonic). Status projects them again at the time of the
+	// call (statusAt), so that a Candidate whose loop is stalled (a frozen
+	// process waking up) never reports a belief it has outlived.
+	status    Status
 	own, site belief
+	changed   chan struct{}
 
 	// healthyAt is the last ReportHealthy, for the loop to pick up.
 	healthyAt time.Time
@@ -283,34 +284,14 @@ func NewCandidate(cfg Config) (*Candidate, error) {
 // Holder returns this participant's identity in the log.
 func (c *Candidate) Holder() string { return c.cfg.Holder }
 
-// Status returns the current status. Holding is evaluated against the clock
-// at the time of the call.
+// Status returns the current status. Holding and what else depends on the
+// clock are evaluated at the time of the call, and standby is what
+// SetStandby asked for, whether the loop has seen it or not; the rules are
+// statusAt's.
 func (c *Candidate) Status() Status {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	s := c.status
-	s.Standby = c.standby
-	now := time.Now()
-	switch {
-	case c.standby:
-		// Neither belief; the loop drops them as soon as it sees standby.
-	case now.Before(c.own.deadline):
-		s.Holding = true
-		s.Epoch, s.Deadline = c.own.epoch, c.own.deadline
-		s.SiteHolding = true
-		s.SiteEpoch, s.SiteDeadline = s.Epoch, s.Deadline
-	case now.Before(c.site.deadline):
-		s.SiteHolding = true
-		s.SiteEpoch, s.SiteDeadline = c.site.epoch, c.site.deadline
-	}
-	if !now.Before(s.CooldownUntil) {
-		s.CooldownUntil = time.Time{}
-	}
-	if !c.standby {
-		// A handover is for standby only; the loop drops it as soon as it
-		// sees standby off.
-		s.Handover, s.HandoverEpoch = false, -1
-	}
+	s, _, _ := statusAt(time.Now(), c.standby, c.status, c.own, c.site)
 	return s
 }
 
@@ -474,24 +455,20 @@ func (r *run) bootstrap(ctx context.Context) error {
 
 // partitionBounds returns the partition's start and end offsets. A topic
 // that was just created has no leader for a moment, so it retries for a
-// while before giving up.
+// while before giving up: whatever the failure, and with the client made to
+// forget what it knows of the topic before each new try.
 func (r *run) partitionBounds(ctx context.Context) (start, end kadm.ListedOffset, err error) {
 	adm := kadm.NewClient(r.cl)
-	deadline := time.Now().Add(max(r.cfg.TTL, 10*time.Second))
-	for {
+	err = untilReady(ctx, max(r.cfg.TTL, topicReadyWait), func() error {
 		start, end, err = listBounds(ctx, adm, r.cfg.Topic, r.cfg.Partition)
-		if err == nil || time.Now().After(deadline) {
-			return start, end, err
-		}
+		return err
+	}, func(err error) bool {
 		r.log.Debug("partition not ready", "err", err)
 		r.cl.PurgeTopicsFromClient(r.cfg.Topic)
 		r.cl.AddConsumePartitions(r.cfg.consumeFromStart())
-		select {
-		case <-ctx.Done():
-			return start, end, ctx.Err()
-		case <-time.After(200 * time.Millisecond):
-		}
-	}
+		return true
+	})
+	return start, end, err
 }
 
 func listBounds(ctx context.Context, adm *kadm.Client, topic string, partition int32) (start, end kadm.ListedOffset, err error) {

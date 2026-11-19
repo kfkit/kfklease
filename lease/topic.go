@@ -155,19 +155,44 @@ func EnsureTopic(ctx context.Context, cl *kgo.Client, topic string, ttl time.Dur
 
 	// A topic another participant created a moment ago may not be known to
 	// every broker yet.
-	deadline := time.Now().Add(10 * time.Second)
+	var (
+		configs  map[string]string
+		replicas int
+	)
+	err = untilReady(ctx, topicReadyWait, func() (err error) {
+		configs, replicas, err = inspectTopic(ctx, adm, topic)
+		return err
+	}, func(err error) bool { return errors.Is(err, kerr.UnknownTopicOrPartition) })
+	if err != nil {
+		return nil, err
+	}
+	return s.checkExisting(topic, configs, replicas)
+}
+
+// A topic created a moment ago has no leader for a few hundred milliseconds
+// and may not be known to every broker yet: whoever asks about it retries
+// for a while before giving up.
+const (
+	topicReadyWait  = 10 * time.Second
+	topicReadyRetry = 200 * time.Millisecond
+)
+
+// untilReady calls try every topicReadyRetry until it succeeds, and gives up
+// with its error once wait has passed, or with ctx's when ctx is done
+// first. retry is asked about each failure there is still time to try again
+// after: false makes the error final, and before it answers it may prepare
+// the next try.
+func untilReady(ctx context.Context, wait time.Duration, try func() error, retry func(error) bool) error {
+	deadline := time.Now().Add(wait)
 	for {
-		configs, replicas, err := inspectTopic(ctx, adm, topic)
-		switch {
-		case err == nil:
-			return s.checkExisting(topic, configs, replicas)
-		case !errors.Is(err, kerr.UnknownTopicOrPartition) || time.Now().After(deadline):
-			return nil, err
+		err := try()
+		if err == nil || time.Now().After(deadline) || !retry(err) {
+			return err
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(200 * time.Millisecond):
+			return ctx.Err()
+		case <-time.After(topicReadyRetry):
 		}
 	}
 }

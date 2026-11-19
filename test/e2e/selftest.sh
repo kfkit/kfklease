@@ -9,14 +9,16 @@ cd "$(dirname "$0")"
 
 # shellcheck disable=SC2317,SC2329 # called by scenarios.sh, through export -f
 {
-  scenario_selftest_ok() { echo "   ok"; }
+  scenario_selftest_ok() { wait_until 0 "true failed" true || return; echo "   ok"; }
   # What a GNU-only `date -d` did on macOS: the command substitution is
   # empty, the arithmetic expansion is a syntax error, and bash drops the
   # command it happens in.
   scenario_selftest_shell_error() { local t0=1; echo "   $(( t0 - $(false) ))s"; }
-  scenario_selftest_fail() { echo "FAILED: on purpose" >&2; return 1; }
+  # The two ways a scenario says it failed: a check, and a wait that ran out.
+  scenario_selftest_fail() { false || fail "on purpose" || return; }
+  scenario_selftest_timeout() { wait_until 0 "timed out on purpose" false || return; }
 }
-export -f scenario_selftest_ok scenario_selftest_shell_error scenario_selftest_fail
+export -f scenario_selftest_ok scenario_selftest_shell_error scenario_selftest_fail scenario_selftest_timeout
 
 failed=0
 
@@ -39,5 +41,6 @@ expect 0 selftest-ok selftest-ok
 expect nonzero selftest-ok selftest-shell-error selftest-ok
 expect nonzero selftest-shell-error
 expect nonzero selftest-ok selftest-fail selftest-ok
+expect nonzero selftest-ok selftest-timeout selftest-ok
 expect nonzero no-such-scenario
 exit "$failed"

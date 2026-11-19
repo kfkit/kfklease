@@ -173,13 +173,19 @@ func holding(src Source) (bool, error) {
 	return st.SiteHolding, nil
 }
 
-// IsActive reports whether this participant's site holds the lease.
-func (s *Server) IsActive(_ context.Context, ref *externalscaler.ScaledObjectRef) (*externalscaler.IsActiveResponse, error) {
+// active is the answer for the ScaledObject ref names: whether this
+// participant's site holds its lease, or the error KEDA gets instead.
+func (s *Server) active(ref *externalscaler.ScaledObjectRef) (bool, error) {
 	src, err := s.source(ref)
 	if err != nil {
-		return nil, err
+		return false, err
 	}
-	active, err := holding(src)
+	return holding(src)
+}
+
+// IsActive reports whether this participant's site holds the lease.
+func (s *Server) IsActive(_ context.Context, ref *externalscaler.ScaledObjectRef) (*externalscaler.IsActiveResponse, error) {
+	active, err := s.active(ref)
 	if err != nil {
 		return nil, err
 	}
@@ -239,11 +245,7 @@ func (s *Server) GetMetricSpec(_ context.Context, ref *externalscaler.ScaledObje
 // GetMetrics returns 1 while the site holds the lease, 0 otherwise, and an
 // error while the lease state is not known yet.
 func (s *Server) GetMetrics(_ context.Context, req *externalscaler.GetMetricsRequest) (*externalscaler.GetMetricsResponse, error) {
-	src, err := s.source(req.GetScaledObjectRef())
-	if err != nil {
-		return nil, err
-	}
-	active, err := holding(src)
+	active, err := s.active(req.GetScaledObjectRef())
 	if err != nil {
 		return nil, err
 	}

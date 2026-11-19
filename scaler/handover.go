@@ -68,34 +68,16 @@ type Handover struct {
 func (h Handover) Run(ctx context.Context) {
 	ticker := time.NewTicker(h.Interval)
 	defer ticker.Stop()
-	var (
-		wasSiteHolding bool
-		// mayBePaused is false only after this run removed the
-		// annotation; a previous life may have left it.
-		mayBePaused       = true
-		pausedFor   int64 = -1
-		yieldedFor  int64 = -1
-	)
+	// What to do at each look is lease.HandoverDriver's to say; Run does it
+	// to the workload and tells it how that went.
+	driver := lease.NewHandoverDriver(h.Site)
+	// yieldedFor is the term whose yield was last logged.
+	var yieldedFor int64 = -1
 	for {
 		s := h.Source.Status()
-		rising := s.SiteHolding && !wasSiteHolding
-		otherHolds := s.Certain && s.Lease.Last != "" && lease.SiteOf(s.Lease.Last) != h.Site
-		switch {
-		case rising || (otherHolds && mayBePaused):
-			if err := h.Workload.Unpause(ctx, h.ScaledObject); err != nil {
-				h.Log.Warn("handover: cannot lift the pause", "scaled_object", h.ScaledObject, "err", err)
-				s.SiteHolding = false // try again at the next look
-				break
-			}
-			if pausedFor >= 0 || rising {
-				h.Log.Info("handover: pause lifted", "scaled_object", h.ScaledObject, "site_holding", s.SiteHolding)
-			}
-			mayBePaused, pausedFor = false, -1
-		case s.Handover:
-			mayBePaused = true
-			h.stop(ctx, s.HandoverEpoch, &pausedFor, &yieldedFor)
+		for step := driver.Look(s); step.Do != lease.HandoverNothing; {
+			step = h.do(ctx, driver, step, s, &yieldedFor)
 		}
-		wasSiteHolding = s.SiteHolding
 		select {
 		case <-ctx.Done():
 			return
@@ -104,30 +86,40 @@ func (h Handover) Run(ctx context.Context) {
 	}
 }
 
-// stop pauses the workload for the handover of epoch and asks for the yield
-// once nothing of it remains.
-func (h Handover) stop(ctx context.Context, epoch int64, pausedFor, yieldedFor *int64) {
-	if *pausedFor != epoch {
-		if err := h.Workload.Pause(ctx, h.ScaledObject); err != nil {
-			h.Log.Warn("handover: cannot pause the workload; the other sites wait for the takeover delay", "scaled_object", h.ScaledObject, "epoch", epoch, "err", err)
-			return
+// do carries one step of a look out and returns the next one.
+func (h Handover) do(ctx context.Context, driver *lease.HandoverDriver, step lease.HandoverStep, s lease.Status, yieldedFor *int64) lease.HandoverStep {
+	epoch := step.Epoch
+	switch step.Do {
+	case lease.HandoverLift:
+		err := h.Workload.Unpause(ctx, h.ScaledObject)
+		switch {
+		case err != nil:
+			h.Log.Warn("handover: cannot lift the pause", "scaled_object", h.ScaledObject, "err", err)
+		case epoch >= 0 || step.Rising:
+			h.Log.Info("handover: pause lifted", "scaled_object", h.ScaledObject, "site_holding", s.SiteHolding)
 		}
-		h.Log.Info("handover: workload paused", "scaled_object", h.ScaledObject, "epoch", epoch)
-		*pausedFor = epoch
+		return driver.Lifted(err == nil)
+	case lease.HandoverPause:
+		err := h.Workload.Pause(ctx, h.ScaledObject)
+		if err != nil {
+			h.Log.Warn("handover: cannot pause the workload; the other sites wait for the takeover delay", "scaled_object", h.ScaledObject, "epoch", epoch, "err", err)
+		} else {
+			h.Log.Info("handover: workload paused", "scaled_object", h.ScaledObject, "epoch", epoch)
+		}
+		return driver.Paused(err == nil)
+	case lease.HandoverCount:
+		n, err := h.Workload.Remaining(ctx, h.ScaledObject)
+		if err != nil {
+			h.Log.Warn("handover: cannot count the workload's pods", "scaled_object", h.ScaledObject, "epoch", epoch, "err", err)
+			break
+		}
+		return driver.Remaining(n)
+	case lease.HandoverYield:
+		if *yieldedFor != epoch {
+			h.Log.Info("handover: workload down, yielding", "scaled_object", h.ScaledObject, "epoch", epoch)
+			*yieldedFor = epoch
+		}
+		h.Source.Yield(epoch)
 	}
-	n, err := h.Workload.Remaining(ctx, h.ScaledObject)
-	switch {
-	case err != nil:
-		h.Log.Warn("handover: cannot count the workload's pods", "scaled_object", h.ScaledObject, "epoch", epoch, "err", err)
-		return
-	case n > 0:
-		return
-	}
-	if *yieldedFor != epoch {
-		h.Log.Info("handover: workload down, yielding", "scaled_object", h.ScaledObject, "epoch", epoch)
-		*yieldedFor = epoch
-	}
-	// Again at every look while the handover stands: a yield that did not
-	// land is simply asked for once more.
-	h.Source.Yield(epoch)
+	return lease.HandoverStep{}
 }

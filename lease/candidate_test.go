@@ -52,11 +52,20 @@ func TestConfigDefaults(t *testing.T) {
 	}
 }
 
-func TestStatusHoldingExpiresWithoutTheLoop(t *testing.T) {
-	c, err := NewCandidate(Config{Brokers: []string{"b:9092"}, Topic: "t", TTL: 10 * time.Second})
+// idleCandidate is a Candidate that is never run, for what has to work
+// without its loop: the status at the time of the call, and what the loop
+// is handed at its next turn. standby is Config.Standby.
+func idleCandidate(t *testing.T, standby bool) *Candidate {
+	t.Helper()
+	c, err := NewCandidate(Config{Brokers: []string{"b:9092"}, Topic: "t", TTL: 10 * time.Second, Standby: standby})
 	if err != nil {
 		t.Fatal(err)
 	}
+	return c
+}
+
+func TestStatusHoldingExpiresWithoutTheLoop(t *testing.T) {
+	c := idleCandidate(t, false)
 	c.setStatus(Status{Certain: true}, belief{time.Now().Add(50 * time.Millisecond), 3}, belief{})
 	if s := c.Status(); !s.Holding || s.Epoch != 3 {
 		t.Fatalf("before the deadline: %+v", s)
@@ -73,10 +82,7 @@ func TestStatusHoldingExpiresWithoutTheLoop(t *testing.T) {
 }
 
 func TestStatusCooldownExpiresWithoutTheLoop(t *testing.T) {
-	c, err := NewCandidate(Config{Brokers: []string{"b:9092"}, Topic: "t", TTL: 10 * time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
+	c := idleCandidate(t, false)
 	until := time.Now().Add(50 * time.Millisecond)
 	c.setStatus(Status{Certain: true, CooldownUntil: until}, belief{}, belief{})
 	if s := c.Status(); !s.CooldownUntil.Equal(until) || s.Holding {
@@ -89,10 +95,7 @@ func TestStatusCooldownExpiresWithoutTheLoop(t *testing.T) {
 }
 
 func TestReportHealthyReachesTheLoop(t *testing.T) {
-	c, err := NewCandidate(Config{Brokers: []string{"b:9092"}, Topic: "t", TTL: 10 * time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
+	c := idleCandidate(t, false)
 	if got, _, _ := c.loopInputs(); !got.IsZero() {
 		t.Fatal("healthy before any report")
 	}
@@ -106,10 +109,7 @@ func TestReportHealthyReachesTheLoop(t *testing.T) {
 // SetStandby takes effect on Status at once, before the loop has seen it:
 // a scaler must not report holding for one more poll.
 func TestSetStandbyHidesHoldingAtOnce(t *testing.T) {
-	c, err := NewCandidate(Config{Brokers: []string{"b:9092"}, Topic: "t", TTL: 10 * time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
+	c := idleCandidate(t, false)
 	c.setStatus(Status{Certain: true, Ready: true}, belief{time.Now().Add(time.Minute), 3}, belief{})
 	<-c.Changed()
 	c.SetStandby(true)
@@ -129,10 +129,7 @@ func TestSetStandbyHidesHoldingAtOnce(t *testing.T) {
 		t.Fatalf("standby off: %+v", s)
 	}
 
-	c, err = NewCandidate(Config{Brokers: []string{"b:9092"}, Topic: "t", TTL: 10 * time.Second, Standby: true})
-	if err != nil {
-		t.Fatal(err)
-	}
+	c = idleCandidate(t, true)
 	if s := c.Status(); !s.Standby {
 		t.Fatalf("Config.Standby: %+v", s)
 	}
@@ -140,10 +137,7 @@ func TestSetStandbyHidesHoldingAtOnce(t *testing.T) {
 
 // Yield reaches the loop once: a request is taken, not kept.
 func TestYieldReachesTheLoopOnce(t *testing.T) {
-	c, err := NewCandidate(Config{Brokers: []string{"b:9092"}, Topic: "t", TTL: 10 * time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
+	c := idleCandidate(t, false)
 	if _, _, e := c.loopInputs(); e != -1 {
 		t.Fatalf("yield %d before any request", e)
 	}

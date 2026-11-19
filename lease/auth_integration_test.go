@@ -8,45 +8,42 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
-	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// The stand's broker has a SASL_PLAINTEXT listener (PLAIN user "kfklease",
-// SCRAM users created here) and an SSL listener that requires a client
-// certificate. KFKLEASE_SASL_BROKERS, KFKLEASE_MTLS_BROKERS and
-// KFKLEASE_CERTS_DIR point at them; `make integration` sets all three.
-
-const (
-	saslUser     = "kfklease"
-	saslPassword = "kfklease-secret"
+// The stand's broker has a SASL_PLAINTEXT listener (a PLAIN user, SCRAM
+// credentials for it created here) and an SSL listener that requires a
+// client certificate. KFKLEASE_SASL_BROKERS, KFKLEASE_MTLS_BROKERS and
+// KFKLEASE_CERTS_DIR point at them, KFKLEASE_SASL_USER and
+// KFKLEASE_SASL_PASSWORD name the user; `make integration` sets all five,
+// the user from test/e2e/.env, its one home.
+var (
+	saslUser     = os.Getenv("KFKLEASE_SASL_USER")
+	saslPassword = os.Getenv("KFKLEASE_SASL_PASSWORD")
 )
 
-func optionalBrokers(t *testing.T, name string) []string {
+// saslBrokers returns the SASL listener, or skips the test when it or the
+// user is not given.
+func saslBrokers(t *testing.T) []string {
 	t.Helper()
-	v := os.Getenv(name)
-	if v == "" {
-		t.Skipf("%s not set", name)
+	bs := optionalBrokers(t, "KFKLEASE_SASL_BROKERS")
+	if saslUser == "" || saslPassword == "" {
+		t.Skip("KFKLEASE_SASL_USER or KFKLEASE_SASL_PASSWORD not set")
 	}
-	return strings.Split(v, ",")
+	return bs
 }
 
 // upsertScram gives saslUser a SCRAM credential through the plaintext
 // admin listener.
 func upsertScram(t *testing.T, mechanism kadm.ScramMechanism) {
 	t.Helper()
-	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers(t)...))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cl.Close()
+	_, adm := adminClient(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	resp, err := kadm.NewClient(cl).AlterUserSCRAMs(ctx, nil, []kadm.UpsertSCRAM{{
+	resp, err := adm.AlterUserSCRAMs(ctx, nil, []kadm.UpsertSCRAM{{
 		User: saslUser, Mechanism: mechanism, Iterations: 4096, Password: saslPassword,
 	}})
 	if err != nil {
@@ -61,20 +58,9 @@ func upsertScram(t *testing.T, mechanism kadm.ScramMechanism) {
 // expects it to hold the lease within a ttl.
 func acquiresWith(t *testing.T, bs []string, auth Auth) {
 	t.Helper()
-	c, err := NewCandidate(Config{Brokers: bs, Topic: randomTopic(t), CreateTopic: true, TopicSettings: itTopic, TTL: itTTL, Margin: itMargin, Auth: auth})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- c.Run(ctx) }()
-	defer func() {
-		cancel()
-		if err := <-done; err != nil {
-			t.Errorf("Run: %v", err)
-		}
-	}()
-	waitFor(t, 2*itTTL, "holding", func() bool { return c.Status().Holding })
+	p := startConfig(t, Config{Brokers: bs, Topic: randomTopic(t), CreateTopic: true, TopicSettings: itTopic, TTL: itTTL, Margin: itMargin, Auth: auth})
+	waitFor(t, 2*itTTL, "holding", func() bool { return p.Status().Holding })
+	p.stop(t)
 }
 
 // failsWith expects Run to give up with an error rather than hang when the
@@ -97,7 +83,7 @@ func failsWith(t *testing.T, bs []string, auth Auth) {
 }
 
 func TestIntegrationSASLPlain(t *testing.T) {
-	bs := optionalBrokers(t, "KFKLEASE_SASL_BROKERS")
+	bs := saslBrokers(t)
 	pw := filepath.Join(t.TempDir(), "password")
 	if err := os.WriteFile(pw, []byte(saslPassword+"\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -107,7 +93,7 @@ func TestIntegrationSASLPlain(t *testing.T) {
 }
 
 func TestIntegrationSASLScram(t *testing.T) {
-	bs := optionalBrokers(t, "KFKLEASE_SASL_BROKERS")
+	bs := saslBrokers(t)
 	upsertScram(t, kadm.ScramSha256)
 	upsertScram(t, kadm.ScramSha512)
 	acquiresWith(t, bs, Auth{SASL: SASL{Mechanism: MechanismScramSha256, Username: saslUser, Password: saslPassword}})

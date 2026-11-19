@@ -21,16 +21,6 @@ import (
 	"github.com/kfkit/kfklease/lease"
 )
 
-func (f *fakeSource) setStatus(s lease.Status) {
-	f.mu.Lock()
-	f.st = s
-	f.mu.Unlock()
-	select {
-	case f.changed <- struct{}{}:
-	default:
-	}
-}
-
 func get(t *testing.T, srv *httptest.Server, path string) (int, string) {
 	t.Helper()
 	resp, err := http.Get(srv.URL + path)
@@ -63,7 +53,8 @@ func noMetric(t *testing.T, body, name string) {
 }
 
 func TestHTTPStatusAndMetrics(t *testing.T) {
-	src := &fakeSource{changed: make(chan struct{}, 1), unknown: true}
+	src := newFakeSource()
+	src.unknown = true
 	h := NewHTTP(src, "k3s-a/pod")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -96,7 +87,7 @@ func TestHTTPStatusAndMetrics(t *testing.T) {
 		Holding: true, Epoch: 7, Deadline: time.Now().Add(8 * time.Second), SiteHolding: true, SiteEpoch: 7,
 		Certain: true, Ready: true, Lease: lease.State{Holder: "k3s-a/pod", Epoch: 7, Expires: asOf.Add(10 * time.Second)}, AsOf: asOf,
 	})
-	waitFor(t, func() bool {
+	eventually(t, "the transition to holding", func() bool {
 		_, b := get(t, srv, "/metrics")
 		return metric(t, b, `kfklease_transitions_total{to="holding"}`) == "1"
 	})
@@ -123,7 +114,7 @@ func TestHTTPStatusAndMetrics(t *testing.T) {
 
 	// Lost it: the standby transition is counted, the gauges follow.
 	src.setStatus(lease.Status{Certain: true, Ready: true, Lease: lease.State{Holder: "other", Epoch: 9, Expires: asOf.Add(20 * time.Second)}, AsOf: asOf})
-	waitFor(t, func() bool {
+	eventually(t, "the transition to standby", func() bool {
 		_, b := get(t, srv, "/metrics")
 		return metric(t, b, `kfklease_transitions_total{to="standby"}`) == "1"
 	})
@@ -183,20 +174,9 @@ func getBody(t *testing.T, srv *httptest.Server, path string) string {
 	return body
 }
 
-func waitFor(t *testing.T, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatal("condition not met in time")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
 func TestHTTPSeveralLeases(t *testing.T) {
-	a := &fakeSource{changed: make(chan struct{}, 1)}
-	b := &fakeSource{changed: make(chan struct{}, 1)}
+	a := newFakeSource()
+	b := newFakeSource()
 	h, err := NewHTTPLeases([]Lease{{Topic: "connect-a", Holder: "k3s-a/pod", Source: a}, {Topic: "connect-b", Holder: "k3s-a/pod", Source: b}})
 	if err != nil {
 		t.Fatal(err)
@@ -210,7 +190,7 @@ func TestHTTPSeveralLeases(t *testing.T) {
 	asOf := time.Now()
 	b.setStatus(lease.Status{Holding: true, Epoch: 42, Deadline: time.Now().Add(8 * time.Second), Certain: true,
 		Lease: lease.State{Holder: "k3s-a/pod", Epoch: 42, Expires: asOf.Add(10 * time.Second)}, AsOf: asOf})
-	waitFor(t, func() bool {
+	eventually(t, "connect-b's transition to holding", func() bool {
 		_, body := get(t, srv, "/metrics")
 		return metric(t, body, `kfklease_transitions_total{to="holding",topic="connect-b"}`) == "1"
 	})
@@ -252,7 +232,7 @@ func TestHTTPSeveralLeases(t *testing.T) {
 }
 
 func TestHTTPOneLeaseTopic(t *testing.T) {
-	src := &fakeSource{changed: make(chan struct{}, 1)}
+	src := newFakeSource()
 	h, err := NewHTTPLeases([]Lease{{Topic: "orders", Holder: "eu/pod", Source: src}})
 	if err != nil {
 		t.Fatal(err)
@@ -280,7 +260,7 @@ func TestHTTPOneLeaseTopic(t *testing.T) {
 // metrics say the site holds it, with the site's epoch, and that this
 // participant does not.
 func TestHTTPSiteHolding(t *testing.T) {
-	src := &fakeSource{changed: make(chan struct{}, 1)}
+	src := newFakeSource()
 	src.setSibling(true)
 	srv := httptest.NewServer(NewHTTP(src, "k3s-a/pod-2").Handler())
 	defer srv.Close()
@@ -357,7 +337,7 @@ func TestStatusSampleInDocs(t *testing.T) {
 		t.Errorf("fields of the sample's lease:\n  %v\nfields of LeaseResponse:\n  %v", got, wantLease)
 	}
 
-	src := &fakeSource{changed: make(chan struct{}, 1)}
+	src := newFakeSource()
 	src.setStatus(lease.Status{Certain: true, Ready: true, AsOf: time.Now()})
 	h, err := NewHTTPLeases([]Lease{{Topic: "orders", Holder: "eu/pod", Source: src}})
 	if err != nil {

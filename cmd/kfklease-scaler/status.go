@@ -12,37 +12,20 @@ import (
 	"io"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/kfkit/kfklease/lease"
+	"github.com/kfkit/kfklease/scaler"
 )
 
 // leaseStatus is one line of `kfklease-scaler status`: the lease as the log
 // says, as of the last record read, on the broker's clock.
 type leaseStatus struct {
 	Topic string `json:"topic"`
-	// Held is whether someone holds the lease as of AsOf.
-	Held bool `json:"held"`
-	// Holder, Site and Epoch name the term, when Held.
-	Holder string `json:"holder,omitempty"`
-	Site   string `json:"site,omitempty"`
-	Epoch  int64  `json:"epoch,omitempty"`
-	// Expires is when the term ends unless renewed, when Held; otherwise
-	// when the latest term ended, as far as the log tells.
-	Expires time.Time `json:"expires,omitzero"`
-	// LastHolder is the holder of the latest term, when the log still
-	// names it.
-	LastHolder string    `json:"last_holder,omitempty"`
-	AsOf       time.Time `json:"as_of,omitzero"`
+	scaler.LogLease
 }
 
 func newLeaseStatus(topic string, s lease.Status) leaseStatus {
-	l := s.Lease
-	out := leaseStatus{Topic: topic, Held: l.HeldAt(s.AsOf), Expires: l.Expires, LastHolder: l.Last, AsOf: s.AsOf}
-	if out.Held {
-		out.Holder, out.Site, out.Epoch = l.Holder, lease.SiteOf(l.Holder), l.Epoch
-	}
-	return out
+	return leaseStatus{Topic: topic, LogLease: scaler.NewLogLease(s)}
 }
 
 // status prints the state of every lease, one JSON object per line in the

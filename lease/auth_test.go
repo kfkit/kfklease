@@ -35,22 +35,33 @@ func writeFile(t *testing.T, name, content string) string {
 	return p
 }
 
-// selfSigned writes a certificate and key and returns their paths.
-func selfSigned(t *testing.T) (certFile, keyFile string) {
+// issued is a certificate with its key, as issue made them.
+type issued struct {
+	cert            *x509.Certificate
+	key             *ecdsa.PrivateKey
+	certPEM, keyPEM string
+}
+
+// issue makes a key and the certificate tmpl describes for it, valid from
+// an hour ago for two hours, signed by ca, or by the new key itself when
+// ca is nil. It is the one place the tests make a certificate; what kind
+// of certificate is the template's business.
+func issue(t *testing.T, tmpl *x509.Certificate, ca *certAuthority) issued {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "test"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		IsCA:         true,
+	tmpl.NotBefore, tmpl.NotAfter = time.Now().Add(-time.Hour), time.Now().Add(time.Hour)
+	parent, signer := tmpl, key
+	if ca != nil {
+		parent, signer = ca.cert, ca.key
 	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, &key.PublicKey, signer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,9 +69,23 @@ func selfSigned(t *testing.T) (certFile, keyFile string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	certFile = writeFile(t, "cert.pem", string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})))
-	keyFile = writeFile(t, "key.pem", string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})))
-	return certFile, keyFile
+	return issued{
+		cert: cert, key: key,
+		certPEM: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})),
+		keyPEM:  string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})),
+	}
+}
+
+// selfSigned writes a certificate and key and returns their paths.
+func selfSigned(t *testing.T) (certFile, keyFile string) {
+	t.Helper()
+	c := issue(t, &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "test"},
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		IsCA:         true,
+	}, nil)
+	return writeFile(t, "cert.pem", c.certPEM), writeFile(t, "key.pem", c.keyPEM)
 }
 
 func TestAuthZeroValueIsPlaintext(t *testing.T) {
@@ -182,55 +207,28 @@ type certAuthority struct {
 
 func newCA(t *testing.T, name string) *certAuthority {
 	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpl := &x509.Certificate{
+	c := issue(t, &x509.Certificate{
 		SerialNumber: big.NewInt(time.Now().UnixNano()),
 		Subject:      pkix.Name{CommonName: name},
-		NotBefore:    time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
-		KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature, IsCA: true, BasicConstraintsValid: true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert, err := x509.ParseCertificate(der)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &certAuthority{cert: cert, key: key, pem: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))}
+		KeyUsage:     x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature, IsCA: true, BasicConstraintsValid: true,
+	}, nil)
+	return &certAuthority{cert: c.cert, key: c.key, pem: c.certPEM}
 }
 
 // leaf issues a certificate for 127.0.0.1 and returns it with its key, PEM.
 func (ca *certAuthority) leaf(t *testing.T, name string, client bool) (certPEM, keyPEM string) {
 	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
 	usage := x509.ExtKeyUsageServerAuth
 	if client {
 		usage = x509.ExtKeyUsageClientAuth
 	}
-	tmpl := &x509.Certificate{
+	c := issue(t, &x509.Certificate{
 		SerialNumber: big.NewInt(time.Now().UnixNano()),
 		Subject:      pkix.Name{CommonName: name},
-		NotBefore:    time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
-		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{usage},
+		KeyUsage:     x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{usage},
 		IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1)},
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.cert, &key.PublicKey, ca.key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyDER, err := x509.MarshalECPrivateKey(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})),
-		string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}))
+	}, ca)
+	return c.certPEM, c.keyPEM
 }
 
 // tlsServer accepts connections that present a client certificate signed

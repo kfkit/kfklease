@@ -125,7 +125,7 @@ func (t TLS) config() (*tls.Config, error) {
 	}
 	ca, err := pemSource(t.CA, t.CAFile, "ca")
 	if err != nil {
-		return nil, fmt.Errorf("lease: tls: %w", err)
+		return nil, err
 	}
 	if ca != nil {
 		pool := x509.NewCertPool()
@@ -136,11 +136,11 @@ func (t TLS) config() (*tls.Config, error) {
 	}
 	cert, err := pemSource(t.Cert, t.CertFile, "client certificate")
 	if err != nil {
-		return nil, fmt.Errorf("lease: tls: %w", err)
+		return nil, err
 	}
 	key, err := pemSource(t.Key, t.KeyFile, "client key")
 	if err != nil {
-		return nil, fmt.Errorf("lease: tls: %w", err)
+		return nil, err
 	}
 	switch {
 	case cert != nil && key != nil:
@@ -155,22 +155,39 @@ func (t TLS) config() (*tls.Config, error) {
 	return cfg, nil
 }
 
-// pemSource returns PEM given inline or as a file, or nil when neither.
-func pemSource(value, file, what string) ([]byte, error) {
+// source is a value given inline or as a file, never both: PEM for TLS, a
+// credential for SASL. It returns nil when neither was given, otherwise a
+// function that returns the value as it is now: a file is read at every
+// call, which is what lets a certificate or a secret renewed in a mounted
+// file take effect on the next reconnect without a restart.
+func source(value, file, what string) (read func() ([]byte, error), err error) {
 	switch {
 	case value != "" && file != "":
 		return nil, fmt.Errorf("%s given both inline and as a file", what)
 	case value != "":
-		return []byte(value), nil
+		return func() ([]byte, error) { return []byte(value), nil }, nil
 	case file != "":
-		b, err := os.ReadFile(file)
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", what, err)
-		}
-		return b, nil
+		return func() ([]byte, error) { return os.ReadFile(file) }, nil
 	default:
 		return nil, nil
 	}
+}
+
+// pemSource returns the PEM of a TLS setting given inline or as a file, as
+// it is now, or nil when neither.
+func pemSource(value, file, what string) ([]byte, error) {
+	read, err := source(value, file, what)
+	if err != nil {
+		return nil, fmt.Errorf("lease: tls: %w", err)
+	}
+	if read == nil {
+		return nil, nil
+	}
+	b, err := read()
+	if err != nil {
+		return nil, fmt.Errorf("lease: tls: %s: %w", what, err)
+	}
+	return b, nil
 }
 
 func (s SASL) mechanism() (sasl.Mechanism, error) {
@@ -181,15 +198,23 @@ func (s SASL) mechanism() (sasl.Mechanism, error) {
 		}
 		return nil, nil
 	}
-	switch mech {
-	case MechanismPlain, MechanismScramSha256, MechanismScramSha512:
-		username, err := secretSource(s.Username, s.UsernameFile, "username")
+	// secret is a credential the mechanism cannot do without.
+	secret := func(value, file, what string) (func() (string, error), error) {
+		get, err := secretSource(value, file, what)
 		if err != nil {
 			return nil, fmt.Errorf("lease: sasl %s: %w", mech, err)
 		}
-		password, err := secretSource(s.Password, s.PasswordFile, "password")
+		return get, nil
+	}
+	switch mech {
+	case MechanismPlain, MechanismScramSha256, MechanismScramSha512:
+		username, err := secret(s.Username, s.UsernameFile, "username")
 		if err != nil {
-			return nil, fmt.Errorf("lease: sasl %s: %w", mech, err)
+			return nil, err
+		}
+		password, err := secret(s.Password, s.PasswordFile, "password")
+		if err != nil {
+			return nil, err
 		}
 		credentials := func() (user, pass string, err error) {
 			if user, err = username(); err != nil {
@@ -210,9 +235,9 @@ func (s SASL) mechanism() (sasl.Mechanism, error) {
 			return scram.Sha512(scramAuth(credentials)), nil
 		}
 	case MechanismOAuthBearer:
-		token, err := secretSource(s.Token, s.TokenFile, "token")
+		token, err := secret(s.Token, s.TokenFile, "token")
 		if err != nil {
-			return nil, fmt.Errorf("lease: sasl %s: %w", mech, err)
+			return nil, err
 		}
 		return oauth.Oauth(func(context.Context) (oauth.Auth, error) {
 			t, err := token()
@@ -230,27 +255,28 @@ func scramAuth(credentials func() (string, string, error)) func(context.Context)
 	}
 }
 
-// secretSource returns a getter for a secret given inline or as a file.
-// The file is read on every call and trailing whitespace is dropped, since
-// mounted secrets often end with a newline.
+// secretSource returns a getter for a secret given inline or as a file; one
+// of the two is required. An inline value is taken as it is. A file has to
+// be there from the start; it is read on every call and trailing whitespace
+// is dropped, since mounted secrets often end with a newline.
 func secretSource(value, file, what string) (func() (string, error), error) {
+	read, err := source(value, file, what)
 	switch {
-	case value != "" && file != "":
-		return nil, fmt.Errorf("%s given both inline and as a file", what)
-	case value != "":
-		return func() (string, error) { return value, nil }, nil
-	case file != "":
-		if _, err := os.Stat(file); err != nil {
-			return nil, fmt.Errorf("%s file: %w", what, err)
-		}
-		return func() (string, error) {
-			b, err := os.ReadFile(file)
-			if err != nil {
-				return "", fmt.Errorf("lease: %s file: %w", what, err)
-			}
-			return strings.TrimRight(string(b), "\r\n"), nil
-		}, nil
-	default:
+	case err != nil:
+		return nil, err
+	case read == nil:
 		return nil, fmt.Errorf("no %s", what)
+	case file == "":
+		return func() (string, error) { return value, nil }, nil
 	}
+	if _, err := os.Stat(file); err != nil {
+		return nil, fmt.Errorf("%s file: %w", what, err)
+	}
+	return func() (string, error) {
+		b, err := read()
+		if err != nil {
+			return "", fmt.Errorf("lease: %s file: %w", what, err)
+		}
+		return strings.TrimRight(string(b), "\r\n"), nil
+	}, nil
 }

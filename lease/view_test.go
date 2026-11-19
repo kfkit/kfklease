@@ -4,27 +4,11 @@
 package lease
 
 import (
+	"encoding/json"
+	"fmt"
+	"maps"
 	"testing"
-	"time"
 )
-
-const testTTL = 10 * time.Second
-
-var t0 = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-
-func at(sec float64) time.Time { return t0.Add(time.Duration(sec * float64(time.Second))) }
-
-func claim(off int64, sec float64, holder string) Record {
-	return Record{Offset: off, Timestamp: at(sec), Kind: Claim, Holder: holder, TTL: testTTL}
-}
-
-func renew(off int64, sec float64, holder string, epoch int64) Record {
-	return Record{Offset: off, Timestamp: at(sec), Kind: Renew, Holder: holder, Epoch: epoch, TTL: testTTL}
-}
-
-func release(off int64, sec float64, holder string, epoch int64) Record {
-	return Record{Offset: off, Timestamp: at(sec), Kind: Release, Holder: holder, Epoch: epoch}
-}
 
 type step struct {
 	rec  Record
@@ -278,9 +262,9 @@ func TestGapResetsView(t *testing.T) {
 
 func TestValueRoundTrip(t *testing.T) {
 	for _, r := range []Record{
-		{Kind: Claim, Holder: "k3s-a/9f2c", TTL: testTTL},
-		{Kind: Renew, Holder: "k3s-a/9f2c", Epoch: 42, TTL: testTTL},
-		{Kind: Release, Holder: "k3s-a/9f2c", Epoch: 42},
+		recordOf(Claim, "k3s-a/9f2c", 0),
+		recordOf(Renew, "k3s-a/9f2c", 42),
+		recordOf(Release, "k3s-a/9f2c", 42),
 	} {
 		b, err := EncodeValue(r)
 		if err != nil {
@@ -298,6 +282,58 @@ func TestValueRoundTrip(t *testing.T) {
 		if _, err := DecodeValue([]byte(bad)); err == nil {
 			t.Fatalf("decode %s: want error", bad)
 		}
+	}
+}
+
+// Which kind carries which field on the wire, as the Records table of
+// docs/protocol.md has it. EncodeValue writes these keys and no other,
+// whatever else the Record has set, and DecodeValue does not read a field
+// its kind does not carry, whatever the value says.
+func TestValueFieldsByKind(t *testing.T) {
+	for _, tc := range []struct {
+		kind       Kind
+		name       string
+		epoch, ttl bool
+	}{
+		{kind: Claim, name: "claim", ttl: true},
+		{kind: Renew, name: "renew", epoch: true, ttl: true},
+		{kind: Release, name: "release", epoch: true, ttl: true},
+		{kind: Yield, name: "yield", epoch: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := map[string]any{"v": float64(1), "kind": tc.name, "holder": "eu/a"}
+			read := Record{Kind: tc.kind, Holder: "eu/a"}
+			if tc.epoch {
+				want["epoch"], read.Epoch = float64(42), 42
+			}
+			if tc.ttl {
+				want["ttl_ms"], read.TTL = float64(testTTL.Milliseconds()), testTTL
+			}
+
+			b, err := EncodeValue(Record{Offset: 5, Timestamp: at(1), Kind: tc.kind, Holder: "eu/a", Epoch: 42, TTL: testTTL})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wire map[string]any
+			if err := json.Unmarshal(b, &wire); err != nil {
+				t.Fatalf("%s: %v", b, err)
+			}
+			if !maps.Equal(wire, want) {
+				t.Errorf("a %s with every field set is written as %s, want exactly %v", tc.name, b, want)
+			}
+
+			all := fmt.Sprintf(`{"v":1,"kind":%q,"holder":"eu/a","epoch":42,"ttl_ms":%d}`, tc.name, testTTL.Milliseconds())
+			got, err := DecodeValue([]byte(all))
+			if err != nil {
+				t.Fatalf("decode %s: %v", all, err)
+			}
+			if got != read {
+				t.Errorf("%s is read as %+v, want %+v", all, got, read)
+			}
+		})
+	}
+	if len(kinds) != 4 {
+		t.Errorf("%d kinds, and this test knows four: add the new one here and to the Records table", len(kinds))
 	}
 }
 

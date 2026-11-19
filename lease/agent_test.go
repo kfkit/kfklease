@@ -14,7 +14,6 @@ import (
 // simulation reaches rarely or not at all.
 
 const (
-	agTTL    = 10 * time.Second
 	agMargin = 2 * time.Second
 	agRenew  = 3 * time.Second
 )
@@ -30,7 +29,7 @@ type agentHarness struct {
 
 func newHarness(t *testing.T, start int64) *agentHarness {
 	t.Helper()
-	cfg, err := Config{Brokers: []string{"x"}, Topic: "x", Holder: "me", TTL: agTTL, Margin: agMargin, RenewEvery: agRenew}.withDefaults()
+	cfg, err := Config{Brokers: []string{"x"}, Topic: "x", Holder: "me", TTL: testTTL, Margin: agMargin, RenewEvery: agRenew}.withDefaults()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +167,7 @@ func TestAgentDropsBeliefWhenLogSaysTermEnded(t *testing.T) {
 	epoch := h.acquire(at(0))
 	// Someone else's claim lands after the term ran out in the log, before
 	// this agent's deadline (say its clock stalled for a bit).
-	h.land(at(10.5), Record{Kind: Claim, Holder: "other", TTL: agTTL})
+	h.land(at(10.5), recordOf(Claim, "other", 0))
 	h.read(at(7.9))
 	h.wantBelief(at(7.9), false)
 	// A renew of the dead term is rejected by the fold too.
@@ -233,7 +232,7 @@ func TestAgentHoleMakesViewUncertain(t *testing.T) {
 	h.acquire(at(0))
 	// Compaction ate a record between what the agent read and what it
 	// reads next: offset 1 never arrives, offset 2 does.
-	skipped := Record{Kind: Renew, Holder: "me", Epoch: 0, TTL: agTTL}
+	skipped := recordOf(Renew, "me", 0)
 	value, err := EncodeValue(skipped)
 	if err != nil {
 		t.Fatal(err)
@@ -355,7 +354,7 @@ func TestAgentNoReleasePastTheDeadline(t *testing.T) {
 	h.a.view.Gap()
 	h.a.setStandby(at(1), true)
 	h.wantSilent(at(1.1)) // uncertain
-	h.a.view = NewViewFromStart(agTTL)
+	h.a.view = NewViewFromStart(testTTL)
 	h.a.nextOffset = 0
 	h.read(at(8.5)) // certain again, the term is this agent's, the deadline (8) has passed
 	h.wantSilent(at(8.6))
@@ -425,10 +424,10 @@ func TestAgentNoReleaseForATermTheLogShowsOver(t *testing.T) {
 		h.a.view.Gap() // the belief is given up on a view that is not certain
 		h.a.setStandby(at(1), true)
 		h.wantSilent(at(1.1))
-		h.a.view, h.a.nextOffset = NewViewFromStart(agTTL), 0
+		h.a.view, h.a.nextOffset = NewViewFromStart(testTTL), 0
 		// On a leader that says 11, another participant's claim is
 		// accepted at 2.
-		h.landAt(at(11), Record{Kind: Claim, Holder: "other", TTL: agTTL})
+		h.landAt(at(11), recordOf(Claim, "other", 0))
 		h.read(at(2.1))
 		h.wantSilent(at(2.2))
 	})
@@ -467,16 +466,16 @@ func TestAgentClaimsOnlyWhenCaughtUp(t *testing.T) {
 	t.Run("replaying", func(t *testing.T) {
 		// Its own site released long ago; a thousand records follow.
 		h := newSiteHarness(t, 0, 30*time.Second)
-		off := h.land(at(0), Record{Kind: Claim, Holder: "eu/old", TTL: agTTL})
-		h.land(at(1), Record{Kind: Release, Holder: "eu/old", Epoch: off, TTL: agTTL})
+		off := h.land(at(0), recordOf(Claim, "eu/old", 0))
+		h.land(at(1), Record{Kind: Release, Holder: "eu/old", Epoch: off, TTL: testTTL})
 		h.read(at(100))
 		h.a.fetched(at(100), 1002)
 		h.wantSilent(at(100.1))
 	})
 	t.Run("caught up", func(t *testing.T) {
 		h := newSiteHarness(t, 0, 30*time.Second)
-		off := h.land(at(0), Record{Kind: Claim, Holder: "eu/old", TTL: agTTL})
-		h.land(at(1), Record{Kind: Release, Holder: "eu/old", Epoch: off, TTL: agTTL})
+		off := h.land(at(0), recordOf(Claim, "eu/old", 0))
+		h.land(at(1), Record{Kind: Release, Holder: "eu/old", Epoch: off, TTL: testTTL})
 		h.read(at(100))
 		h.wantSend(at(100.1), Claim)
 	})
@@ -492,16 +491,16 @@ func TestAgentTakeoverWaitsOutAReleasedTermsNaturalEnd(t *testing.T) {
 	other := newSiteHarness(t, 0, delay)
 	other.a.cfg.Site, other.a.cfg.Holder = "us", "us/them"
 	for _, h := range []*agentHarness{sibling, other} {
-		h.land(at(0), Record{Kind: Claim, Holder: "eu/holder", TTL: agTTL})
+		h.land(at(0), recordOf(Claim, "eu/holder", 0))
 		h.read(at(0.1))
 		h.tick(at(0.1))
-		h.land(at(3), Record{Kind: Renew, Holder: "eu/holder", Epoch: 0, TTL: agTTL}) // the term runs until 13
+		h.land(at(3), recordOf(Renew, "eu/holder", 0)) // the term runs until 13
 		h.tick(at(2.9))
 		h.read(at(3.1))
 		h.tick(at(3.1))
 	}
 	// The holder releases at 4. The sibling is cut off and never reads it.
-	other.land(at(4), Record{Kind: Release, Holder: "eu/holder", Epoch: 0, TTL: agTTL})
+	other.land(at(4), Record{Kind: Release, Holder: "eu/holder", Epoch: 0, TTL: testTTL})
 	other.read(at(4.1))
 	if !sibling.a.siteHolding(at(10.9)) {
 		t.Fatal("the sibling does not answer for its site")
@@ -522,14 +521,13 @@ func TestAgentTakeoverWaitsOutAReleasedTermsNaturalEnd(t *testing.T) {
 // what the brokers' clocks may be apart: the record before the gap may
 // carry the time of a leader running behind.
 func TestViewSilenceAllowsForBrokerSkew(t *testing.T) {
-	sec := func(s float64) time.Time { return t0.Add(time.Duration(s * float64(time.Second))) }
 	// The whole log: a holds from 0 and renews at 9.5 on a leader whose
 	// clock runs 1 s ahead of the next one's.
 	log := []Record{
-		{Offset: 0, Timestamp: sec(0), Kind: Claim, Holder: "a", TTL: testTTL},
-		{Offset: 1, Timestamp: sec(9.5), Kind: Renew, Holder: "a", Epoch: 0, TTL: testTTL},
-		{Offset: 2, Timestamp: sec(8.6), Kind: Claim, Holder: "b", TTL: testTTL}, // rejected; 9.6 by the old leader
-		{Offset: 3, Timestamp: sec(18.7), Kind: Renew, Holder: "a", Epoch: 0, TTL: testTTL},
+		claim(0, 0, "a"),
+		renew(1, 9.5, "a", 0),
+		claim(2, 8.6, "b"), // rejected; 9.6 by the old leader
+		renew(3, 18.7, "a", 0),
 	}
 	full := NewViewFromStart(testTTL)
 	for _, r := range log {
@@ -574,7 +572,7 @@ func TestAgentNoticesAReplacedLog(t *testing.T) {
 		for i := 1; i <= 3; i++ {
 			h.renewAt(float64(3 * i))
 		}
-		rec := value(Record{Kind: Claim, Holder: "other", TTL: agTTL})
+		rec := value(recordOf(Claim, "other", 0))
 		if err := h.a.record(at(20), 0, at(20).Add(h.skew), rec); !errors.Is(err, ErrLogReplaced) {
 			t.Fatalf("record at offset 0 with a later timestamp: %v, want ErrLogReplaced", err)
 		}
@@ -613,7 +611,7 @@ func TestAgentNoticesAReplacedLog(t *testing.T) {
 
 func TestAgentBacksOffAfterRejectedClaim(t *testing.T) {
 	h := newHarness(t, 0)
-	h.land(at(0), Record{Kind: Claim, Holder: "other", TTL: agTTL})
+	h.land(at(0), recordOf(Claim, "other", 0))
 	// The agent has not read the log yet, so it claims blindly...
 	rec := h.wantSend(at(0.1), Claim)
 	off := h.land(at(0.2), rec)
@@ -697,7 +695,7 @@ func TestAgentHealthGateGivesANewTermTimeToComeUp(t *testing.T) {
 	// A healthy report from long before the term counts for nothing, and
 	// does not trip the gate at once either.
 	h.a.healthy(at(0))
-	h.land(at(0), Record{Kind: Claim, Holder: "other", TTL: agTTL})
+	h.land(at(0), recordOf(Claim, "other", 0))
 	h.read(at(0.1))
 	h.acquire(at(10.2)) // settles at 10.4
 	h.renewAt(13.2)
@@ -747,10 +745,10 @@ func newSiteHarness(t *testing.T, start int64, delay time.Duration) *agentHarnes
 func TestAgentTakeoverDelay(t *testing.T) {
 	const delay = 30 * time.Second
 	claim := func(h *agentHarness, sec float64, holder string) {
-		h.land(at(sec), Record{Kind: Claim, Holder: holder, TTL: agTTL})
+		h.land(at(sec), recordOf(Claim, holder, 0))
 	}
 	release := func(h *agentHarness, sec float64, holder string) {
-		h.land(at(sec), Record{Kind: Release, Holder: holder, Epoch: 0})
+		h.land(at(sec), recordOf(Release, holder, 0))
 	}
 	// The broker's clock is estimated from the read-back time of the last
 	// record, read 0.2 s after it landed: a term that ended at broker time
@@ -773,7 +771,7 @@ func TestAgentTakeoverDelay(t *testing.T) {
 		// the margin for the brokers' clocks on top.
 		{"unknown holder, settled by silence", 1, func(h *agentHarness) {
 			claim(h, 0, "eu/old")
-			h.land(at(1), Record{Kind: Renew, Holder: "eu/old", Epoch: 0, TTL: agTTL})
+			h.land(at(1), recordOf(Renew, "eu/old", 0))
 		}, 43.1, 43.3},
 	}
 	for _, tc := range cases {
@@ -816,8 +814,8 @@ func TestAgentReadyOnceCertain(t *testing.T) {
 	// A log read from its start is certain at once, but says nothing until
 	// it has been read to its end.
 	h := newHarness(t, 0)
-	h.land(at(0), Record{Kind: Claim, Holder: "other", TTL: agTTL})
-	h.land(at(1), Record{Kind: Renew, Holder: "other", Epoch: 0, TTL: agTTL})
+	h.land(at(0), recordOf(Claim, "other", 0))
+	h.land(at(1), recordOf(Renew, "other", 0))
 	h.a = newAgent(h.a.cfg, slog.New(slog.DiscardHandler), 0, int64(len(h.log)), at(1.1))
 	if ready(h) {
 		t.Fatal("ready before reading a log with records in it")
@@ -843,14 +841,14 @@ func TestAgentReadyOnceCertain(t *testing.T) {
 
 func TestAgentGivesUpAClaimThatLandedEarly(t *testing.T) {
 	h := newSiteHarness(t, 0, 30*time.Second)
-	h.land(at(0), Record{Kind: Claim, Holder: "us/x", TTL: agTTL})
-	h.land(at(1), Record{Kind: Release, Holder: "us/x", Epoch: 0})
+	h.land(at(0), recordOf(Claim, "us/x", 0))
+	h.land(at(1), recordOf(Release, "us/x", 0))
 	h.read(at(1.2))
 	rec := h.wantSend(at(31.3), Claim)
 	// While the claim is on its way, the other site takes the lease back
 	// for a moment: its own nodes need not wait.
-	h.land(at(31.4), Record{Kind: Claim, Holder: "us/y", TTL: agTTL})
-	h.land(at(31.5), Record{Kind: Release, Holder: "us/y", Epoch: 2})
+	h.land(at(31.4), recordOf(Claim, "us/y", 0))
+	h.land(at(31.5), recordOf(Release, "us/y", 2))
 	off := h.land(at(31.6), rec)
 	h.a.acked(at(31.7), off, nil)
 	h.read(at(31.8))
@@ -867,12 +865,12 @@ func TestAgentGivesUpAClaimThatLandedEarly(t *testing.T) {
 
 func TestAgentTakesOverOnlyWhenCaughtUp(t *testing.T) {
 	h := newSiteHarness(t, 0, 30*time.Second)
-	h.land(at(0), Record{Kind: Claim, Holder: "us/x", TTL: agTTL})
-	h.land(at(1), Record{Kind: Release, Holder: "us/x", Epoch: 0})
+	h.land(at(0), recordOf(Claim, "us/x", 0))
+	h.land(at(1), recordOf(Release, "us/x", 0))
 	h.read(at(1.2))
 	// The log has grown, but the record has not arrived yet: it may be a
 	// new term of the other site.
-	h.land(at(31), Record{Kind: Claim, Holder: "us/y", TTL: agTTL})
+	h.land(at(31), recordOf(Claim, "us/y", 0))
 	h.a.fetched(at(31.3), int64(len(h.log)))
 	h.wantSilent(at(31.3))
 	h.read(at(31.4))
@@ -880,12 +878,12 @@ func TestAgentTakesOverOnlyWhenCaughtUp(t *testing.T) {
 	// The own site waits for the record too: it may be a new term of
 	// anyone. Here it is a renew of the term that was released, rejected.
 	h = newSiteHarness(t, 0, 30*time.Second)
-	h.land(at(0), Record{Kind: Claim, Holder: "eu/x", TTL: agTTL})
-	h.land(at(1), Record{Kind: Release, Holder: "eu/x", Epoch: 0})
+	h.land(at(0), recordOf(Claim, "eu/x", 0))
+	h.land(at(1), recordOf(Release, "eu/x", 0))
 	h.read(at(1.2))
 	h.a.fetched(at(1.3), int64(len(h.log))+1)
 	h.wantSilent(at(1.3))
-	h.land(at(1.31), Record{Kind: Renew, Holder: "eu/x", Epoch: 0, TTL: agTTL})
+	h.land(at(1.31), recordOf(Renew, "eu/x", 0))
 	h.read(at(1.4))
 	h.wantSend(at(1.4), Claim)
 }
@@ -901,7 +899,7 @@ func TestAgentStandbyNeverClaims(t *testing.T) {
 		t.Fatalf("status = %+v, want standby and ready", s)
 	}
 	// It follows the log all the same.
-	h.land(at(60), Record{Kind: Claim, Holder: "other", TTL: agTTL})
+	h.land(at(60), recordOf(Claim, "other", 0))
 	h.read(at(60.1))
 	if s := h.a.view.State(); s.Holder != "other" {
 		t.Fatalf("log state = %+v, want other holding", s)
@@ -973,9 +971,6 @@ func TestAgentStandbyGivesUpAClaimInFlight(t *testing.T) {
 func (h *agentHarness) siteRecord(sec float64, rec Record) int64 {
 	h.t.Helper()
 	h.tick(at(sec - 0.1))
-	if rec.Kind != Release {
-		rec.TTL = agTTL
-	}
 	off := h.land(at(sec), rec)
 	h.read(at(sec + 0.1))
 	return off
@@ -999,53 +994,53 @@ func TestAgentSiteBelief(t *testing.T) {
 
 	t.Run("follows a term of its site", func(t *testing.T) {
 		h := newSibling(t, delay)
-		epoch := h.siteRecord(1, Record{Kind: Claim, Holder: "eu/b"})
+		epoch := h.siteRecord(1, recordOf(Claim, "eu/b", 0))
 		// Read at 1.1: the term counts from there for ttl - margin.
 		h.wantSite(at(9.09), true, epoch)
 		h.wantSite(at(9.1), false, 0)
-		h.siteRecord(4, Record{Kind: Renew, Holder: "eu/b", Epoch: epoch})
+		h.siteRecord(4, recordOf(Renew, "eu/b", epoch))
 		h.wantSite(at(12.09), true, epoch)
 		h.wantBelief(at(12.09), false)
-		h.siteRecord(5, Record{Kind: Release, Holder: "eu/b", Epoch: epoch})
+		h.siteRecord(5, recordOf(Release, "eu/b", epoch))
 		h.wantSite(at(5.1), false, 0)
 	})
 
 	t.Run("a stale read extends nothing", func(t *testing.T) {
 		h := newSibling(t, delay)
-		epoch := h.siteRecord(1, Record{Kind: Claim, Holder: "eu/b"})
+		epoch := h.siteRecord(1, recordOf(Claim, "eu/b", 0))
 		// Frozen from 1.1 to 8: the renew of 4 is read at 8, far from the
 		// last tick, and might be any age.
-		h.land(at(4), Record{Kind: Renew, Holder: "eu/b", Epoch: epoch, TTL: agTTL})
+		h.land(at(4), recordOf(Renew, "eu/b", epoch))
 		h.read(at(8))
 		h.wantSite(at(9.09), true, epoch)
 		h.wantSite(at(9.1), false, 0)
 		// So does a read behind the end of the log: the tick at 9.9 saw
 		// the renew of 9.5 landed but not read.
-		h.land(at(9.5), Record{Kind: Renew, Holder: "eu/b", Epoch: epoch, TTL: agTTL})
+		h.land(at(9.5), recordOf(Renew, "eu/b", epoch))
 		h.a.fetched(at(9.6), int64(len(h.log)))
 		h.tick(at(9.9))
 		h.read(at(10))
 		h.wantSite(at(10), false, 0)
 		// The next fresh renew does.
-		h.siteRecord(12, Record{Kind: Renew, Holder: "eu/b", Epoch: epoch})
+		h.siteRecord(12, recordOf(Renew, "eu/b", epoch))
 		h.wantSite(at(20.09), true, epoch)
 	})
 
 	t.Run("not for another site, without a delay, or in standby", func(t *testing.T) {
 		h := newSibling(t, delay)
-		h.siteRecord(1, Record{Kind: Claim, Holder: "us/x"})
+		h.siteRecord(1, recordOf(Claim, "us/x", 0))
 		h.wantSite(at(1.2), false, 0)
 
 		h = newSibling(t, 0)
-		h.siteRecord(1, Record{Kind: Claim, Holder: "eu/b"})
+		h.siteRecord(1, recordOf(Claim, "eu/b", 0))
 		h.wantSite(at(1.2), false, 0)
 
 		h = newSibling(t, delay)
-		epoch := h.siteRecord(1, Record{Kind: Claim, Holder: "eu/b"})
+		epoch := h.siteRecord(1, recordOf(Claim, "eu/b", 0))
 		h.wantSite(at(1.2), true, epoch)
 		h.a.setStandby(at(1.3), true)
 		h.wantSite(at(1.3), false, 0)
-		h.siteRecord(4, Record{Kind: Renew, Holder: "eu/b", Epoch: epoch})
+		h.siteRecord(4, recordOf(Renew, "eu/b", epoch))
 		h.wantSite(at(4.2), false, 0)
 	})
 
@@ -1063,8 +1058,8 @@ func TestAgentSiteBelief(t *testing.T) {
 	t.Run("takes over for its site at once", func(t *testing.T) {
 		h := newSiteHarness(t, 0, delay)
 		h.a.nextClaimAt = at(5)
-		epoch := h.siteRecord(1, Record{Kind: Claim, Holder: "eu/b"})
-		h.siteRecord(6, Record{Kind: Release, Holder: "eu/b", Epoch: epoch})
+		epoch := h.siteRecord(1, recordOf(Claim, "eu/b", 0))
+		h.siteRecord(6, recordOf(Release, "eu/b", epoch))
 		h.wantSend(at(6.2), Claim)
 	})
 }
@@ -1079,13 +1074,13 @@ func TestAgentHealthGateOfASibling(t *testing.T) {
 		h := newSiteHarness(t, 0, 30*time.Second)
 		h.a.cfg.Health = gate
 		h.a.nextClaimAt = at(1000)
-		epoch := h.siteRecord(1, Record{Kind: Claim, Holder: "eu/b"}) // the site's term starts at 1.1
+		epoch := h.siteRecord(1, recordOf(Claim, "eu/b", 0)) // the site's term starts at 1.1
 		h.a.healthy(at(2))
 		for s := 4.0; s < 15; s += 3 {
 			if healthy {
 				h.a.healthy(at(s - 0.5))
 			}
-			h.siteRecord(s, Record{Kind: Renew, Holder: "eu/b", Epoch: epoch})
+			h.siteRecord(s, recordOf(Renew, "eu/b", epoch))
 		}
 		s, _, _ := h.a.status(at(13))
 		if tripped := !s.CooldownUntil.IsZero(); tripped == healthy {
@@ -1094,7 +1089,7 @@ func TestAgentHealthGateOfASibling(t *testing.T) {
 		// Tripped, it still answers for its site while the holder holds.
 		h.wantSite(at(13), true, epoch)
 		h.a.nextClaimAt = time.Time{}
-		h.siteRecord(14, Record{Kind: Release, Holder: "eu/b", Epoch: epoch})
+		h.siteRecord(14, recordOf(Release, "eu/b", epoch))
 		if healthy {
 			h.wantSend(at(14.2), Claim)
 			continue
@@ -1112,8 +1107,8 @@ func TestAgentHealthGateCountsAcrossTheSite(t *testing.T) {
 	h := newSiteHarness(t, 0, 30*time.Second)
 	h.a.cfg.Health = HealthGate{FailAfter: 10 * time.Second, Cooldown: time.Minute}
 	h.a.nextClaimAt = at(1000)
-	epoch := h.siteRecord(1, Record{Kind: Claim, Holder: "eu/b"}) // the run starts at 1.1
-	h.siteRecord(4, Record{Kind: Release, Holder: "eu/b", Epoch: epoch})
+	epoch := h.siteRecord(1, recordOf(Claim, "eu/b", 0)) // the run starts at 1.1
+	h.siteRecord(4, recordOf(Release, "eu/b", epoch))
 	h.a.nextClaimAt = time.Time{}
 	h.acquire(at(4.2))
 	h.renewAt(7.2)
@@ -1131,13 +1126,6 @@ func TestAgentHealthGateCountsAcrossTheSite(t *testing.T) {
 // landed, so the broker's clock is estimated 0.2 s behind the agent's.
 func TestAgentYield(t *testing.T) {
 	const delay = 30 * time.Second
-	rec := func(kind Kind, holder string, epoch int64) Record {
-		r := Record{Kind: kind, Holder: holder, Epoch: epoch}
-		if kind == Claim || kind == Renew {
-			r.TTL = agTTL
-		}
-		return r
-	}
 	type landed struct {
 		sec float64
 		rec Record
@@ -1148,22 +1136,22 @@ func TestAgentYield(t *testing.T) {
 		// silent is the last moment checked for silence; sendsAt the claim.
 		silent, sendsAt float64
 	}{
-		{"yield after a release", []landed{{0, rec(Claim, "us/x", 0)}, {3, rec(Renew, "us/x", 0)}, {4, rec(Release, "us/x", 0)}, {6, rec(Yield, "us/y", 0)}},
+		{"yield after a release", []landed{{0, recordOf(Claim, "us/x", 0)}, {3, recordOf(Renew, "us/x", 0)}, {4, recordOf(Release, "us/x", 0)}, {6, recordOf(Yield, "us/y", 0)}},
 			14.6, 14.8}, // the renew at 3 runs out at 13, + 1.5
-		{"yield later than the natural end", []landed{{0, rec(Claim, "us/x", 0)}, {1, rec(Release, "us/x", 0)}, {20, rec(Yield, "us/x", 0)}},
+		{"yield later than the natural end", []landed{{0, recordOf(Claim, "us/x", 0)}, {1, recordOf(Release, "us/x", 0)}, {20, recordOf(Yield, "us/x", 0)}},
 			0, 20.3},
-		{"yield after an expiry", []landed{{0, rec(Claim, "us/x", 0)}, {12, rec(Yield, "us/x", 0)}},
+		{"yield after an expiry", []landed{{0, recordOf(Claim, "us/x", 0)}, {12, recordOf(Yield, "us/x", 0)}},
 			12.1, 12.3}, // 10 + 1.5 = 11.5 has passed by the time it is read
-		{"yield by another site", []landed{{0, rec(Claim, "us/x", 0)}, {1, rec(Release, "us/x", 0)}, {2, rec(Yield, "ap/z", 0)}},
+		{"yield by another site", []landed{{0, recordOf(Claim, "us/x", 0)}, {1, recordOf(Release, "us/x", 0)}, {2, recordOf(Yield, "ap/z", 0)}},
 			31.1, 31.3},
-		{"yield by the claimant's own site", []landed{{0, rec(Claim, "us/x", 0)}, {1, rec(Release, "us/x", 0)}, {2, rec(Yield, "eu/z", 0)}},
+		{"yield by the claimant's own site", []landed{{0, recordOf(Claim, "us/x", 0)}, {1, recordOf(Release, "us/x", 0)}, {2, recordOf(Yield, "eu/z", 0)}},
 			31.1, 31.3},
-		{"yield of another term", []landed{{0, rec(Claim, "us/x", 0)}, {1, rec(Release, "us/x", 0)}, {2, rec(Yield, "us/x", 5)}},
+		{"yield of another term", []landed{{0, recordOf(Claim, "us/x", 0)}, {1, recordOf(Release, "us/x", 0)}, {2, recordOf(Yield, "us/x", 5)}},
 			31.1, 31.3},
-		{"yield while the term was held", []landed{{0, rec(Claim, "us/x", 0)}, {1, rec(Yield, "us/x", 0)}, {2, rec(Release, "us/x", 0)}},
+		{"yield while the term was held", []landed{{0, recordOf(Claim, "us/x", 0)}, {1, recordOf(Yield, "us/x", 0)}, {2, recordOf(Release, "us/x", 0)}},
 			32.1, 32.3},
 		// The yield names the term before the last: it lands late.
-		{"yield after a new term", []landed{{0, rec(Claim, "us/x", 0)}, {1, rec(Release, "us/x", 0)}, {2, rec(Claim, "us/y", 0)}, {3, rec(Release, "us/y", 2)}, {4, rec(Yield, "us/x", 0)}},
+		{"yield after a new term", []landed{{0, recordOf(Claim, "us/x", 0)}, {1, recordOf(Release, "us/x", 0)}, {2, recordOf(Claim, "us/y", 0)}, {3, recordOf(Release, "us/y", 2)}, {4, recordOf(Yield, "us/x", 0)}},
 			33.1, 33.3},
 	}
 	for _, tc := range cases {
@@ -1194,11 +1182,11 @@ func TestAgentYield(t *testing.T) {
 	// said: the view anchors again on the renew and the release, but the
 	// term's natural end is not known, and the yield does not count.
 	h := newSiteHarness(t, 0, delay)
-	h.land(at(0), rec(Claim, "us/x", 0))
-	h.land(at(3), rec(Renew, "us/x", 0)) // compacted away
-	h.land(at(5), rec(Renew, "us/x", 0))
-	h.land(at(6), rec(Release, "us/x", 0))
-	h.land(at(7), rec(Yield, "us/x", 0))
+	h.land(at(0), recordOf(Claim, "us/x", 0))
+	h.land(at(3), recordOf(Renew, "us/x", 0)) // compacted away
+	h.land(at(5), recordOf(Renew, "us/x", 0))
+	h.land(at(6), recordOf(Release, "us/x", 0))
+	h.land(at(7), recordOf(Yield, "us/x", 0))
 	for _, r := range h.log {
 		if r.Offset == 1 {
 			continue
@@ -1224,9 +1212,9 @@ func TestAgentYield(t *testing.T) {
 	// (at 2.2 + ttl + margin), on a term that ended by 1 + ttl + margin at
 	// the latest, and the delay counts from there.
 	h = newSiteHarness(t, 1, delay)
-	h.land(at(0), rec(Claim, "us/x", 0))
-	h.land(at(1), rec(Release, "us/x", 0))
-	h.land(at(2), rec(Yield, "us/x", 0))
+	h.land(at(0), recordOf(Claim, "us/x", 0))
+	h.land(at(1), recordOf(Release, "us/x", 0))
+	h.land(at(2), recordOf(Yield, "us/x", 0))
 	h.read(at(2.2))
 	h.wantSilent(at(14.3))
 	h.wantSilent(at(43.1))
@@ -1307,17 +1295,17 @@ func TestAgentHandover(t *testing.T) {
 	})
 	t.Run("not while another site holds", func(t *testing.T) {
 		h, _ := standbyAfterTerm(t)
-		epoch := h.land(at(3), Record{Kind: Claim, Holder: "eu/other", TTL: agTTL})
+		epoch := h.land(at(3), recordOf(Claim, "eu/other", 0))
 		h.read(at(3.1))
 		if _, ok := handover(h, at(3.2)); ok {
 			t.Fatal("handover while its own site holds again")
 		}
-		h.land(at(4), Record{Kind: Release, Holder: "eu/other", Epoch: epoch})
+		h.land(at(4), recordOf(Release, "eu/other", epoch))
 		h.read(at(4.1))
 		if e, ok := handover(h, at(4.2)); !ok || e != epoch {
 			t.Fatalf("handover = %d, %v; want the new term %d", e, ok, epoch)
 		}
-		h.land(at(5), Record{Kind: Claim, Holder: "us/x", TTL: agTTL})
+		h.land(at(5), recordOf(Claim, "us/x", 0))
 		h.read(at(5.1))
 		if _, ok := handover(h, at(5.2)); ok {
 			t.Fatal("handover while another site holds")
@@ -1325,8 +1313,8 @@ func TestAgentHandover(t *testing.T) {
 	})
 	t.Run("not out of standby", func(t *testing.T) {
 		h := newSiteHarness(t, 0, delay)
-		h.land(at(0), Record{Kind: Claim, Holder: "eu/other", TTL: agTTL})
-		h.land(at(1), Record{Kind: Release, Holder: "eu/other", Epoch: 0})
+		h.land(at(0), recordOf(Claim, "eu/other", 0))
+		h.land(at(1), recordOf(Release, "eu/other", 0))
 		h.a.nextClaimAt = at(1000)
 		h.read(at(1.1))
 		if _, ok := handover(h, at(1.2)); ok {
@@ -1337,4 +1325,44 @@ func TestAgentHandover(t *testing.T) {
 			t.Fatal("no handover in standby")
 		}
 	})
+}
+
+// The projection from what an agent published to the Status reported at a
+// later moment, as Candidate.Status calls it: with a clock the loop has not
+// reached and a standby switch it has not seen.
+func TestStatusAt(t *testing.T) {
+	own, site := belief{at(8), 5}, belief{at(6), 3}
+	known := Status{Certain: true, Ready: true, CooldownUntil: at(7), Handover: true, HandoverEpoch: 5}
+	for _, tc := range []struct {
+		name      string
+		now       time.Time
+		standby   bool
+		own, site belief
+		want      Status
+	}{
+		{"own term: the site's term too", at(1), false, own, belief{},
+			Status{Holding: true, Epoch: 5, Deadline: at(8), SiteHolding: true, SiteEpoch: 5, SiteDeadline: at(8), CooldownUntil: at(7), HandoverEpoch: -1}},
+		{"own term before the site's", at(1), false, own, site,
+			Status{Holding: true, Epoch: 5, Deadline: at(8), SiteHolding: true, SiteEpoch: 5, SiteDeadline: at(8), CooldownUntil: at(7), HandoverEpoch: -1}},
+		{"site's term only", at(1), false, belief{}, site,
+			Status{SiteHolding: true, SiteEpoch: 3, SiteDeadline: at(6), CooldownUntil: at(7), HandoverEpoch: -1}},
+		{"site's term outlived", at(6), false, belief{}, site,
+			Status{CooldownUntil: at(7), HandoverEpoch: -1}},
+		{"own term and cooldown outlived", at(8), false, own, belief{},
+			Status{HandoverEpoch: -1}},
+		{"standby: no belief, and the handover", at(1), true, own, site,
+			Status{Standby: true, CooldownUntil: at(7), Handover: true, HandoverEpoch: 5}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.want.Certain, tc.want.Ready = true, true
+			got, gotOwn, gotSite := statusAt(tc.now, tc.standby, known, tc.own, tc.site)
+			if got != tc.want {
+				t.Errorf("status:\n got %+v\nwant %+v", got, tc.want)
+			}
+			// Projected again from its own result, it stays what it is.
+			if again, _, _ := statusAt(tc.now, tc.standby, got, gotOwn, gotSite); again != got {
+				t.Errorf("projected twice:\n got %+v\nwant %+v", again, got)
+			}
+		})
+	}
 }
