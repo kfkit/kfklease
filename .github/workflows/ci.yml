@@ -9,6 +9,21 @@ permissions:
   contents: read
 
 jobs:
+  # Does the pull request touch more than documents? If not, the jobs below
+  # that build and run the code are skipped, and a skipped job passes as a
+  # required check. A push to main always runs them all, and so does a
+  # change this job could not judge (the conditions read "not false").
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.changes.outputs.code }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - id: changes
+        run: test/changes.sh | tee -a "$GITHUB_OUTPUT"
+
   unit:
     runs-on: ubuntu-latest
     steps:
@@ -24,6 +39,8 @@ jobs:
           git diff --exit-code -- internal/
 
   integration:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -33,12 +50,16 @@ jobs:
       - run: make integration
 
   image:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - run: make image
 
   chart:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -48,7 +69,11 @@ jobs:
   # failover scenarios. Slow, so it runs after the fast jobs pass.
   e2e:
     runs-on: ubuntu-latest
-    needs: [unit, integration, image, chart]
+    needs: [changes, unit, integration, image, chart]
+    if: >-
+      ${{ !cancelled() && needs.changes.outputs.code != 'false'
+      && needs.unit.result == 'success' && needs.integration.result == 'success'
+      && needs.image.result == 'success' && needs.chart.result == 'success' }}
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
