@@ -7,6 +7,40 @@ and this project adheres to
 
 ## Unreleased
 
+### Fixed
+
+- A stop (`Run`'s context cancelled, a pod terminated) no longer writes a
+  release behind a record that is still in flight. A holder cut off from
+  the brokers with a renew on its way and stopped while it still believed
+  could leave `renew, release` in the log after its term had run out and
+  another participant had claimed; a participant that joined the log right
+  there took the pair for an anchor, saw the lease as free and held it
+  together with the real holder. The same pair could follow a release by
+  the health gate or by standby. A release now waits for the record in
+  flight and is written only before the deadline of the belief it ends,
+  for a term the log shows as live.
+- A participant claims only when it has read the log up to its end. It
+  used to claim before its first fetch came back, and, for its own site or
+  without a takeover delay, while still replaying history.
+- Another site no longer claims before the natural end of a released term
+  (plus two poll intervals), whatever the takeover delay: with a delay
+  shorter than the TTL, a participant that missed the release still
+  answered "my site holds" when the other site had the lease. The chart's
+  delay (95 s by default) was long enough; a `TakeoverDelay` below the TTL
+  was not.
+- A silence between two records proves the lease free only when it is the
+  margin longer than a TTL: with partition leaders whose clocks differ, a
+  late reader could call a held lease free.
+- A participant whose lease topic was deleted and created again, or whose
+  partition lost acknowledged records, stops with `lease.ErrLogReplaced`
+  (the scaler exits and restarts). It used to stay up, ready and holding
+  nothing, for good.
+
+### Added
+
+- `View.AllowSkew`: how far apart two partition leaders' clocks may be.
+  Participants pass their margin.
+
 ## [0.4.0] - 2026-11-18
 
 ### Breaking

@@ -21,9 +21,10 @@ import (
 // acknowledgements that arrive after the record was already read back,
 // processes frozen in the middle of a decision, nodes cut off from the log
 // for a while, and participants that join late and see only the tail of
-// the log. Time is virtual and all clocks are
-// perfect, so the safety margin is zero and any overlap is a protocol bug
-// rather than a tuning problem.
+// the log, and processes that are stopped, with whatever they have in
+// flight, and come back as a new process under the same holder id. Time is
+// virtual and all clocks are perfect, so the safety margin is zero and any
+// overlap is a protocol bug rather than a tuning problem.
 //
 // Two properties are checked:
 //
@@ -34,6 +35,8 @@ import (
 //     the workloads of two sites never run at once either;
 //   - agreement: a reader that starts from any point of the log, once it is
 //     certain, has exactly the state of a reader that saw the whole log.
+//     Every run of every flavour is checked from every offset
+//     (checkAgreement).
 
 const (
 	simTTL      = 1000 * time.Millisecond
@@ -43,9 +46,15 @@ const (
 
 // simMsg is a produce request on its way to the log.
 type simMsg struct {
-	from   *simNode
+	from *simNode
+	// by is the agent that sent it: a node that was stopped and came back
+	// is a new process and hears nothing of what its previous life sent.
+	by     *agent
 	landAt time.Time
 	rec    Record
+	// unacked: the sender hears nothing of the landing. Its client gave up
+	// on the record before, or it never went through the agent.
+	unacked bool
 }
 
 // simAck is the broker's answer on its way back, or the client giving up
@@ -65,6 +74,9 @@ type simParams struct {
 	// brokerSkew bounds the offset of a partition leader's clock from real
 	// time; each new leader draws its own offset from [-brokerSkew, +brokerSkew].
 	brokerSkew time.Duration
+	// leaderEvery is the longest a partition leader lasts; twenty TTLs
+	// when zero.
+	leaderEvery time.Duration
 	// clientDrift bounds the rate error of a node's clock: a node's clock
 	// runs at a rate drawn from [1-clientDrift, 1+clientDrift].
 	clientDrift float64
@@ -72,7 +84,9 @@ type simParams struct {
 	// health turns the health gate on, with workloads that go up and down.
 	health bool
 	// sites puts the nodes in two sites, with a takeover delay: delay, or
-	// simDelay when zero.
+	// simDelay when zero. Now and then a whole site is cut off from the
+	// log for up to twice the delay, as a cluster that loses its network:
+	// what moves a lease to another site.
 	sites bool
 	delay time.Duration
 	// standby switches nodes in and out of standby every twenty TTLs or
@@ -184,6 +198,19 @@ type simNode struct {
 	// wasSiteHolding is siteHolding at the node's last step, for the
 	// handover driver, which lifts a pause when it turns true.
 	wasSiteHolding bool
+
+	// stopBy is set while the node is being stopped, as Run does it: the
+	// agent was told to stop and is driven on until it has nothing left to
+	// wait for, or until stopBy on the node's clock. Then the process is
+	// gone and a new one joins a while later.
+	stopBy time.Time
+}
+
+// gone ends the node's process and schedules the next one: it joins as a
+// late reader does, from the tail of the log, knowing nothing of the life
+// before.
+func (n *simNode) gone(now time.Time, rng *rand.Rand) {
+	*n = simNode{joinAt: now.Add(time.Duration(rng.Int64N(int64(2 * simTTL)))), standby: n.standby, workloadUp: n.workloadUp}
 }
 
 // simStats counts what happened in one run.
@@ -196,6 +223,10 @@ type simStats struct {
 	siteAnswers int
 	// yields counts yields sent by the handover, bogus the others.
 	yields, bogus int
+	// stops counts processes stopped, stopReleases the releases they wrote
+	// on the way out, and stopsInFlight the stops that found a record in
+	// flight.
+	stops, stopReleases, stopsInFlight int
 	// workOverlapAt is the first instant at which the workloads of two
 	// sites ran at once; zero for never.
 	workOverlapAt time.Time
@@ -295,11 +326,12 @@ func runSimStats(t *testing.T, seed uint64, p simParams) (records []Record, over
 	var wire []*simMsg
 	work := map[string]*simWorkload{"s0": {}, "s1": {}}
 	siteStandby := map[string]bool{}
+	siteCutUntil := map[string]time.Time{}
 
 	for now := simTime(0); now.Before(simTime(simDuration)); now = now.Add(simStep) {
 		if !now.Before(nextLeaderChange) {
 			leaderOffset = time.Duration((2*rng.Float64() - 1) * float64(p.brokerSkew))
-			nextLeaderChange = now.Add(time.Duration(rng.Int64N(int64(20 * simTTL))))
+			nextLeaderChange = now.Add(time.Duration(rng.Int64N(int64(cmp.Or(p.leaderEvery, 20*simTTL)))))
 		}
 		// Land produce requests. LogAppendTime is the landing time by the
 		// leader's clock. The acknowledgement takes its own time to get
@@ -313,10 +345,21 @@ func runSimStats(t *testing.T, seed uint64, p simParams) (records []Record, over
 			m.rec.Offset = int64(len(records))
 			m.rec.Timestamp = now.Add(leaderOffset)
 			records = append(records, m.rec)
+			if m.unacked || m.from.a != m.by {
+				continue
+			}
 			m.from.acks = append(m.from.acks, simAck{at: now.Add(time.Duration(rng.IntN(60)) * time.Millisecond), offset: m.rec.Offset})
 			slices.SortStableFunc(m.from.acks, func(x, y simAck) int { return x.at.Compare(y.at) })
 		}
 		wire = rest
+
+		if p.sites {
+			for _, site := range []string{"s0", "s1"} {
+				if rng.Float64() < 0.0002 {
+					siteCutUntil[site] = now.Add(time.Duration(rng.Int64N(int64(2 * cmp.Or(p.delay, simDelay)))))
+				}
+			}
+		}
 
 		holders := 0
 		sites := map[string]bool{}
@@ -378,6 +421,10 @@ func runSimStats(t *testing.T, seed uint64, p simParams) (records []Record, over
 			if now.Before(n.pausedUntil) {
 				continue
 			}
+			if !n.stopBy.IsZero() && (n.a.stopDone(n.local(now)) || !n.local(now).Before(n.stopBy)) {
+				n.gone(now, rng)
+				continue
+			}
 			if rng.Float64() < 0.002 {
 				n.pausedUntil = now.Add(time.Duration(rng.Int64N(int64(3 * simTTL))))
 				continue
@@ -411,17 +458,24 @@ func runSimStats(t *testing.T, seed uint64, p simParams) (records []Record, over
 
 			// Acknowledgements that have arrived.
 			for len(n.acks) > 0 && !n.acks[0].at.After(now) {
-				n.a.acked(local, n.acks[0].offset, n.acks[0].err)
+				if err := n.a.acked(local, n.acks[0].offset, n.acks[0].err); err != nil {
+					t.Fatalf("seed %d: %v", seed, err)
+				}
 				n.acks = n.acks[1:]
 			}
-			if now.Before(n.partitionedUntil) {
-				n.a.fetchFailed(errSimTimeout)
-				rec, ok := n.a.tick(local)
-				if p.health {
-					n.checkGate(t, seed, local, rec, ok, &st)
+			// A stop, at any moment: more often for a holder, which has a
+			// term to give up and, a third of the time, a renew in flight.
+			if pStop := 0.0001 + 0.0009*b2f(n.a.believing(local)); n.stopBy.IsZero() && rng.Float64() < pStop {
+				st.stops++
+				if n.a.inflight != nil {
+					st.stopsInFlight++
 				}
-				n.checkStandby(t, seed, local, rec, ok, &st)
-				if ok {
+				n.a.stop(local)
+				n.stopBy = local.Add(simTTL)
+			}
+			if now.Before(n.partitionedUntil) || now.Before(siteCutUntil[n.a.cfg.Site]) {
+				n.a.fetchFailed(errSimTimeout)
+				if _, ok := n.tick(t, seed, p, local, &st); ok {
 					// Sent into the void; the client gives up after a ttl.
 					n.acks = append(n.acks, simAck{at: now.Add(simTTL), err: errSimTimeout})
 				}
@@ -446,22 +500,12 @@ func runSimStats(t *testing.T, seed uint64, p simParams) (records []Record, over
 			if p.handover {
 				simHandover(n, local, work[n.a.cfg.Site], now, rng)
 				if rng.Float64() < 0.0005 {
-					wire = append(wire, &simMsg{from: n, landAt: now.Add(simStep), rec: n.bogusYield(local)})
+					wire = append(wire, &simMsg{from: n, by: n.a, landAt: now.Add(simStep), rec: n.bogusYield(local), unacked: true})
 					st.bogus++
 				}
 			}
 
-			var rec Record
-			var ok bool
-			if n.a.believing(local) && rng.Float64() < 0.001 {
-				rec, ok = n.a.release(local)
-			} else {
-				rec, ok = n.a.tick(local)
-				if p.health {
-					n.checkGate(t, seed, local, rec, ok, &st)
-				}
-				n.checkStandby(t, seed, local, rec, ok, &st)
-			}
+			rec, ok := n.tick(t, seed, p, local, &st)
 			if !ok {
 				continue
 			}
@@ -481,10 +525,93 @@ func runSimStats(t *testing.T, seed uint64, p simParams) (records []Record, over
 					continue
 				}
 			}
-			wire = append(wire, &simMsg{from: n, landAt: now.Add(simStep + delay), rec: rec})
+			wire = append(wire, &simMsg{from: n, by: n.a, landAt: now.Add(simStep + delay), rec: rec, unacked: delay >= simTTL})
 		}
 	}
+	if p.sound() {
+		checkAgreement(t, seed, records, p.margin)
+	}
 	return records, overlapAt, st
+}
+
+// sound reports whether the margin of the run covers its clocks: the bound
+// of TestSimulationClockSkewNeedsMargin. Without it a fast client clock
+// calls a silence early and the views themselves go wrong, so agreement is
+// only asked of sound runs.
+func (p simParams) sound() bool {
+	return p.margin >= 2*p.brokerSkew+time.Duration(float64(simTTL)*p.clientDrift)
+}
+
+// tick ticks the node's agent at its local time and holds it to the rules
+// of the run. A release on the way out of a stop is the stop's, not the
+// gate's nor standby's.
+func (n *simNode) tick(t *testing.T, seed uint64, p simParams, local time.Time, st *simStats) (Record, bool) {
+	t.Helper()
+	rec, ok := n.a.tick(local)
+	if stopping := !n.stopBy.IsZero(); stopping {
+		switch {
+		case ok && rec.Kind == Release:
+			st.stopReleases++
+		case ok:
+			t.Fatalf("seed %d, t=%v: %s writes a %v while stopping", seed, local.Sub(t0), n.a.cfg.Holder, rec.Kind)
+		}
+		if n.a.believing(local) {
+			t.Fatalf("seed %d, t=%v: %s believes while stopping", seed, local.Sub(t0), n.a.cfg.Holder)
+		}
+		return rec, ok
+	}
+	if p.health {
+		n.checkGate(t, seed, local, rec, ok, st)
+	}
+	n.checkStandby(t, seed, local, rec, ok, st)
+	return rec, ok
+}
+
+func b2f(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// checkAgreement is the agreement property over one log: a reader started
+// at any offset, once certain, has the state of the reader that saw
+// everything, at every record from there on. skew is what the readers allow
+// for the brokers' clocks, as a participant does with its margin.
+func checkAgreement(t *testing.T, seed uint64, records []Record, skew time.Duration) {
+	t.Helper()
+	ref := NewViewFromStart(simTTL)
+	refStates := make([]State, len(records))
+	refClocks := make([]time.Time, len(records))
+	for i, r := range records {
+		if _, err := ref.Apply(r); err != nil {
+			t.Fatalf("seed %d: %v", seed, err)
+		}
+		refStates[i], refClocks[i] = ref.State(), ref.Clock()
+	}
+	for start := range records {
+		late := NewView(simTTL)
+		late.AllowSkew(skew)
+		for i := start; i < len(records); i++ {
+			if _, err := late.Apply(records[i]); err != nil {
+				t.Fatalf("seed %d: %v", seed, err)
+			}
+			if !late.Certain() {
+				continue
+			}
+			got, want := late.State(), refStates[i]
+			now := late.Clock()
+			if got.HeldAt(now) != want.HeldAt(now) || (want.HeldAt(now) && got != want) {
+				t.Fatalf("seed %d: reader from offset %d disagrees at offset %d: got %+v, want %+v; records from %d: %v",
+					seed, start, i, got, want, start, records[start:i+1])
+			}
+			if got == want && now.Equal(refClocks[i]) {
+				// The same state at the same time: the same fold from
+				// here on.
+				break
+			}
+		}
+	}
 }
 
 // simHandover is the scaler's handover driver for node n: while its agent
@@ -605,7 +732,7 @@ func TestSimulationClockSkewNeedsMargin(t *testing.T) {
 		name string
 		p    simParams
 	}{
-		{"broker skew", simParams{brokerSkew: simTTL / 5}},
+		{"broker skew", simParams{brokerSkew: simTTL / 5, leaderEvery: 2 * simTTL}},
 		{"client drift", simParams{clientDrift: 0.1}},
 		{"both", simParams{brokerSkew: simTTL / 10, clientDrift: 0.05}},
 	}

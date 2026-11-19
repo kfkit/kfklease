@@ -74,7 +74,9 @@ func (o Outcome) String() string {
 //
 //   - start: the caller guarantees the full history (NewViewFromStart);
 //   - silence: no claim or renew for a whole TTL means the lease is free,
-//     either between two consecutive records or at the end of the log (Quiet);
+//     either between two consecutive records (by broker timestamps, plus
+//     the skew between two leaders' clocks, see AllowSkew) or at the end of
+//     the log (Quiet);
 //   - anchor: a record of a term followed by a renew or release of the same
 //     term was valid, because a holder writes those only after its own fold
 //     accepted the earlier record and only while it still believes the term is
@@ -86,6 +88,9 @@ func (o Outcome) String() string {
 // A View is not safe for concurrent use.
 type View struct {
 	ttl time.Duration
+	// skew is how far apart the clocks of two partition leaders may be;
+	// see AllowSkew.
+	skew time.Duration
 
 	certain bool
 	state   State
@@ -121,6 +126,19 @@ func NewViewFromStart(ttl time.Duration) *View {
 	return v
 }
 
+// AllowSkew tells the view how far apart the clocks of two partition
+// leaders may be: twice the offset of one broker's clock from real time.
+// Timestamps step when the leader changes, so the gap between two records
+// can read longer than it was by that much, and only a gap of a TTL plus
+// d proves the lease free. Participants pass their margin, which has to
+// cover the skew anyway. The default is none: perfect broker clocks.
+func (v *View) AllowSkew(d time.Duration) {
+	if d < 0 {
+		panic("lease: negative skew")
+	}
+	v.skew = d
+}
+
 // Certain reports whether State can be trusted.
 func (v *View) Certain() bool { return v.certain }
 
@@ -150,7 +168,7 @@ func (v *View) Quiet(d time.Duration) bool {
 	}
 	var endBy time.Time
 	if v.seen {
-		endBy = v.clock.Add(v.ttl)
+		endBy = v.clock.Add(v.ttl + v.skew)
 	}
 	v.setFree(endBy)
 	return true
@@ -194,9 +212,11 @@ func (v *View) Apply(r Record) (Outcome, error) {
 	v.seen = true
 
 	// Silence between two consecutive records: whatever term there was, it
-	// got no renewal for a whole TTL.
-	if !v.certain && hadPrev && r.Timestamp.Sub(prev) >= v.ttl {
-		v.setFree(prev.Add(v.ttl))
+	// got no renewal for a whole TTL, and for the skew on top: the record
+	// before may carry the time of a leader whose clock ran behind the one
+	// that stamped the term's last renewal.
+	if !v.certain && hadPrev && r.Timestamp.Sub(prev) >= v.ttl+v.skew {
+		v.setFree(prev.Add(v.ttl + v.skew))
 	}
 
 	if v.certain {

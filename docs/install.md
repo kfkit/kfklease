@@ -704,6 +704,7 @@ writes to the topic.
 | A failover takes about two minutes | TTL plus `takeoverDelay`, which is `pollingInterval + cooldownPeriod + takeoverMargin`: the price of a scaler restart that keeps the workload. Lower `cooldownPeriod` if scaler restarts are fast |
 | Standby moves the workload only after `takeoverDelay` | the handover did not finish: the scaler logs `handover: cannot pause`, `cannot count the workload's pods` (RBAC, a target kind whose plural is not kind + `s`, a ScaledObject KEDA has not resolved yet) or keeps logging nothing while a pod of the workload hangs in `Terminating`. See [The handover](#the-handover) |
 | A ScaledObject keeps `autoscaling.keda.sh/paused-replicas: "0"` | a handover that never finished, with the cluster's own term still the latest. It goes when the cluster or another one holds the lease; remove it by hand only when no other cluster could have taken over on the promise of a yield |
+| Scaler exits with `the log was replaced or truncated` | the lease topic was deleted and created again, or the partition lost acknowledged records, under running scalers. They restart and read the log as it is; epochs start over, so a workload that fences by epoch must not trust an older one |
 | KEDA logs `the lease state is not known yet` | a scaler that just started and has not read the log yet; it settles within seconds. If it does not, look at its connection to Kafka |
 
 Set `logLevel: debug` to see every record the scaler folds.
