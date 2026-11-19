@@ -65,6 +65,10 @@ and this project adheres to
 
 - `View.AllowSkew`: how far apart two partition leaders' clocks may be.
   Participants pass their margin.
+- Docs: "When the partition leader dies" in docs/install.md: what a hard
+  failure of the lease partition's leader costs at the default TTL (the
+  term and its epoch, not the workload), measured, and the two ways to
+  ride through it.
 
 ## [0.4.0] - 2026-11-18
 

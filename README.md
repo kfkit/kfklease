@@ -219,7 +219,8 @@ once and that nothing stale got through.
 `Status().Holding` is a belief with a deadline, not a fact: a holder that
 cannot reach Kafka stops believing after one TTL minus a margin, and the next
 holder is elected only after the term runs out in the log, so the two never
-overlap as long as the margin covers clock skew.
+overlap as long as the margin covers clock skew. How to choose the two is
+in [docs/install.md](docs/install.md#choosing-ttl-and-margin).
 
 ## Development
 

@@ -542,7 +542,8 @@ gate fires. Without `url` (the default) there is no gate.
   also how often the holder writes to the topic (every TTL/3). 10 s is a
   reasonable default; 5 s if failover time matters more than a few extra
   records per minute; longer if the clusters see the broker over a flaky
-  link and should not fail over on every blip.
+  link and should not fail over on every blip, or if a term has to outlast
+  the hard death of a broker ([below](#when-the-partition-leader-dies)).
 - **Margin** is safety. The holder stops believing this much before its
   term ends in the log, to cover clocks that disagree. It must be at least
   twice the clock skew between brokers plus the drift of the holder's own
@@ -553,6 +554,69 @@ gate fires. Without `url` (the default) there is no gate.
 
 The TTL is a property of the lease: every participant must use the same
 value, and the fold rejects records that ask for more.
+
+### When the partition leader dies
+
+The lease topic has one partition, and one broker leads it. A broker that
+is stopped gracefully hands the leadership over first, and the lease does
+not notice. A broker that dies hard (a kill, a lost node, a power cut)
+leaves the partition without a leader until the controller declares the
+broker dead, after `broker.session.timeout.ms`, 9 s by default, and then
+elects another. No renewal lands in between.
+
+A holder renews every TTL/3 and believes for TTL minus the margin after
+the send of its last accepted renewal. Right before a renewal the belief
+has `ttl − margin − ttl/3` left, 4.7 s with the defaults, and right after
+one `ttl − margin`, 8 s. Both are shorter than 9 s. So at the default TTL
+a hard failure of the partition leader always costs the term: the holder
+stops believing, nobody holds the lease for a few seconds, and the next
+claim starts a new term with a new epoch. Safety holds: there are never
+two holders.
+
+Under the chart the workload stays where it is: the term that ended was
+the site's own, so the site claims again within seconds, and KEDA's
+`cooldownPeriod` covers the gap. What changes is the epoch. A workload
+that [fences by epoch](#fencing-by-epoch) sees a few seconds without
+`site_holding` and then a new `site_epoch`; a program that uses
+`lease.Candidate` directly sees a few seconds without a holder and a new
+epoch, maybe on another participant.
+
+Measured with three brokers (Apache Kafka 4.3.1, KRaft, default settings),
+a lease topic with three replicas and `min.insync.replicas=2`, three
+`lease.Candidate`s, TTL 10 s, margin 2 s, statuses sampled every 5 ms:
+
+| Event | What the lease did |
+|---|---|
+| `SIGKILL` of the partition leader | the holder logged `deadline passed without renewal` 6.5 s later; nobody held for 3.9 s; another participant took a new epoch |
+| graceful stop of the partition leader | nothing: the holder kept its term |
+| two of three brokers killed (no ISR quorum, no controller quorum) | the holder stopped believing after 7.7 s; nobody held for the 37.5 s that were left of the outage; held again 13.1 s after the brokers were started |
+
+No two holders at any moment of the run.
+
+To keep a term through a hard failure of the partition leader, the belief
+left right before a renewal has to outlast the session timeout and the
+election:
+
+```
+ttl − margin − ttl/3  >  broker.session.timeout.ms + election
+```
+
+There are two ways to get there:
+
+- **A longer TTL.** With the default margin of TTL/5 the left side is 7/15
+  of the TTL, so the brokers' default of 9 s takes a TTL of about 20 s, and
+  more the longer the election takes. The cost is the failover time: when
+  the holder is really gone, every takeover waits out a TTL first, 20 s
+  where it was 10 s.
+- **A shorter `broker.session.timeout.ms` on the brokers**, below the
+  4.7 s the default TTL leaves, less the election. The cost falls on the
+  whole Kafka cluster, not on the lease: a broker that pauses for longer
+  than the timeout (a long GC, a slow disk) is declared dead and loses its
+  leaderships, on every topic. And the brokers may not be yours to
+  configure.
+
+With neither, a hard failure of the partition leader costs what the table
+shows: a few seconds without a holder and a new epoch.
 
 ## Operations
 
@@ -575,7 +639,9 @@ site that held it claims at once, the others wait `takeoverDelay`, so the
 lease comes back where it was, and so does the workload, which never
 stopped if the outage was shorter than `cooldownPeriod`. A restart of the
 broker shorter than TTL minus margin passes unnoticed: a renewal gets
-through in time.
+through in time. The hard death of the partition leader is never that
+short with the brokers' defaults; see [When the partition leader
+dies](#when-the-partition-leader-dies).
 
 **Changing the TTL.** It is one value for all participants. Stop all
 scalers, change the value everywhere, start them. Records with the old TTL
@@ -713,6 +779,7 @@ writes to the topic.
 | `kfklease_certain` stays 0 | the scaler is not reading the log: check `fetch failed` in its logs, the brokers, the auth |
 | Every cluster is standby, `kfklease_lease_held` is 1 | someone else holds the lease: a scaler you forgot, or a previous pod still releasing. Wait one TTL |
 | `acquired` and `no longer holder` alternate | renewals are not landing in time: the broker is slow or the link is flaky. Raise the TTL, or look at the broker |
+| The epoch changed and nothing failed over: `deadline passed without renewal`, then `acquired` with a new epoch in the same cluster | a broker died hard, the leader of the lease's partition: at the default TTL the term does not outlast the brokers' session timeout. See [When the partition leader dies](#when-the-partition-leader-dies) |
 | Two clusters run the workload for a few seconds after a handover | the workload takes longer to stop than `takeoverMargin`, or a revived cluster runs its stale pod until its KEDA is back. Raise `takeoverMargin`; fence by epoch |
 | A failover takes about two minutes | TTL plus `takeoverDelay`, which is `pollingInterval + cooldownPeriod + takeoverMargin`: the price of a scaler restart that keeps the workload. Lower `cooldownPeriod` if scaler restarts are fast |
 | Standby moves the workload only after `takeoverDelay` | the handover did not finish: the scaler logs `handover: cannot pause`, `cannot count the workload's pods` (RBAC, a target kind whose plural is not kind + `s`, a ScaledObject KEDA has not resolved yet) or keeps logging nothing while a pod of the workload hangs in `Terminating`. See [The handover](#the-handover) |
