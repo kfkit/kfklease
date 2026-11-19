@@ -22,6 +22,7 @@ runs a workload in one cluster at a time. The map:
 | `examples/heartbeat` | a workload that fences by epoch, and the report that checks it | scaler's `/status` |
 | `test/e2e` | the stand: two k3s clusters with KEDA and one Kafka, and the failure scenarios; `test/e2e/README.md` lists them | Docker |
 | `docs/protocol.md` | why the lease is safe. Change it when the rules change | |
+| `claude-plugin/`, `.claude-plugin/marketplace.json` | a Claude Code plugin with one skill, for people who adopt kfklease, not for work on this repository: the order to do things in and the mistakes to avoid, pointing at `docs/install.md`. No `version` in `plugin.json`, so every commit reaches those who installed it: when the guide changes, change the skill in the same PR | |
 | `docs/index.html` | "How kfklease works", the page GitHub Pages serves at kfkit.dev/kfklease: one static file, no build step, nothing loaded from elsewhere, no version numbers. Its simulation is a model of the rules, not the code: change it when the rules change | |
 
 ## Rules
@@ -188,4 +189,33 @@ goes before `p2`, then oldest first.
 Append here after every review that found something these rules did not
 prevent.
 
-(none yet)
+- **A property checked on a sample is not checked.** The simulation
+  compared late readers with the full history from 25 random offsets a
+  run and passed for months with two ways for a reader to be wrong in the
+  log. Checked from every offset it failed at once (#44, #54). When a
+  property is cheap to check everywhere, check it everywhere.
+- **A shortcut in the simulation is a rule nobody tests.** A stop was
+  modelled as "release and carry on", so the same agent claimed again at
+  once and nothing ever saw a site leave (#53); a record the client had
+  given up on still acknowledged itself, which wedged agents and made the
+  runs look busier than they were. Model what the client and the process
+  really do, the stop and the silence included.
+- **A mutant that does not compile was not killed.** Breaking a rule by
+  deleting half a condition can leave an unused variable; the build
+  fails, every test "fails", and the rule is still untested. Read the
+  failure, or mutate with `true ||` so that the code still builds.
+- **One stand per machine, and one directory.** The compose project has
+  one name. Scripts run from a second worktree recreate the containers of
+  the first with other mounts. `make e2e-down` where the stand was
+  started, before `make e2e` anywhere else.
+- **A hole in the log takes a real compaction.** The broker refuses
+  `DeleteRecords` on a compacted topic, so the start offset stays 0. To
+  put a reader behind a hole in a test, create the topic with a short
+  `segment.ms`, write the records a second apart, and wait for the cleaner
+  with `min.compaction.lag.ms` at 0.
+- **A release is not done at the tag.** The chart's push to GHCR can fail
+  with `failed to perform "Tag" on destination` while the image is
+  already out: rerun the failed jobs. Then the provenance entry
+  (`docs/provenance/README.md`), and a few lines of highlights and
+  upgrade notes on top of the generated release notes, which are only the
+  titles of the pull requests.

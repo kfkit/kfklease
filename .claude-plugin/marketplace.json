@@ -1,0 +1,14 @@
+{
+  "name": "kfklease",
+  "description": "kfklease for Claude Code: a skill for adopting and operating it.",
+  "owner": {
+    "name": "kfkit"
+  },
+  "plugins": [
+    {
+      "name": "kfklease",
+      "source": "./claude-plugin",
+      "description": "A skill for adopting and operating kfklease: what to decide before installing, what the numbers trade, how to fence, how to move a workload on purpose, what not to do."
+    }
+  ]
+}

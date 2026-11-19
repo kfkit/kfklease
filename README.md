@@ -220,6 +220,23 @@ holder is elected only after the term runs out in the log, so the two never
 overlap as long as the margin covers clock skew. How to choose the two is
 in [docs/install.md](docs/install.md#choosing-ttl-and-margin).
 
+### With Claude Code
+
+The repository carries a skill for whoever adopts kfklease with
+[Claude Code](https://claude.com/claude-code): what to find out before
+installing, what the numbers trade, how to fence, how to move a workload on
+purpose, and what not to do, each step pointing at the section of
+[docs/install.md](docs/install.md) it rests on.
+
+```
+/plugin marketplace add kfkit/kfklease
+/plugin install kfklease@kfklease
+```
+
+Or copy `claude-plugin/skills/kfklease` into `.claude/skills/` of your own
+repository. The skill is [one file](claude-plugin/skills/kfklease/SKILL.md);
+read it before you trust it.
+
 ## Development
 
 ```bash
