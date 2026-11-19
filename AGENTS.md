@@ -23,7 +23,7 @@ runs a workload in one cluster at a time. The map:
 | `test/e2e` | the stand: two k3s clusters with KEDA and one Kafka, and the failure scenarios; `test/e2e/README.md` lists them | Docker |
 | `docs/protocol.md` | why the lease is safe. Change it when the rules change | |
 | `claude-plugin/`, `.claude-plugin/marketplace.json` | a Claude Code plugin with one skill, for people who adopt kfklease, not for work on this repository: the order to do things in and the mistakes to avoid, pointing at `docs/install.md`. No `version` in `plugin.json`, so every commit reaches those who installed it: when the guide changes, change the skill in the same PR | |
-| `docs/index.html` | "How kfklease works", the page GitHub Pages serves at kfkit.dev/kfklease: one static file, no build step, nothing loaded from elsewhere, no version numbers. Its simulation is a model of the rules, not the code: change it when the rules change | |
+| `docs/index.html` | "How kfklease works", the page GitHub Pages serves at kfkit.dev/kfklease: one static file, no build step, nothing loaded from elsewhere, no version numbers, dark only. Its simulation is a model of the rules, not the code: change it when the rules change | |
 
 ## Rules
 
