@@ -1,0 +1,711 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How kfklease works</title>
+<meta name="description" content="How kfklease keeps a workload running in one cluster at a time: a lease derived from a compacted topic of Apache Kafka, in fifteen slides and one small simulation.">
+<meta name="author" content="Ivan Abramov">
+<!--
+  One static page: no build step, no dependencies, nothing loaded from
+  elsewhere. The pictures are drawn on canvases by the script at the end,
+  pixel by pixel; the simulation on slide 11 is a small model of the rules in
+  docs/protocol.md, not the real code.
+-->
+<style>
+  :root {
+    --bg: #fff1e8; --fg: #1d2b53; --muted: #5f574f; --rule: #c2c3c7;
+    --accent: #7e2553; --panel: #ffffff; --key: #ab5236;
+    --screen: #0e1428; --screen-edge: #1d2b53;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0b0f1e; --fg: #fff1e8; --muted: #c2c3c7; --rule: #2a3350;
+      --accent: #ffec27; --panel: #131a30; --key: #ffa300;
+      --screen: #060912; --screen-edge: #29366f;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { scroll-snap-type: y proximity; scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 17px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  a { color: var(--accent); }
+  .slide {
+    min-height: 100vh; scroll-snap-align: start;
+    display: flex; flex-direction: column; justify-content: center;
+    max-width: 62rem; margin: 0 auto; padding: 3.5rem 1.25rem 4.5rem;
+  }
+  .kicker { color: var(--muted); font-size: .8rem; letter-spacing: .14em; text-transform: uppercase; margin: 0 0 .6rem; }
+  h1, h2 {
+    margin: 0 0 1.1rem; line-height: 1.15; letter-spacing: .02em; text-transform: uppercase;
+    text-shadow: 3px 3px 0 var(--rule);
+  }
+  h1 { font-size: clamp(2.4rem, 8vw, 4.6rem); }
+  h2 { font-size: clamp(1.5rem, 4.4vw, 2.4rem); }
+  p, li { max-width: 46rem; }
+  p { margin: 0 0 1rem; }
+  ul { margin: 0 0 1rem; padding-left: 1.2rem; }
+  li { margin: 0 0 .45rem; }
+  li::marker { content: "\25AA  "; color: var(--accent); }
+  strong { color: var(--accent); font-weight: 700; }
+  code { background: var(--panel); border: 1px solid var(--rule); padding: 0 .3em; font-size: .92em; }
+  pre {
+    background: var(--panel); border: 3px solid var(--fg); padding: .9rem 1rem; margin: 0 0 1rem;
+    overflow-x: auto; font-size: .88rem; line-height: 1.5; max-width: 100%;
+  }
+  pre code { background: none; border: 0; padding: 0; }
+  /* A picture is a small game screen, the same in light and dark. */
+  canvas.px {
+    display: block; width: 100%; height: auto; max-width: var(--w, 48rem);
+    image-rendering: pixelated; image-rendering: crisp-edges;
+    background: var(--screen); border: 4px solid var(--screen-edge);
+    box-shadow: 6px 6px 0 var(--rule); margin: .4rem 0 1.4rem;
+  }
+  table { border-collapse: collapse; margin: 0 0 1rem; max-width: 100%; }
+  th, td { text-align: left; vertical-align: top; padding: .4rem .9rem .4rem 0; border-bottom: 2px solid var(--rule); }
+  th { font-size: .8rem; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+  .chip { display: inline-block; min-width: 5.2rem; padding: 0 .45rem; color: #1d2b53; font-weight: 700; text-align: center; }
+  .claim { background: #ffec27; } .renew { background: #00e436; } .release { background: #29adff; } .yield { background: #ff77a8; }
+  .controls { display: grid; grid-template-columns: 1fr auto 1fr; gap: .6rem 1rem; max-width: 48rem; margin: 0 0 1rem; }
+  .controls > div { display: flex; flex-wrap: wrap; gap: .45rem; align-content: flex-start; }
+  .controls > div:nth-child(2) { justify-content: center; }
+  .controls > div:nth-child(3) { justify-content: flex-end; }
+  button {
+    font: inherit; font-size: .82rem; color: var(--fg); background: var(--panel);
+    border: 3px solid var(--fg); padding: .25rem .6rem; cursor: pointer; box-shadow: 3px 3px 0 var(--rule);
+  }
+  button:hover { background: var(--accent); color: var(--bg); }
+  button:active { transform: translate(3px, 3px); box-shadow: none; }
+  button[aria-pressed="true"] { background: var(--fg); color: var(--bg); }
+  button:focus-visible, a:focus-visible { outline: 3px solid var(--key); outline-offset: 2px; }
+  .readout { max-width: 48rem; font-size: .88rem; display: grid; grid-template-columns: 1fr 1fr; gap: .2rem 1.5rem; margin: 0 0 .8rem; }
+  .readout b { color: var(--accent); }
+  #feed { list-style: none; padding: 0; margin: 0; max-width: 48rem; font-size: .82rem; color: var(--muted); min-height: 6.6em; }
+  #feed li { margin: 0; max-width: none; }
+  #feed li::marker { content: none; }
+  .hint { color: var(--muted); font-size: .85rem; }
+  nav.pager {
+    position: fixed; right: .8rem; bottom: .7rem; display: flex; align-items: center; gap: .5rem;
+    font-size: .8rem; color: var(--muted); background: var(--bg); padding: .2rem .4rem; border: 2px solid var(--rule);
+  }
+  nav.pager button { padding: 0 .5rem; box-shadow: none; border-width: 2px; }
+  footer { max-width: 62rem; margin: 0 auto; padding: 0 1.25rem 4rem; color: var(--muted); font-size: .8rem; }
+  @media (max-width: 40rem) {
+    body { font-size: 15px; }
+    .controls { grid-template-columns: 1fr; }
+    .controls > div:nth-child(n) { justify-content: flex-start; }
+    .readout { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<main>
+
+<section class="slide" id="s1">
+  <p class="kicker">kfklease, a lease on Apache Kafka&reg;</p>
+  <h1>One workload.<br>One cluster<br>at a time.</h1>
+  <canvas class="px" data-scene="title" width="192" height="56" style="--w:48rem" role="img"
+    aria-label="Pixel art: two clusters on either side of a broker's log. A crown hovers over the left cluster, where a small robot is working; the right cluster sleeps."></canvas>
+  <p>The log decides who. This is how, in fifteen slides and one small simulation.</p>
+  <p class="hint">Scroll, or use the arrow keys.</p>
+</section>
+
+<section class="slide" id="s2">
+  <p class="kicker">1 &middot; the job</p>
+  <h2>Something must run exactly once</h2>
+  <p>A connector, a scheduler, a consumer that must not be doubled. You have two Kubernetes
+     clusters, so that one can go away. The workload should run in one of them, and move when
+     that one is gone: not before, and never in both.</p>
+  <canvas class="px" data-scene="job" width="192" height="48" style="--w:48rem" role="img"
+    aria-label="Pixel art: two clusters and one robot between them with a question mark: which cluster runs it?"></canvas>
+  <p>That needs an arbiter both clusters can reach and neither owns. If you run
+     Apache Kafka, you already operate one: a durable, ordered log.</p>
+</section>
+
+<section class="slide" id="s3">
+  <p class="kicker">2 &middot; the catch</p>
+  <h2>A log cannot say &ldquo;take it if it is free&rdquo;</h2>
+  <p>A lock needs compare-and-swap. A partition only appends. Two candidates can always both
+     write <em>I take it</em>, and both writes succeed.</p>
+  <canvas class="px" data-scene="race" width="192" height="48" style="--w:48rem" role="img"
+    aria-label="Pixel art: two robots each throw a claim record at the log at the same moment; both land."></canvas>
+</section>
+
+<section class="slide" id="s4">
+  <p class="kicker">3 &middot; the idea</p>
+  <h2>So writing decides nothing</h2>
+  <p>The state of the lease is a <strong>function of the log</strong>. Every participant reads
+     the same partition in the same order and applies the same rules, the writer included: it
+     learns the fate of its own record by reading it back. The partition's order is the missing
+     compare-and-swap.</p>
+  <canvas class="px" data-scene="fold" width="192" height="48" style="--w:48rem" role="img"
+    aria-label="Pixel art: records in the log are judged one by one in order. The first claim is accepted, the second rejected, renewals accepted."></canvas>
+</section>
+
+<section class="slide" id="s5">
+  <p class="kicker">4 &middot; the records</p>
+  <h2>Four kinds, one key</h2>
+  <table>
+    <tr><th>Record</th><th>Means</th><th>Takes effect when</th></tr>
+    <tr><td><span class="chip claim">claim</span></td><td>start a new term</td><td>the lease is not held at the record's timestamp</td></tr>
+    <tr><td><span class="chip renew">renew</span></td><td>extend my term</td><td>that term is still live, and mine</td></tr>
+    <tr><td><span class="chip release">release</span></td><td>end my term now</td><td>the same</td></tr>
+    <tr><td><span class="chip yield">yield</span></td><td>my site's workload has stopped</td><td>never changes the lease; lets another site take over sooner</td></tr>
+  </table>
+  <p>The offset of an accepted claim is the term's <strong>epoch</strong>: unique, growing with
+     every term, known to anyone who reads the record. It is the fencing token.</p>
+  <p>All records share one key, so compaction keeps the tail and the topic stays small.</p>
+</section>
+
+<section class="slide" id="s6">
+  <p class="kicker">5 &middot; time</p>
+  <h2>One clock: the broker's</h2>
+  <p>The topic uses <code>LogAppendTime</code>: the broker stamps every record as it lands. A term
+     lasts one <strong>TTL</strong> after its last accepted record. Client clocks are never
+     compared with anything.</p>
+  <canvas class="px" data-scene="clock" width="192" height="48" style="--w:48rem" role="img"
+    aria-label="Pixel art: a clock over the log, and a bar that drains as time passes and refills each time a renewal lands."></canvas>
+</section>
+
+<section class="slide" id="s7">
+  <p class="kicker">6 &middot; the holder</p>
+  <h2>A belief with a deadline</h2>
+  <p>A holder does not <em>know</em> it holds the lease; it believes so until
+     <strong>send time + TTL &minus; margin</strong>, on its own monotonic clock. A record lands
+     after it was sent, so the term in the log always outlives the belief.</p>
+  <canvas class="px" data-scene="belief" width="192" height="52" style="--w:48rem" role="img"
+    aria-label="Pixel art: two bars starting together. The belief bar is shorter than the term bar; the difference is the margin."></canvas>
+  <p>A process frozen for a minute wakes up with a deadline in the past. It stops before anyone
+     else may start.</p>
+</section>
+
+<section class="slide" id="s8">
+  <p class="kicker">7 &middot; newcomers</p>
+  <h2>Joining in the middle</h2>
+  <p>Compaction leaves a tail, so a new reader starts mid-story and cannot judge the first
+     records it sees. Its view is <strong>uncertain</strong> until it can prove a state:</p>
+  <ul>
+    <li><strong>Start</strong>: it read the partition from offset 0, without gaps.</li>
+    <li><strong>Silence</strong>: nothing for a whole TTL, and the margin on top. Whatever term there was is over.</li>
+    <li><strong>Anchor</strong>: two records of one term. A writer writes the second only after
+        reading the first back and finding it accepted.</li>
+  </ul>
+  <canvas class="px" data-scene="anchor" width="192" height="44" style="--w:48rem" role="img"
+    aria-label="Pixel art: a log with a hole in it. The records after the hole carry question marks until two renewals of one term appear; then the view is certain."></canvas>
+  <p>Nobody writes, or believes, on an uncertain view.</p>
+</section>
+
+<section class="slide" id="s9">
+  <p class="kicker">8 &middot; sites</p>
+  <h2>The lease belongs to a site</h2>
+  <p>A holder is <code>&lt;site&gt;/&lt;pod&gt;</code>, and a site is a cluster. Each cluster runs
+     two scaler pods: one holds the term, both answer for the site.</p>
+  <ul>
+    <li><strong>Own site</strong>: takes over at once. A scaler restart, an upgrade, a node drain move nothing.</li>
+    <li><strong>Another site</strong>: waits the <strong>takeover delay</strong> after the term
+        ended, the time the old workload gets to stop, and never less than the term's natural end.</li>
+  </ul>
+  <canvas class="px" data-scene="sites" width="192" height="48" style="--w:48rem" role="img"
+    aria-label="Pixel art: inside one cluster the crown passes between two scaler pods at once; the other cluster watches an hourglass."></canvas>
+</section>
+
+<section class="slide" id="s10">
+  <p class="kicker">9 &middot; moving the workload</p>
+  <h2>KEDA does the lifting</h2>
+  <p>The scaler is a <a href="https://keda.sh/">KEDA</a> external scaler. It answers
+     <strong>1</strong> while its site holds the lease and <strong>0</strong> otherwise. The
+     ScaledObject has <code>idleReplicaCount: 0</code> and
+     <code>minReplicaCount = maxReplicaCount = N</code>.</p>
+  <canvas class="px" data-scene="keda" width="192" height="48" style="--w:48rem" role="img"
+    aria-label="Pixel art: the holding cluster runs three robots, the other cluster runs none."></canvas>
+  <p>N replicas where the lease is held, none elsewhere. If KEDA cannot reach the scaler, a
+     fallback scales the workload to zero: fail closed.</p>
+</section>
+
+<section class="slide" id="s11">
+  <p class="kicker">10 &middot; try it</p>
+  <h2>Break a cluster</h2>
+  <canvas class="px" id="sim" width="256" height="112" style="--w:48rem" role="img"
+    aria-label="Simulation: two clusters, eu and us, and the lease log between them. The text below the picture says who holds the lease and where the workload runs."></canvas>
+  <div class="controls">
+    <div aria-label="Cluster eu">
+      <button data-site="eu" data-act="kill">kill eu</button>
+      <button data-site="eu" data-act="cut">cut eu off</button>
+      <button data-site="eu" data-act="standby">standby eu</button>
+    </div>
+    <div>
+      <button id="play" aria-pressed="true">run</button>
+      <button id="speed">speed &times;4</button>
+      <button id="reset">reset</button>
+    </div>
+    <div aria-label="Cluster us">
+      <button data-site="us" data-act="kill">kill us</button>
+      <button data-site="us" data-act="cut">cut us off</button>
+      <button data-site="us" data-act="standby">standby us</button>
+    </div>
+  </div>
+  <div class="readout" aria-live="off">
+    <span>broker time <b id="r-t">0 s</b></span>
+    <span>lease <b id="r-lease">free</b></span>
+    <span>workload in eu <b id="r-eu">no</b></span>
+    <span>workload in us <b id="r-us">no</b></span>
+    <span>ran in both at once <b id="r-overlap">0.0 s</b></span>
+    <span>TTL 10 s &middot; takeover delay 40 s &middot; KEDA cooldown 30 s</span>
+  </div>
+  <ol id="feed" aria-label="Latest events"></ol>
+  <p class="hint">A model of the rules, not the real code: one scaler per cluster, instant reads.
+     Kill the holder and count: the term runs out a TTL after its last renewal, the other cluster
+     waits the delay, then claims.</p>
+</section>
+
+<section class="slide" id="s12">
+  <p class="kicker">11 &middot; on purpose</p>
+  <h2>The handover</h2>
+  <p>The takeover delay is a guess at how long the old workload takes to stop. A cluster that
+     leaves on purpose can do better. Put it in <strong>standby</strong> and its scaler:</p>
+  <ul>
+    <li>stops believing and writes a <span class="chip release">release</span>;</li>
+    <li>pauses the ScaledObject at zero, and waits until the scale is at zero and no pod is left;</li>
+    <li>writes a <span class="chip yield">yield</span>: <em>our workload is down</em>.</li>
+  </ul>
+  <p>The other cluster reads the yield and takes over about a TTL after the last renewal, not a
+     takeover delay after the release. Try <em>standby</em> on the holder in the simulation.</p>
+</section>
+
+<section class="slide" id="s13">
+  <p class="kicker">12 &middot; the last line of defence</p>
+  <h2>Fence with the epoch</h2>
+  <p>Kubernetes will happily restart a stale pod in a cluster that just came back. So the
+     workload asks the scaler before it writes, and sends the epoch along:</p>
+  <canvas class="px" data-scene="fence" width="192" height="48" style="--w:48rem" role="img"
+    aria-label="Pixel art: a robot carrying epoch 41 bounces off a wall that lets only epoch 42 and later through."></canvas>
+  <ul>
+    <li><code>GET /status</code>: no <code>site_holding</code>, no write.</li>
+    <li>Every write carries <code>site_epoch</code>; whatever receives it rejects an epoch older
+        than the newest it has seen.</li>
+  </ul>
+</section>
+
+<section class="slide" id="s14">
+  <p class="kicker">13 &middot; why believe any of this</p>
+  <h2>How it is tested</h2>
+  <ul>
+    <li><strong>A simulation</strong> drives the real decision code against a fake log with frozen
+        processes, late and lost records, cut-off nodes, stopped processes, skewed clocks. No two
+        holders at any instant; a reader started at <em>any</em> offset agrees with one that saw
+        everything.</li>
+    <li><strong>Integration tests</strong> on a real broker, over plaintext, SASL and mTLS.</li>
+    <li><strong>A stand</strong>: two k3s clusters with KEDA and one broker, and a dozen failure
+        scenarios (crash, partition, freeze, broker outage, a scaler that is gone, handover).
+        A heartbeat workload proves no two epochs ever wrote at once, by the broker's clock.</li>
+    <li>Every rule was <strong>broken on purpose</strong> to see a test fail.</li>
+  </ul>
+  <p>The reasoning is in <a href="https://github.com/kfkit/kfklease/blob/main/docs/protocol.md">the protocol</a>.</p>
+</section>
+
+<section class="slide" id="s15">
+  <p class="kicker">14 &middot; go</p>
+  <h2>One release per cluster</h2>
+<pre><code>helm install kfklease oci://ghcr.io/kfkit/charts/kfklease \
+  -n kfklease --create-namespace \
+  --set brokers=kafka:9092 --set topic=my-lease \
+  --set site=eu-west \
+  --set scaledObject.targetRef.name=my-singleton</code></pre>
+  <p>The same in the other cluster, with another <code>site</code>.</p>
+  <ul>
+    <li><a href="https://github.com/kfkit/kfklease">Source on GitHub</a></li>
+    <li><a href="https://github.com/kfkit/kfklease/blob/main/docs/install.md">Install and operate</a></li>
+    <li><a href="https://github.com/kfkit/kfklease/blob/main/docs/protocol.md">The protocol, and why it is safe</a></li>
+    <li><a href="https://github.com/kfkit/kfklease/releases">Releases</a></li>
+    <li><a href="https://kfkit.dev/">kfkit</a></li>
+  </ul>
+  <canvas class="px" data-scene="end" width="192" height="40" style="--w:48rem" role="img"
+    aria-label="Pixel art: the robot waves under the crown."></canvas>
+</section>
+
+</main>
+
+<footer>
+  Written and maintained by <a rel="me" href="https://www.linkedin.com/in/ivan-abramov-8605078/">Ivan Abramov</a>.
+  Apache-2.0. Apache Kafka&reg; is a registered trademark of The Apache Software Foundation;
+  kfkit is not affiliated with or endorsed by the ASF.
+</footer>
+
+<nav class="pager" aria-label="Slides">
+  <button id="prev" aria-label="Previous slide">&larr;</button>
+  <span id="pos">1 / 15</span>
+  <button id="next" aria-label="Next slide">&rarr;</button>
+</nav>
+
+<script>
+"use strict";
+// ---------------------------------------------------------------- palette
+// Sixteen colours, used by every picture.
+const C = {
+  navy: "#1d2b53", plum: "#7e2553", green: "#008751", brown: "#ab5236",
+  dark: "#5f574f", light: "#c2c3c7", white: "#fff1e8", red: "#ff004d",
+  orange: "#ffa300", yellow: "#ffec27", lime: "#00e436", blue: "#29adff",
+  lavender: "#83769c", pink: "#ff77a8", peach: "#ffccaa", black: "#060912",
+};
+const KIND = { claim: C.yellow, renew: C.lime, release: C.blue, yield: C.pink };
+const LETTER = { claim: "C", renew: "R", release: "L", yield: "Y" };
+
+// ---------------------------------------------------------------- drawing
+const R = (g, x, y, w, h, c) => { g.fillStyle = c; g.fillRect(Math.round(x), Math.round(y), w, h); };
+
+// A 3x5 font: fifteen bits a glyph, rows from the top.
+const FONT = {
+  A: "010101111101101", B: "110101110101110", C: "011100100100011", D: "110101101101110",
+  E: "111100110100111", F: "111100110100100", G: "011100101101011", H: "101101111101101",
+  I: "111010010010111", J: "001001001101010", K: "101101110101101", L: "100100100100111",
+  M: "101111111101101", N: "111101101101101", O: "010101101101010", P: "110101110100100",
+  Q: "010101101110011", R: "110101110101101", S: "011100010001110", T: "111010010010010",
+  U: "101101101101111", V: "101101101101010", W: "101101111111101", X: "101101010101101",
+  Y: "101101010010010", Z: "111001010100111",
+  0: "111101101101111", 1: "010110010010111", 2: "110001010100111", 3: "110001010001110",
+  4: "101101111001001", 5: "111100110001110", 6: "011100111101111", 7: "111001010010010",
+  8: "111101111101111", 9: "111101111001110",
+  ".": "000000000000010", ":": "000010000010000", "-": "000000111000000", "/": "001001010100100",
+  "=": "000111000111000", "+": "000010111010000", "!": "010010010000010", "?": "110001010000010",
+  ">": "100010001010100", "<": "001010100010001",
+};
+function text(g, s, x, y, c) {
+  for (const ch of String(s).toUpperCase()) {
+    const bits = FONT[ch];
+    if (bits) for (let i = 0; i < 15; i++) if (bits[i] === "1") R(g, x + i % 3, y + (i / 3 | 0), 1, 1, c);
+    x += 4;
+  }
+}
+const textW = s => String(s).length * 4 - 1;
+
+// A sprite is rows of letters; the legend maps a letter to a colour.
+function sprite(g, rows, x, y, legend) {
+  rows.forEach((row, j) => { for (let i = 0; i < row.length; i++) if (legend[row[i]]) R(g, x + i, y + j, 1, 1, legend[row[i]]); });
+}
+const CROWN = ["y...y...y", "yy.yyy.yy", "yyyyyyyyy", "yryybyyry", "yyyyyyyyy", "ooooooooo"];
+const ROBOT = ["....aa....", "....dd....", ".llllllll.", ".lwnllwnl.", ".llllllll.", ".lnnnnnnl.", ".llllllll.", "dd.llll.dd", "...llll...", "...l..l...", "..dd..dd.."];
+const SKULL = [".wwwwwww.", "wwwwwwwww", "wnnwwwnnw", "wnnwwwnnw", "wwwwnwwww", ".wwwwwww.", ".wnwnwnw.", ".wwwwwww."];
+const GLASS = ["ooooooo", ".w...w.", ".wyyyw.", "..wyw..", "...w...", "..w.w..", ".w.y.w.", ".wyyyw.", "ooooooo"];
+
+function crown(g, x, y, grey) {
+  sprite(g, CROWN, x, y, grey ? { y: C.dark, o: C.dark, r: C.light, b: C.light }
+                               : { y: C.yellow, o: C.orange, r: C.red, b: C.blue });
+}
+function robot(g, x, y, f, tint) {
+  const bob = f % 2;
+  sprite(g, ROBOT, x, y + bob, { a: f % 4 < 2 ? C.red : C.yellow, d: C.dark, l: tint || C.light, w: C.white, n: C.navy });
+}
+// A rack: three shelves, each with a light.
+function server(g, x, y, led) {
+  R(g, x, y, 14, 19, C.dark); R(g, x + 1, y + 1, 12, 17, C.lavender);
+  for (let i = 0; i < 3; i++) { R(g, x + 2, y + 2 + i * 5, 10, 4, C.navy); R(g, x + 3, y + 3 + i * 5, 2, 2, led); R(g, x + 7, y + 4 + i * 5, 4, 1, C.dark); }
+  R(g, x - 1, y + 19, 16, 1, C.dark);
+}
+// A record of the log: a tile with the first letter of its kind.
+function tile(g, x, y, kind, ok) {
+  if (ok === false) { R(g, x, y, 7, 7, C.dark); text(g, LETTER[kind], x + 2, y + 1, C.black); for (let i = 0; i < 7; i++) R(g, x + i, y + 6 - i, 1, 1, C.red); return; }
+  R(g, x, y, 7, 7, KIND[kind]); text(g, LETTER[kind], x + 2, y + 1, C.navy);
+}
+function frame(g, x, y, w, h, c) { R(g, x, y, w, 1, c); R(g, x, y + h - 1, w, 1, c); R(g, x, y, 1, h, c); R(g, x + w - 1, y, 1, h, c); }
+function ground(g, w, y) { for (let x = 0; x < w; x += 2) R(g, x, y, 1, 1, C.navy); }
+function dots(g, x0, x1, y, c) { for (let x = Math.min(x0, x1); x <= Math.max(x0, x1); x += 3) R(g, x, y, 1, 1, c); }
+function bar(g, x, y, w, frac, c) { frame(g, x, y, w, 5, C.light); R(g, x + 1, y + 1, Math.max(0, Math.round((w - 2) * Math.min(1, frac))), 3, c); }
+
+// ---------------------------------------------------------------- scenes
+// Each scene draws one frame; f counts frames at about six a second.
+const SCENES = {
+  title(g, f) {
+    const W = 192;
+    text(g, "CLUSTER EU", 8, 4, C.light); text(g, "CLUSTER US", W - 8 - textW("CLUSTER US"), 4, C.dark);
+    server(g, 12, 26, C.lime); server(g, W - 26, 26, C.dark);
+    crown(g, 14, 14 + (f % 4 < 2 ? 0 : 1));
+    robot(g, 32, 34, f); text(g, "ZZZ", W - 44, 30 + (f % 6 < 3 ? 0 : 1), C.dark);
+    text(g, "LOG", 70, 12, C.peach);
+    const kinds = ["claim", "renew", "renew", "renew", "renew", "renew", "renew"];
+    for (let i = 0; i < 7; i++) tile(g, 70 + i * 8, 20, kinds[(i + (f >> 2)) % 7 === 0 ? 0 : 1 + i % 6]);
+    dots(g, 28, 68, 38, C.lavender); dots(g, 127, W - 28, 38, C.navy);
+    ground(g, W, 46);
+  },
+  job(g, f) {
+    server(g, 20, 14, C.light); server(g, 158, 14, C.light);
+    text(g, "EU", 23, 37, C.light); text(g, "US", 161, 37, C.light);
+    const x = 91 + Math.round(Math.sin(f / 4) * 30);
+    robot(g, x, 18, f); text(g, "?", x + 4, 8 + f % 2, C.yellow);
+    ground(g, 192, 34);
+  },
+  race(g, f) {
+    robot(g, 16, 22, f); robot(g, 166, 22, f + 1);
+    text(g, "LOG", 86, 6, C.peach);
+    for (let i = 0; i < 4; i++) tile(g, 66 + i * 8, 14, "renew");
+    const p = (f % 16) / 15;                       // both claims fly in, both land
+    const lx = 28 + p * 70, rx = 158 - p * 52;
+    if (p < 1) { tile(g, lx, 26 - Math.sin(p * 3.14) * 12, "claim"); tile(g, rx, 26 - Math.sin(p * 3.14) * 12, "claim"); }
+    else { tile(g, 98, 14, "claim"); tile(g, 106, 14, "claim"); text(g, "BOTH LANDED", 74, 30, C.red); }
+    text(g, "MINE!", 10, 12, C.yellow); text(g, "MINE!", 160, 12, C.yellow);
+    ground(g, 192, 36);
+  },
+  fold(g, f) {
+    const recs = [["claim", true], ["claim", false], ["renew", true], ["renew", true], ["release", true], ["claim", true], ["renew", true]];
+    const at = (f >> 2) % (recs.length + 3);        // the reading head moves on
+    text(g, "LOG", 24, 6, C.peach);
+    recs.forEach(([k, ok], i) => {
+      const x = 24 + i * 20;
+      tile(g, x, 14, k, i < at ? ok : undefined);
+      if (i < at) text(g, ok ? "OK" : "NO", x, 24, ok ? C.lime : C.red);
+      if (i === at) { R(g, x - 1, 13, 9, 9, C.white); tile(g, x, 14, k); }
+    });
+    text(g, "SAME ORDER + SAME RULES = SAME VERDICT", 20, 36, C.light);
+  },
+  clock(g, f) {
+    const t = f % 30, sinceRenew = t % 10;          // a renewal every ten frames
+    frame(g, 18, 8, 15, 15, C.light); R(g, 25, 15, 1, 1, C.white);
+    const a = t / 30 * 6.28; R(g, 25 + Math.round(Math.sin(a) * 4), 15 - Math.round(Math.cos(a) * 4), 1, 1, C.yellow);
+    text(g, "BROKER CLOCK", 12, 28, C.peach);
+    for (let i = 0; i <= (t / 10 | 0) + 1 && i < 4; i++) tile(g, 80 + i * 10, 10, i ? "renew" : "claim");
+    text(g, "TTL", 80, 24, C.light); bar(g, 96, 23, 70, 1 - sinceRenew / 14, sinceRenew > 7 ? C.orange : C.lime);
+    text(g, "A RENEWAL REFILLS IT", 80, 34, C.dark);
+  },
+  belief(g, f) {
+    const p = (f % 24) / 23, L = 150;
+    text(g, "SENT", 4, 4, C.light); R(g, 20, 4, 1, 42, C.light);
+    text(g, "LANDED", 34, 4, C.lavender); R(g, 30, 4, 1, 42, C.lavender);
+    text(g, "TERM IN THE LOG", 34, 14, C.peach); R(g, 30, 21, Math.round((L - 10) * Math.min(1, p / 0.95)), 5, C.blue);
+    text(g, "BELIEF", 22, 30, C.peach); R(g, 20, 37, Math.round((L - 44) * Math.min(1, p / 0.7)), 5, C.yellow);
+    if (p > 0.7) { text(g, "MARGIN", 132, 37, C.red); dots(g, 126, 170, 44, C.red); }
+    if (p > 0.95) text(g, "OVER", 174, 21, C.light);
+  },
+  anchor(g, f) {
+    const step = (f >> 2) % 7;
+    text(g, "LOG", 14, 4, C.peach);
+    tile(g, 14, 12, "renew"); text(g, "...", 26, 14, C.dark); text(g, "HOLE", 24, 22, C.dark);
+    const recs = ["renew", "renew", "renew", "renew"];
+    recs.forEach((k, i) => {
+      const x = 48 + i * 12, seen = i < step, sure = step >= 2;
+      if (!seen) { frame(g, x, 12, 7, 7, C.navy); return; }
+      tile(g, x, 12, k); text(g, sure ? "OK" : "?", x + (sure ? 0 : 2), 22, sure ? C.lime : C.orange);
+    });
+    if (step >= 2) { frame(g, 46, 10, 23, 11, C.yellow); text(g, "ANCHOR: TWO RECORDS OF ONE TERM", 40, 32, C.yellow); }
+    else text(g, "UNCERTAIN", 48, 32, C.orange);
+    text(g, step >= 2 ? "CERTAIN" : "", 150, 14, C.lime);
+  },
+  sites(g, f) {
+    text(g, "SITE EU", 12, 4, C.light); frame(g, 8, 10, 78, 32, C.lavender);
+    server(g, 16, 16, C.lime); server(g, 60, 16, C.lime);
+    const p = (f % 12) / 11, x = 18 + Math.round(p * 44);
+    crown(g, x, 6 - Math.round(Math.sin(p * 3.14) * 3));
+    text(g, "AT ONCE", 30, 44, C.lime);
+    text(g, "SITE US", 122, 4, C.light); frame(g, 106, 10, 78, 32, C.navy);
+    server(g, 114, 16, C.dark); server(g, 158, 16, C.dark);
+    sprite(g, GLASS, 139, 19 + (f % 6 < 3 ? 0 : 1), { o: C.orange, w: C.white, y: C.yellow });
+    text(g, "WAITS THE DELAY", 116, 44, C.orange);
+  },
+  keda(g, f) {
+    frame(g, 8, 8, 84, 34, C.lavender); text(g, "HOLDS: 1", 12, 2, C.lime);
+    server(g, 12, 14, C.lime); for (let i = 0; i < 3; i++) robot(g, 32 + i * 18, 22, f + i);
+    frame(g, 100, 8, 84, 34, C.navy); text(g, "DOES NOT: 0", 104, 2, C.dark);
+    server(g, 104, 14, C.dark); text(g, "ZZZ", 136, 24 + (f % 6 < 3 ? 0 : 1), C.dark);
+    text(g, "N REPLICAS", 34, 44, C.light); text(g, "NONE", 134, 44, C.dark);
+  },
+  fence(g, f) {
+    const p = (f % 14) / 13, hit = p > 0.55;
+    const x = hit ? 96 - Math.round((p - 0.55) * 80) : 20 + Math.round(p * 138);
+    for (let y = 6; y < 40; y += 6) for (let i = 0; i < 2; i++) { R(g, 128 + i * 7 + (y / 6 % 2 ? 3 : 0), y, 6, 5, C.brown); }
+    text(g, "ONLY 42+", 144, 20, C.peach);
+    robot(g, x, 22, f, hit ? C.pink : undefined); text(g, "41", x + 1, 14, C.yellow);
+    if (hit) text(g, "TOO OLD", 86, 8, C.red);
+    ground(g, 124, 36);
+  },
+  end(g, f) {
+    crown(g, 91, 4 + (f % 4 < 2 ? 0 : 1)); robot(g, 91, 14, f);
+    R(g, 101, 21 - (f % 2) * 2, 2, 2, C.light);     // a wave
+    text(g, "THE LOG DECIDES", 66, 30, C.peach); ground(g, 192, 27);
+  },
+};
+
+// ---------------------------------------------------------------- simulation
+// A small model of docs/protocol.md: one participant per site, reads that
+// take no time, and KEDA as a polling interval plus a cooldown.
+const TTL = 10, RENEW = TTL / 3, MARGIN = 2, DELAY = 40, COOLDOWN = 35, GRACE = 2, LAG = 1.6;
+let S;
+function newSite(name) {
+  return { name, id: name + "/scaler", alive: true, linked: true, standby: false, belief: null, lastSend: -1e9,
+           work: false, wantUntil: -1e9, changeAt: null, paused: false, yielded: -1 };
+}
+function reset() {
+  S = { t: 0, log: [], lease: { holder: null, site: null, epoch: -1, expires: -1e9, natural: -1e9, yieldAt: null },
+        sites: { eu: newSite("eu"), us: newSite("us") }, overlap: 0, feed: [] };
+  S.sites.us.lastSend = 0.4;                         // eu speaks first
+}
+const held = () => S.lease.holder !== null && S.t < S.lease.expires;
+function say(msg) { S.feed.unshift("t=" + S.t.toFixed(0) + " s  " + msg); S.feed.length = Math.min(S.feed.length, 5); }
+
+// append folds a record, as every reader of the log does.
+function append(kind, s, epoch) {
+  const L = S.lease, t = S.t; let ok = false;
+  if (kind === "claim") { ok = !held(); if (ok) S.lease = { holder: s.id, site: s.name, epoch: S.log.length, expires: t + TTL, natural: t + TTL, yieldAt: null }; }
+  else if (kind === "yield") { ok = L.epoch === epoch && L.site === s.name && !held(); if (ok) L.yieldAt = t; }
+  else { ok = held() && L.holder === s.id && L.epoch === epoch;
+         if (ok && kind === "renew") L.expires = L.natural = t + TTL;
+         if (ok && kind === "release") { L.expires = t; L.holder = null; } }
+  S.log.push({ kind, by: s.name, ok, t });
+  if (kind !== "renew") say(s.name + " writes " + kind + (kind === "yield" ? "" : ok ? ": accepted" + (kind === "claim" ? ", epoch " + S.lease.epoch : "") : ": rejected"));
+  return ok;
+}
+
+function participant(s) {
+  const L = S.lease, t = S.t;
+  if (s.belief && t >= s.belief.deadline) { s.belief = null; say(s.name + " stops believing: its deadline passed"); }
+  if (!s.alive || !s.linked) return;                 // cannot read, cannot write
+  if (s.belief && !(held() && L.holder === s.id && L.epoch === s.belief.epoch)) s.belief = null;
+  if (L.site && L.site !== s.name) s.paused = false; // another site has the latest term: lift a pause
+  if (s.standby) {
+    if (s.belief) { append("release", s, s.belief.epoch); s.belief = null; s.paused = true; }
+    if (L.site === s.name && !held() && L.yieldAt === null && L.epoch >= 0 && s.yielded !== L.epoch && t < L.expires + DELAY) {
+      s.paused = true;
+      if (!s.work && s.changeAt === null) { append("yield", s, L.epoch); s.yielded = L.epoch; }
+    }
+    return;
+  }
+  if (s.belief) {
+    if (t - s.lastSend >= RENEW) { s.lastSend = t; if (append("renew", s, s.belief.epoch)) s.belief.deadline = t + TTL - MARGIN; else s.belief = null; }
+    return;
+  }
+  if (held() || t - s.lastSend < 1) return;
+  let from = -1e9;                                    // own site, or no term yet: at once
+  if (L.epoch >= 0 && L.site !== s.name) {
+    from = Math.max(L.expires + DELAY, L.natural + LAG);
+    if (L.yieldAt !== null) from = Math.min(from, Math.max(L.yieldAt, L.natural + LAG));
+  }
+  if (t < from) return;
+  s.lastSend = t;
+  if (append("claim", s)) { s.belief = { epoch: S.lease.epoch, deadline: t + TTL - MARGIN }; s.paused = false; }
+}
+
+// keda keeps the workload while the scaler says "holding" and for the
+// cooldown after; a pause takes it down at once.
+function keda(s) {
+  const t = S.t;
+  if (!s.alive) { s.work = false; s.changeAt = null; return; }
+  if (s.belief && !s.standby) s.wantUntil = t + COOLDOWN;
+  if (s.paused) s.wantUntil = -1e9;                  // scaled to zero: lifting the pause starts nothing
+  const want = t < s.wantUntil;
+  if (want !== s.work && s.changeAt === null) s.changeAt = t + GRACE;
+  if (want === s.work) s.changeAt = null;
+  if (s.changeAt !== null && t >= s.changeAt) { s.work = want; s.changeAt = null; say("workload " + (want ? "starts" : "stops") + " in " + s.name); }
+}
+
+function step(dt) {
+  S.t += dt;
+  for (const s of Object.values(S.sites)) { participant(s); keda(s); }
+  if (S.sites.eu.work && S.sites.us.work) S.overlap += dt;
+}
+
+function act(name, what) {
+  const s = S.sites[name];
+  if (what === "kill") { s.alive = !s.alive; if (!s.alive) { s.belief = null; s.wantUntil = -1e9; } else s.lastSend = S.t; say(name + (s.alive ? " is back" : " is killed")); }
+  if (what === "cut") { s.linked = !s.linked; say(name + (s.linked ? " reaches the brokers again" : " is cut off from the brokers")); }
+  if (what === "standby") { s.standby = !s.standby; if (!s.standby) s.paused = false; say(name + (s.standby ? " goes into standby" : " leaves standby")); }
+}
+
+function drawSim(g, f) {
+  const W = 256, L = S.lease, isHeld = held();
+  // the log: the last twenty-six records, the newest on the right
+  text(g, "LOG", 4, 4, C.peach);
+  const tail = S.log.slice(-26);
+  tail.forEach((r, i) => tile(g, 20 + (26 - tail.length + i) * 9, 3, r.kind, r.ok));
+  // the broker in the middle
+  frame(g, 100, 22, 56, 40, C.lavender); text(g, "BROKER", 116, 26, C.light);
+  text(g, "T=" + S.t.toFixed(0), 128 - textW("T=" + S.t.toFixed(0)) / 2, 34, C.white);
+  if (isHeld) { text(g, "TERM " + L.epoch, 128 - textW("TERM " + L.epoch) / 2, 42, C.yellow); bar(g, 108, 51, 40, (L.expires - S.t) / TTL, L.expires - S.t < 3 ? C.orange : C.lime); }
+  else { text(g, "FREE", 120, 42, C.light); crown(g, 124, 50, true); }
+  for (const [name, x0] of [["eu", 6], ["us", 170]]) {
+    const s = S.sites[name], mine = isHeld && L.site === name, c = s.alive ? C.light : C.dark;
+    frame(g, x0, 22, 80, 70, s.alive ? C.lavender : C.navy);
+    text(g, "CLUSTER " + name, x0 + 4, 26, c);
+    if (s.standby) text(g, "STANDBY", x0 + 48, 26, C.orange);
+    server(g, x0 + 8, 46, !s.alive ? C.black : s.belief ? C.lime : s.linked ? C.yellow : C.red);
+    text(g, "SCALER", x0 + 4, 68, c);
+    if (s.belief) crown(g, x0 + 10, 35 + (f % 4 < 2 ? 0 : 1));
+    else if (mine) crown(g, x0 + 10, 36, true);     // the log still names it; it no longer believes
+    if (!s.alive) sprite(g, SKULL, x0 + 44, 50, { w: C.light, n: C.black });
+    else if (s.work) { robot(g, x0 + 44, 48, f, s.changeAt !== null ? C.pink : undefined); text(g, "WORKLOAD", x0 + 34, 68, C.lime); }
+    else { text(g, s.paused ? "PAUSED" : "ZZZ", x0 + 42, 54 + (f % 6 < 3 ? 0 : 1), C.dark); text(g, "WORKLOAD", x0 + 34, 68, C.dark); }
+    // what the scaler tells KEDA
+    text(g, "KEDA: " + (s.alive ? (s.belief && !s.standby ? "1" : "0") : "-"), x0 + 4, 80, s.belief ? C.lime : c);
+    // the wire to the broker
+    const wx0 = name === "eu" ? x0 + 80 : 156, wx1 = name === "eu" ? 99 : x0 - 1;
+    if (s.alive && s.linked) dots(g, wx0, wx1, 44, s.belief ? C.yellow : C.lavender);
+    else text(g, "X", (wx0 + wx1) / 2 - 1, 42, C.red);
+  }
+  if (S.sites.eu.work && S.sites.us.work) text(g, "BOTH RUNNING!", 102, 70, C.red);
+  ground(g, W, 100); text(g, "ONE WORKLOAD. ONE CLUSTER AT A TIME.", 60, 104, C.dark);
+}
+
+function readout() {
+  const L = S.lease, $ = id => document.getElementById(id);
+  $("r-t").textContent = S.t.toFixed(0) + " s";
+  $("r-lease").textContent = held() ? L.holder + ", epoch " + L.epoch + ", " + Math.max(0, L.expires - S.t).toFixed(0) + " s left" : "free";
+  for (const n of ["eu", "us"]) { const s = S.sites[n]; $("r-" + n).textContent = !s.alive ? "cluster down" : s.work ? "running" : s.paused ? "paused" : "no"; }
+  $("r-overlap").textContent = S.overlap.toFixed(1) + " s";
+  $("feed").innerHTML = S.feed.map(m => "<li>" + m + "</li>").join("");
+  for (const b of document.querySelectorAll("button[data-site]")) {
+    const s = S.sites[b.dataset.site], on = b.dataset.act === "kill" ? !s.alive : b.dataset.act === "cut" ? !s.linked : s.standby;
+    b.setAttribute("aria-pressed", on);
+    b.textContent = { kill: on ? "revive " : "kill ", cut: on ? "heal " : "cut off ", standby: on ? "leave standby " : "standby " }[b.dataset.act] + s.name;
+  }
+}
+
+// ---------------------------------------------------------------- running
+const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const visible = new Set();
+const watch = new IntersectionObserver(es => es.forEach(e => e.isIntersecting ? visible.add(e.target) : visible.delete(e.target)), { threshold: 0.2 });
+const pictures = [...document.querySelectorAll("canvas[data-scene]")];
+const simCanvas = document.getElementById("sim");
+[...pictures, simCanvas].forEach(c => watch.observe(c));
+function paint(c, draw, f) { const g = c.getContext("2d"); g.clearRect(0, 0, c.width, c.height); draw(g, f); }
+
+let frameNo = 0, speed = 4, running = !still, last = performance.now();
+reset();
+pictures.forEach(c => paint(c, SCENES[c.dataset.scene], 5));       // one frame for those who want no motion
+paint(simCanvas, drawSim, 0); readout();
+
+setInterval(() => {
+  const now = performance.now(), dt = Math.min(0.5, (now - last) / 1000); last = now;
+  if (still && !running) return;
+  frameNo++;
+  if (!still) for (const c of pictures) if (visible.has(c)) paint(c, SCENES[c.dataset.scene], frameNo);
+  if (running && visible.has(simCanvas)) {
+    let left = dt * speed; while (left > 0) { step(Math.min(0.1, left)); left -= 0.1; }
+    paint(simCanvas, drawSim, frameNo); readout();
+  }
+}, 160);
+
+document.getElementById("play").addEventListener("click", e => { running = !running; e.target.setAttribute("aria-pressed", running); e.target.textContent = running ? "run" : "paused"; });
+document.getElementById("speed").addEventListener("click", e => { speed = { 1: 4, 4: 12, 12: 1 }[speed]; e.target.textContent = "speed ×" + speed; });
+document.getElementById("reset").addEventListener("click", () => { reset(); paint(simCanvas, drawSim, frameNo); readout(); });
+if (still) { const p = document.getElementById("play"); p.setAttribute("aria-pressed", false); p.textContent = "paused"; }
+for (const b of document.querySelectorAll("button[data-site]")) b.addEventListener("click", () => { act(b.dataset.site, b.dataset.act); paint(simCanvas, drawSim, frameNo); readout(); });
+
+// ---------------------------------------------------------------- slides
+const slides = [...document.querySelectorAll(".slide")];
+const current = () => { const y = scrollY + innerHeight / 2; let i = slides.findIndex(s => s.offsetTop + s.offsetHeight > y); return i < 0 ? slides.length - 1 : i; };
+const go = i => slides[Math.max(0, Math.min(slides.length - 1, i))].scrollIntoView({ behavior: still ? "auto" : "smooth" });
+const pos = document.getElementById("pos");
+const mark = () => { pos.textContent = (current() + 1) + " / " + slides.length; };
+addEventListener("scroll", mark, { passive: true }); mark();
+document.getElementById("prev").addEventListener("click", () => go(current() - 1));
+document.getElementById("next").addEventListener("click", () => go(current() + 1));
+addEventListener("keydown", e => {
+  if (e.target.closest("button, a, input") && (e.key === " " || e.key === "Enter")) return;
+  if (e.altKey || e.ctrlKey || e.metaKey) return;
+  if (["ArrowRight", "ArrowDown", "PageDown", " "].includes(e.key)) { e.preventDefault(); go(current() + 1); }
+  else if (["ArrowLeft", "ArrowUp", "PageUp"].includes(e.key)) { e.preventDefault(); go(current() - 1); }
+  else if (e.key === "Home") { e.preventDefault(); go(0); }
+  else if (e.key === "End") { e.preventDefault(); go(slides.length - 1); }
+});
+</script>
+</body>
+</html>

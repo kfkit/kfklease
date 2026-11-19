@@ -22,6 +22,7 @@ runs a workload in one cluster at a time. The map:
 | `examples/heartbeat` | a workload that fences by epoch, and the report that checks it | scaler's `/status` |
 | `test/e2e` | the stand: two k3s clusters with KEDA and one Kafka, and the failure scenarios; `test/e2e/README.md` lists them | Docker |
 | `docs/protocol.md` | why the lease is safe. Change it when the rules change | |
+| `docs/index.html` | "How kfklease works", the page GitHub Pages serves at kfkit.dev/kfklease: one static file, no build step, nothing loaded from elsewhere, no version numbers. Its simulation is a model of the rules, not the code: change it when the rules change | |
 
 ## Rules
 
