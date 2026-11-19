@@ -56,6 +56,9 @@ and this project adheres to
 - `make lint` runs `shellcheck -x` over the stand's scripts. In CI a
   missing shellcheck fails it; elsewhere the scripts are skipped with a
   message.
+- `make chart-test` runs the chart's tests and `make e2e` the stand from
+  nothing to the last scenario; CI calls make for every job, so what it
+  runs is what runs locally.
 - Docs and the library's comments: a holder id has to be unique among the
   participants alive at one time, where they asked for one per process
   incarnation. It may repeat when a process restarts, as the chart's

@@ -13,18 +13,6 @@ source ./lib.sh
 
 cluster=${1:?usage: deploy.sh <k3s-a|k3s-b>}
 
-ROOT=$(cd ../.. && pwd)
-
-# helm_template <values...> renders the chart from the repository root,
-# whatever the working directory.
-helm_template() {
-  if command -v helm >/dev/null; then
-    helm template "$RELEASE" "$ROOT/charts/kfklease" "$@"
-  else
-    docker run --rm -v "$ROOT:/src" alpine/helm:3.19.0 template "$RELEASE" /src/charts/kfklease "$@"
-  fi
-}
-
 kc "$cluster" create namespace "$NS" --dry-run=client -o yaml | kc "$cluster" apply -f - >/dev/null
 
 # Each cluster authenticates differently, so that the chart's auth values
@@ -48,7 +36,7 @@ case "$cluster" in
     ;;
 esac
 
-manifest=$(helm_template --namespace "$NS" \
+manifest=$(helm_run template "$RELEASE" "$CHART" --namespace "$NS" \
   --set image.repository="${SCALER_IMAGE%:*}" --set image.tag="${IMAGE_TAG:-${SCALER_IMAGE##*:}}" --set image.pullPolicy=Never \
   --set topic="$TOPIC" --set ttl="${TTL}s" --set replicationFactor=1 \
   --set site="$cluster" --set scaledObject.targetRef.name=singleton \

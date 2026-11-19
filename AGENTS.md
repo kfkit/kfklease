@@ -78,10 +78,11 @@ test itself; the agent was extracted so it checks the agent.
 
 ## The stand
 
-`test/e2e`: `smoke.sh`, `build-image.sh`, `deploy.sh k3s-a`, `deploy.sh
-k3s-b`, `scenarios.sh`, `docker compose down -v`. k3s-a authenticates over
-mTLS from a mounted Secret, k3s-b over SASL from environment variables, so
-every scenario also covers both ways of handing secrets to the scaler.
+`test/e2e`: `make e2e` runs `run.sh`, the one place that says which script
+follows which, from the images to the scenarios; `make e2e-down` tears the
+stand down. k3s-a authenticates over mTLS from a mounted Secret, k3s-b
+over SASL from environment variables, so every scenario also covers both
+ways of handing secrets to the scaler.
 
 - One home for each constant: `test/e2e/.env` for what compose and the
   Makefile read as well (addresses, ports, the SASL user, image names),
@@ -104,16 +105,20 @@ every scenario also covers both ways of handing secrets to the scaler.
 - A revived cluster restarts its stale workload pod until its own KEDA is
   back, 20–30 s. That is Kubernetes, not the lease; it is why fencing
   exists.
-- `helm` is not installed here; `deploy.sh` falls back to the
-  `alpine/helm` image and renders the chart by absolute path (a relative
-  path from `test/e2e` is taken for a repository name).
+- `helm` is not installed here; `deploy.sh` and `make chart-test` fall
+  back to the `alpine/helm` image (`test/lib.sh`) and render the chart by
+  absolute path (a relative path from `test/e2e` is taken for a repository
+  name).
 - Scripts are bash. On a zsh host, `$var` does not word-split: run them,
   do not paste them.
 
 ## CI and releases
 
 - `ci.yml` runs unit, integration, image, chart and e2e; all five are
-  required checks and the branch must be up to date with `main`. Stacked
+  required checks and the branch must be up to date with `main`. Each job
+  calls make (`lint` and `test`, `integration`, `image`, `chart-test`,
+  `e2e`): a command line belongs in the Makefile or a script, not in the
+  workflow, so that what CI runs is what runs here. Stacked
   PRs that touch the same file (the README roadmap, say) conflict after
   the first merges; resolve by hand, `update-branch` cannot.
 - `setup-go` installs exactly the `go` directive's version with
@@ -137,10 +142,10 @@ every scenario also covers both ways of handing secrets to the scaler.
 ## Before opening a PR
 
 ```bash
-make lint && make test
+make lint && make test && make chart-test
 make integration          # needs Docker
-test/e2e/build-image.sh && test/e2e/smoke.sh && test/e2e/deploy.sh k3s-a && test/e2e/deploy.sh k3s-b && test/e2e/scenarios.sh
-docker compose -f test/e2e/compose.yaml down -v
+make e2e                  # needs Docker; the stand stays up for its logs
+make e2e-down
 ```
 
 Say in the PR what was verified and how, with numbers; say what was not.

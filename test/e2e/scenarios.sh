@@ -8,8 +8,8 @@
 #   ./scenarios.sh            # all
 #   ./scenarios.sh crash      # one: coldstart, restart, holder-pod, bad-image, crash, partition, pause, broker, replicas, scaler-down, standby, handover-crash
 #
-# Expects the stand to be up (./smoke.sh), the image built (./build-image.sh)
-# and the manifests deployed to both clusters (./deploy.sh k3s-a; ./deploy.sh k3s-b).
+# Expects the stand to be up, the images built and the chart deployed to
+# both clusters: ./run.sh (`make e2e`) does all of that and then runs this.
 set -euo pipefail
 
 cd "$(dirname "$0")"

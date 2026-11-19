@@ -228,6 +228,8 @@ in [docs/install.md](docs/install.md#choosing-ttl-and-margin).
 make test          # unit tests, no broker needed
 make integration   # starts the Kafka container from test/e2e and runs the client tests
 make image         # builds the scaler image
+make chart-test    # lints the chart and checks what it renders (helm, or Docker)
+make e2e           # the two-cluster stand and its failure scenarios (Docker, about half an hour)
 make generate      # regenerates the KEDA gRPC stubs from proto/ (buf via go run)
 ```
 

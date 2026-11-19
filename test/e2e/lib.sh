@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Shared by the stand scripts; source it after cd-ing into test/e2e.
 
+# shellcheck source=../lib.sh
+source ../lib.sh
 # The broker's address and ports, its SASL user, the image names and the
 # compose project: .env, which compose.yaml and the Makefile read as well.
 # shellcheck source=.env
@@ -26,13 +28,6 @@ source ./.env
   TAKEOVER_MARGIN=5
   TAKEOVER_DELAY_FILE=.out/takeover-delay
   POLL=1            # seconds between two tries of wait_until
-}
-
-# fail <message...> prints the failure and returns 1:
-#   [[ it is fine ]] || fail "why it is not" || return
-fail() {
-  echo "FAILED: $*" >&2
-  return 1
 }
 
 # kc <cluster> <kubectl args...> runs kubectl against one cluster.

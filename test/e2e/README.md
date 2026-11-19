@@ -33,12 +33,18 @@ Requires Docker with cgroup v2, `docker compose`, `kubectl` and `envsubst`.
 About 2 GB of memory for the whole stand.
 
 ```bash
-./smoke.sh                     # up + readiness checks
-./build-image.sh               # scaler image, imported into both clusters
-./deploy.sh k3s-a; ./deploy.sh k3s-b   # the chart plus the test workload
-./scenarios.sh                 # failover scenarios, see below
-docker compose down -v         # tear down, drop cluster state
+./run.sh                       # from nothing to the last scenario; `make e2e`
+./run.sh crash                 # the same with the scenarios named, see below
+./diagnose.sh                  # after a failure: containers, pods, logs
+docker compose down -v         # tear down, drop cluster state; `make e2e-down`
 ```
+
+`run.sh` is the one place that says which step follows which. Each step
+also runs by itself: `build-image.sh` (the scaler and the heartbeat images,
+as tarballs k3s imports on boot and straight into a running cluster),
+`smoke.sh` (up and readiness checks), `deploy.sh <cluster>` (the chart plus
+the test workload) and `scenarios.sh [name...]`. The stand stays up after
+a run, passed or failed.
 
 The broker's address and ports, its SASL user and the image names are in
 `.env`: compose reads it, the scripts do through `lib.sh`, which holds the
