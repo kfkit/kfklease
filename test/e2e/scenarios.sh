@@ -24,11 +24,10 @@ want=1
 # at the latest, plus the takeover delay; TAKEOVER leaves two TTLs on top
 # for KEDA and the pod start.
 TAKEOVER=$(( TTL + TAKEOVER_DELAY + 2 * TTL ))
-
-fail() {
-  echo "FAILED: $*" >&2
-  return 1
-}
+# A scenario ends with WATCH seconds in which nothing may move.
+WATCH=$(( 2 * TTL ))
+# A workload that stays is watched for KEDA's cooldown and ten seconds more.
+STAY=$(( COOLDOWN + 10 ))
 
 # running <cluster> prints the number of Running, not terminating, singleton pods.
 running() {
@@ -37,22 +36,25 @@ running() {
     || echo "?"
 }
 
+# runs <cluster> <count> succeeds if the cluster runs exactly <count>
+# workload pods.
+runs() {
+  [[ $(running "$1") == "$2" ]]
+}
+
 # wait_running <cluster> <count> <timeout> waits until the cluster runs
 # exactly <count> workload pods and prints how long it took.
 wait_running() {
   local cluster=$1 want=$2 timeout=$3 t0
   t0=$(date +%s)
-  while true; do
-    if [[ $(running "$cluster") == "$want" ]]; then
-      echo $(( $(date +%s) - t0 ))
-      return 0
-    fi
-    if (( $(date +%s) - t0 >= timeout )); then
-      echo "FAILED: ${cluster} did not reach ${want} pods within ${timeout}s" >&2
-      return 1
-    fi
-    sleep 1
-  done
+  wait_until "$timeout" "${cluster} did not reach ${want} pods within ${timeout}s" runs "$cluster" "$want" || return
+  echo $(( $(date +%s) - t0 ))
+}
+
+# left <t0> <seconds> prints how many of <seconds> are left, counted from
+# <t0>: the timeout of a wait whose time began before the wait did.
+left() {
+  echo $(( $1 + $2 - $(date +%s) ))
 }
 
 # some <count> succeeds if a running() count is a number above zero.
@@ -77,8 +79,7 @@ transition() {
       return 0
     fi
     if python3 -c "import sys; sys.exit(0 if $now >= $timeout else 1)"; then
-      echo "FAILED: transition ${from} -> ${to} not complete within ${timeout}s (down=${down:-?} up=${up:-?})" >&2
-      return 1
+      fail "transition ${from} -> ${to} not complete within ${timeout}s (down=${down:-?} up=${up:-?})" || return
     fi
     sleep 0.5
   done
@@ -91,13 +92,18 @@ holder() {
   done
 }
 
-# watch_exclusive <seconds> fails if both clusters run the workload at once.
+# has_holder succeeds if a cluster runs the workload.
+has_holder() {
+  [[ -n $(holder) ]]
+}
+
+# watch_exclusive fails if both clusters run the workload at once in the
+# next WATCH seconds.
 watch_exclusive() {
-  local until=$(( $(date +%s) + $1 ))
+  local until=$(( $(date +%s) + WATCH ))
   while (( $(date +%s) < until )); do
-    if some "$(running k3s-a)" && some "$(running k3s-b)"; then
-      echo "FAILED: workload running in both clusters" >&2
-      return 1
+    if some "$(running "${CLUSTERS[0]}")" && some "$(running "${CLUSTERS[1]}")"; then
+      fail "workload running in both clusters" || return
     fi
     sleep 1
   done
@@ -106,10 +112,7 @@ watch_exclusive() {
 settle() {
   local h
   h=$(holder)
-  if [[ -z $h ]]; then
-    echo "FAILED: no holder" >&2
-    return 1
-  fi
+  [[ -n $h ]] || fail "no holder" || return
   echo "$h"
 }
 
@@ -145,6 +148,26 @@ now_rfc3339() {
   date -u +%Y-%m-%dT%H:%M:%SZ
 }
 
+# begin starts every scenario but coldstart, on a stand where one cluster
+# runs the workload. It sets, in the scenario that calls it: h, that
+# cluster; o, the other one; since, the time from which the heartbeat report
+# is read at the end.
+begin() {
+  h=$(settle) || return
+  o=$(other "$h")
+  since=$(now_rfc3339)
+}
+
+# begin_staying is begin for a scenario whose workload must stay where it
+# is. On top it sets uids, the workload's pods, and before, the epoch the
+# site of h holds; it fails if the site holds none.
+begin_staying() {
+  begin || return
+  uids=$(workload_uids "$h") || return
+  before=$(held_epoch "$h")
+  (( before >= 0 )) || fail "the site ${h} does not hold the lease" || return
+}
+
 # heartbeats <since> reads the heartbeat topic from <since>, prints what
 # the workload actually did, and fails on any fenced (stale) record or any
 # overlap between epochs: the workload-level mutual exclusion check.
@@ -167,42 +190,43 @@ scenario_coldstart() {
   local t0 h since
   since=$(now_rfc3339)
   t0=$(date +%s)
-  until [[ -n $(holder) ]]; do
-    (( $(date +%s) - t0 < 3 * TTL )) || { echo "FAILED: nobody took the lease" >&2; return 1; }
-    sleep 1
-  done
+  wait_until $(( 3 * TTL )) "nobody took the lease" has_holder || return
   h=$(holder)
   echo "   holder: ${h} after $(( $(date +%s) - t0 ))s"
-  watch_exclusive $(( 2 * TTL ))
-  [[ $(running "$(other "$h")") == 0 ]] || { echo "FAILED: standby is running the workload" >&2; return 1; }
+  watch_exclusive
+  runs "$(other "$h")" 0 || fail "standby is running the workload" || return
   heartbeats "$since"
-  echo "   ok: standby idle for $(( 2 * TTL ))s"
+  echo "   ok: standby idle for ${WATCH}s"
 }
 
-# stays <cluster> <uids>: for KEDA's cooldown and ten seconds more, the
-# other cluster never starts the workload and <cluster> keeps the workload
-# pods <uids>. Had the scaler said "not holding", or failed to answer, for
-# that long, the workload would be gone by then.
+# stays <cluster> <uids>: for STAY seconds, the other cluster never starts
+# the workload and <cluster> keeps the workload pods <uids>. Had the scaler
+# said "not holding", or failed to answer, for that long, the workload would
+# be gone by then.
 stays() {
   local h=$1 uids=$2 o until
   o=$(other "$h")
-  until=$(( $(date +%s) + COOLDOWN + 10 ))
+  until=$(( $(date +%s) + STAY ))
   while (( $(date +%s) < until )); do
-    [[ $(running "$o") == 0 ]] || fail "${o} started the workload" || return
+    runs "$o" 0 || fail "${o} started the workload" || return
     [[ $(workload_uids "$h") == "$uids" ]] || fail "the workload pods of ${h} changed" || return
     sleep 1
   done
 }
 
+# epoch_above <cluster> <epoch> succeeds if the cluster's site holds a
+# later epoch, and leaves the one it holds in the caller's epoch.
+epoch_above() {
+  epoch=$(held_epoch "$1")
+  (( epoch > $2 ))
+}
+
 # new_epoch <cluster> <before> <what> waits until the cluster's site holds an
 # epoch above <before>, of a holder of that site, and prints the holder.
 new_epoch() {
-  local h=$1 before=$2 what=$3 t0 epoch holder
+  local h=$1 before=$2 what=$3 timeout=$(( 3 * TTL )) t0 epoch holder
   t0=$(date +%s)
-  until epoch=$(held_epoch "$h"); (( epoch > before )); do
-    (( $(date +%s) - t0 < 3 * TTL )) || fail "${h} holds no new epoch $(( 3 * TTL ))s after ${what}" || return
-    sleep 1
-  done
+  wait_until "$timeout" "${h} holds no new epoch ${timeout}s after ${what}" epoch_above "$h" "$before" || return
   holder=$(status_get "$h" 'r["lease"]["holder"]')
   [[ $holder == "${h}/"* ]] || fail "the lease is held by ${holder}, not by site ${h}" || return
   echo "   ${holder} holds epoch ${epoch} (was ${before}) $(( $(date +%s) - t0 ))s after ${what}" >&2
@@ -212,26 +236,20 @@ new_epoch() {
 scenario_restart() {
   echo "== restart: delete every scaler pod of the holder's cluster; the workload stays where it is"
   local h o since uids before
-  h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
-  uids=$(workload_uids "$h")
-  before=$(held_epoch "$h")
-  (( before >= 0 )) || fail "the site ${h} does not hold the lease" || return
+  begin_staying || return
   # The holder releases on its way out and a new pod of the same site
   # claims at once; the other site would wait the takeover delay.
   kc "$h" -n "$NS" delete pod -l app.kubernetes.io/name=kfklease --wait=false >/dev/null
   new_epoch "$h" "$before" "the pods were deleted" >/dev/null || return
   stays "$h" "$uids" || return
   heartbeats "$since"
-  echo "   ok: same workload pods $(( COOLDOWN + 10 ))s on, ${o} never started"
+  echo "   ok: same workload pods ${STAY}s on, ${o} never started"
 }
 
 scenario_holder_pod() {
   echo "== holder-pod: delete the scaler pod that holds the lease; another of its site takes over, the workload stays"
   local h o since uids before holder pod after
-  h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
-  uids=$(workload_uids "$h")
-  before=$(held_epoch "$h")
-  (( before >= 0 )) || fail "the site ${h} does not hold the lease" || return
+  begin_staying || return
   holder=$(status_get "$h" 'r["lease"]["holder"]')
   pod=${holder#"${h}/"}
   [[ $pod != "$holder" ]] || fail "the lease is held by ${holder}, not by site ${h}" || return
@@ -242,7 +260,7 @@ scenario_holder_pod() {
   [[ $after != "$holder" ]] || fail "the deleted pod still holds the lease" || return
   stays "$h" "$uids" || return
   heartbeats "$since"
-  echo "   ok: same workload pods $(( COOLDOWN + 10 ))s on, ${o} never started"
+  echo "   ok: same workload pods ${STAY}s on, ${o} never started"
 }
 
 # scaler_pods <cluster> prints one line per scaler pod: name, image, ready,
@@ -257,19 +275,19 @@ for p in json.load(sys.stdin)["items"]:
     print(p["metadata"]["name"], p["spec"]["containers"][0]["image"], ready, waiting)'
 }
 
+# pull_fails <cluster> <tag> succeeds if a scaler pod with the image tag
+# <tag> is not ready because its image does not pull.
+pull_fails() {
+  grep -qE ":$2 False (ErrImageNeverPull|ErrImagePull|ImagePullBackOff)\$" <<<"$(scaler_pods "$1")"
+}
+
 scenario_bad_image() {
   echo "== bad-image: upgrade the holder's scaler to an image that does not pull; its old pods keep the site, the workload stays"
-  local h o since uids before t0 pods
-  h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
-  uids=$(workload_uids "$h")
-  before=$(held_epoch "$h")
-  (( before >= 0 )) || fail "the site ${h} does not hold the lease" || return
-  IMAGE_TAG=does-not-exist WAIT=false ./deploy.sh "$h" >/dev/null
-  t0=$(date +%s)
-  until grep -qE ':does-not-exist False (ErrImageNeverPull|ErrImagePull|ImagePullBackOff)$' <<<"$(scaler_pods "$h")"; do
-    (( $(date +%s) - t0 < 60 )) || fail "no pod of the new image failed to pull: $(scaler_pods "$h")" || return
-    sleep 1
-  done
+  local h o since uids before pods tag=does-not-exist
+  begin_staying || return
+  IMAGE_TAG=$tag WAIT=false ./deploy.sh "$h" >/dev/null
+  wait_until 60 "no pod of the new image failed to pull" pull_fails "$h" "$tag" \
+    || fail "the scaler pods of ${h}: $(scaler_pods "$h")" || return
   echo "   the rollout is stuck:" && scaler_pods "$h" | sed 's/^/     /'
   stays "$h" "$uids" || return
   pods=$(scaler_pods "$h")
@@ -277,13 +295,13 @@ scenario_bad_image() {
   (( $(held_epoch "$h") >= before )) || fail "${h} no longer holds the lease" || return
   ./deploy.sh "$h" >/dev/null
   heartbeats "$since"
-  echo "   ok: same workload pods $(( COOLDOWN + 10 ))s on, ${o} never started, rolled back"
+  echo "   ok: same workload pods ${STAY}s on, ${o} never started, rolled back"
 }
 
 scenario_crash() {
   echo "== crash: kill the holder's cluster"
-  local h o t since
-  h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
+  local h o t t0 since
+  begin || return
   docker compose kill "$h" >/dev/null 2>&1
   t=$(wait_running "$o" "$want" "$TAKEOVER")
   echo "   ${o} took over ${t}s after ${h} died (ttl ${TTL}s, takeover delay ${TAKEOVER_DELAY}s)"
@@ -292,7 +310,6 @@ scenario_crash() {
   # state, so its kubelet restarts the stale pod until KEDA is back up and
   # scales it down. That window is a property of Kubernetes, not of the
   # lease; it is why workloads that must not overlap check the epoch.
-  local t0
   t0=$(date +%s)
   kc "$h" -n keda rollout status deploy/keda-operator --timeout=180s >/dev/null
   kc "$h" -n "$NS" rollout status "deploy/$RELEASE" --timeout=120s >/dev/null
@@ -300,8 +317,8 @@ scenario_crash() {
   echo "   ${h} came back and ran its stale pod for $(( $(date +%s) - t0 ))s before KEDA scaled it down"
   # The revived scaler's site no longer holds the lease: it must not take
   # it back.
-  watch_exclusive $(( 2 * TTL ))
-  [[ $(holder) == "$o" ]] || { echo "FAILED: lease moved back to the revived cluster" >&2; return 1; }
+  watch_exclusive
+  [[ $(holder) == "$o" ]] || fail "lease moved back to the revived cluster" || return
   heartbeats "$since"
   echo "   ok: ${h} stayed idle"
 }
@@ -309,12 +326,12 @@ scenario_crash() {
 scenario_partition() {
   echo "== partition: cut the holder's cluster off from Kafka"
   local h o since
-  h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
+  begin || return
   ./partition.sh cut "$h"
   echo "   ${h} -> ${o}: $(transition "$h" "$o" "$TAKEOVER") (ttl ${TTL}s, cooldown ${COOLDOWN}s, takeover delay ${TAKEOVER_DELAY}s)"
   ./partition.sh heal "$h"
-  watch_exclusive $(( 2 * TTL ))
-  [[ $(holder) == "$o" ]] || { echo "FAILED: lease moved back after the heal" >&2; return 1; }
+  watch_exclusive
+  [[ $(holder) == "$o" ]] || fail "lease moved back after the heal" || return
   heartbeats "$since"
   echo "   ok: ${h} healed and stayed idle"
 }
@@ -322,7 +339,7 @@ scenario_partition() {
 scenario_pause() {
   echo "== pause: freeze the holder's cluster for 2 x ttl"
   local h o t since
-  h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
+  begin || return
   docker compose pause "$h" >/dev/null 2>&1
   t=$(wait_running "$o" "$want" "$TAKEOVER")
   echo "   ${o} took over ${t}s into the freeze"
@@ -333,16 +350,25 @@ scenario_pause() {
   # in any useful sense; what matters is how fast it goes after the wake-up.
   t=$(wait_running "$h" 0 $(( 2 * TTL + COOLDOWN )))
   echo "   ${h} stopped its pod ${t}s after waking up"
-  watch_exclusive $(( 2 * TTL ))
-  [[ $(holder) == "$o" ]] || { echo "FAILED: lease moved back after the pause" >&2; return 1; }
+  watch_exclusive
+  [[ $(holder) == "$o" ]] || fail "lease moved back after the pause" || return
   heartbeats "$since"
   echo "   ok"
 }
 
+# held_or_started <cluster> <other> ends a wait when the cluster's site
+# holds the lease, and also when the other cluster runs the workload: then
+# it leaves that cluster's name in the caller's started.
+held_or_started() {
+  (( $(held_epoch "$1") >= 0 )) && return
+  runs "$2" 0 || started=$2
+  [[ -n $started ]]
+}
+
 scenario_broker() {
   echo "== broker: Kafka, the arbiter, is down for 2 x ttl; the lease stays with its site"
-  local h o t0 back since
-  h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
+  local h o t0 back since started=""
+  begin || return
   t0=$(date +%s)
   # A restart would be over before the holder's deadline on a fast machine
   # and the holder would keep its term; a stop of a known length makes the
@@ -353,15 +379,14 @@ scenario_broker() {
   # is about Kafka alone.
   docker compose up -d --no-deps --no-recreate kafka >/dev/null 2>&1
   # Both sites see the same expired term of ${h}: its site claims at once,
-  # the other one waits the takeover delay.
-  until (( $(held_epoch "$h") >= 0 )); do
-    [[ $(running "$o") == 0 ]] || fail "${o} started the workload" || return
-    (( $(date +%s) - t0 < 2 * TTL + TAKEOVER_DELAY )) || fail "${h} did not take the lease back after the broker came back" || return
-    sleep 1
-  done
+  # the other one waits the takeover delay. The time counts from the
+  # beginning of the outage.
+  wait_until "$(left "$t0" $(( 2 * TTL + TAKEOVER_DELAY )))" "${h} did not take the lease back after the broker came back" \
+    held_or_started "$h" "$o" || return
+  [[ -z $started ]] || fail "${started} started the workload" || return
   back=$(( $(date +%s) - t0 ))
   echo "   ${h} holds again ${back}s after the outage began (ttl ${TTL}s), its workload at $(running "$h")"
-  watch_exclusive $(( 2 * TTL ))
+  watch_exclusive
   [[ $(holder) == "$h" && $(running "$o") == 0 ]] || fail "the workload moved to ${o}" || return
   heartbeats "$since"
   echo "   ok: the lease stayed with ${h}"
@@ -379,18 +404,17 @@ redeploy() {
 scenario_replicas() {
   echo "== replicas: N = 3 where the lease is held, 0 elsewhere, and a failover"
   local h o t since
-  h=$(settle); since=$(now_rfc3339)
+  begin || return
   want=3
   redeploy "$want"
   t=$(wait_running "$h" "$want" $(( 6 * TTL )))
   echo "   ${h} scaled to ${want} in ${t}s without moving the lease"
-  o=$(other "$h")
-  [[ $(running "$o") == 0 ]] || { echo "FAILED: standby is running the workload" >&2; return 1; }
+  runs "$o" 0 || fail "standby is running the workload" || return
   ./partition.sh cut "$h"
   echo "   ${h} -> ${o}: $(transition "$h" "$o" "$TAKEOVER") (ttl ${TTL}s, ${want} replicas)"
   ./partition.sh heal "$h"
-  watch_exclusive $(( 2 * TTL ))
-  [[ $(holder) == "$o" && $(running "$o") == "$want" ]] || { echo "FAILED: ${o} does not run ${want} replicas after the heal" >&2; return 1; }
+  watch_exclusive
+  [[ $(holder) == "$o" && $(running "$o") == "$want" ]] || fail "${o} does not run ${want} replicas after the heal" || return
   heartbeats "$since"
   want=1
   redeploy "$want"
@@ -398,23 +422,24 @@ scenario_replicas() {
   echo "   ok: back to ${want} replica in ${t}s"
 }
 
+# no_endpoint <cluster> succeeds if kube-proxy refuses connections to the
+# gRPC port of the scaler's Service.
+no_endpoint() {
+  # Not a pipe into grep -q: with pipefail, an early exit is a failure.
+  grep -qF "${NS}/${RELEASE}:grpc has no endpoints" <<<"$(docker compose exec -T "$1" iptables -t filter -S)"
+}
+
 # scaler_service <cluster> on|off adds a selector term no pod has to the
 # scaler's Service, or takes it away. Off, the Service has no endpoint and
 # kube-proxy refuses new connections to it: what KEDA sees when the scaler
 # pod is gone. Waits until kube-proxy has the rule.
 scaler_service() {
-  local cluster=$1 t0
+  local cluster=$1
   case "$2" in
     off)
       kc "$cluster" -n "$NS" patch service "$RELEASE" --type=merge \
         -p '{"spec":{"selector":{"kfklease-e2e/scaler-down":"true"}}}' >/dev/null
-      t0=$(date +%s)
-      # Not a pipe into grep -q: with pipefail, an early exit is a failure.
-      until grep -qF "${NS}/${RELEASE}:grpc has no endpoints" \
-          <<<"$(docker compose exec -T "$cluster" iptables -t filter -S)"; do
-        (( $(date +%s) - t0 < 30 )) || { echo "FAILED: kube-proxy kept the scaler's endpoint" >&2; return 1; }
-        sleep 1
-      done
+      wait_until 30 "kube-proxy kept the scaler's endpoint" no_endpoint "$cluster" || return
       ;;
     on)
       kc "$cluster" -n "$NS" patch service "$RELEASE" --type=merge \
@@ -426,7 +451,7 @@ scaler_service() {
 scenario_scaler_down() {
   echo "== scaler-down: the holder's scaler is gone, its workload pods are not"
   local h o since
-  h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
+  begin || return
   # The scaler goes without a word, as with a lost node: KEDA can no longer
   # reach it, it can no longer reach Kafka, and it is killed, which writes
   # no release and resets KEDA's open connection to it. The kubelet's
@@ -438,8 +463,8 @@ scenario_scaler_down() {
   echo "   ${h} -> ${o}: $(transition "$h" "$o" "$TAKEOVER") (ttl ${TTL}s, cooldown ${COOLDOWN}s)"
   ./partition.sh heal "$h"
   scaler_service "$h" on
-  watch_exclusive $(( 2 * TTL ))
-  [[ $(holder) == "$o" ]] || { echo "FAILED: lease moved back after the scaler returned" >&2; return 1; }
+  watch_exclusive
+  [[ $(holder) == "$o" ]] || fail "lease moved back after the scaler returned" || return
   heartbeats "$since"
   echo "   ok: ${h} stopped its workload without its scaler and stayed idle"
 }
@@ -457,20 +482,21 @@ paused() {
   kc "$1" -n "$NS" get scaledobject singleton -o jsonpath='{.metadata.annotations.autoscaling\.keda\.sh/paused-replicas}'
 }
 
+# pause_is <cluster> <replicas> succeeds if the ScaledObject is paused at
+# <replicas>; with an empty <replicas>, if it is not paused.
+pause_is() {
+  [[ $(paused "$1") == "$2" ]]
+}
+
 # wait_unpaused <cluster> waits until the ScaledObject has no pause left.
 wait_unpaused() {
-  local t0
-  t0=$(date +%s)
-  until [[ -z $(paused "$1") ]]; do
-    (( $(date +%s) - t0 < 2 * TTL )) || fail "the ScaledObject of $1 is still paused" || return
-    sleep 1
-  done
+  wait_until $(( 2 * TTL )) "the ScaledObject of $1 is still paused" pause_is "$1" ""
 }
 
 scenario_standby() {
   echo "== standby: put the holder's cluster in standby; the workload moves through the handover, and stays moved"
   local h o since st site tr up
-  h=$(settle); o=$(other "$h"); since=$(now_rfc3339)
+  begin || return
   # The scaler restarts in standby; its predecessor releases on the way out.
   # A standby pod pauses the ScaledObject at zero, waits for the workload's
   # pods to go and yields, and the other site takes over from the yield
@@ -488,11 +514,11 @@ scenario_standby() {
   echo "   status: ${st}"
   site=$(python3 -c 'import sys, json; r = json.loads(sys.argv[1]); print(r["site"] if r["held"] else "")' "$st")
   [[ $site == "$o" ]] || fail "status names site '${site}', want ${o}" || return
-  watch_exclusive $(( 2 * TTL ))
+  watch_exclusive
   # Out of standby, the cluster claims again by the usual rules: the lease
   # is held, so nothing moves back.
   ./deploy.sh "$h" >/dev/null
-  watch_exclusive $(( 2 * TTL ))
+  watch_exclusive
   [[ $(holder) == "$o" && $(running "$h") == 0 ]] || fail "the workload moved back to ${h}" || return
   heartbeats "$since"
   echo "   ok: ${o} holds, ${h} back out of standby and idle"
@@ -522,22 +548,18 @@ scenario_handover_crash() {
   local h o since begun t0 t
   # The start in epoch seconds as well: BSD date cannot parse the RFC 3339
   # time back (it has no -d).
-  h=$(settle); o=$(other "$h"); since=$(now_rfc3339); begun=$(date +%s)
+  begin || return
+  begun=$(date +%s)
   # A finalizer keeps the workload's pod in Terminating: the handover
   # paused the ScaledObject and waits for the pod, and no yield goes out.
   finalizer "$h" add
   # Not waiting for the rollout: the handover starts when its last old pod
   # releases, and the scalers go down right after the pause.
   STANDBY=true WAIT=false ./deploy.sh "$h" >/dev/null
+  # One time for both: paused and stopped within two TTLs of the rollout.
   t0=$(date +%s)
-  until [[ $(paused "$h") == 0 ]]; do
-    (( $(date +%s) - t0 < 2 * TTL )) || fail "${h} did not pause its ScaledObject" || return
-    sleep 1
-  done
-  until [[ $(running "$h") == 0 ]]; do
-    (( $(date +%s) - t0 < 2 * TTL )) || fail "${h} did not stop its workload" || return
-    sleep 1
-  done
+  wait_until "$(left "$t0" $(( 2 * TTL )))" "${h} did not pause its ScaledObject" pause_is "$h" 0 || return
+  wait_until "$(left "$t0" $(( 2 * TTL )))" "${h} did not stop its workload" runs "$h" 0 || return
   (( $(pods_left "$h") > 0 )) || fail "the finalizer did not hold the pod" || return
   echo "   ${h} paused and its pod is terminating; killing its scaler pods"
   kc "$h" -n "$NS" delete pod -l app.kubernetes.io/name=kfklease --grace-period=0 --force >/dev/null 2>&1
@@ -545,16 +567,16 @@ scenario_handover_crash() {
   # A pod that still terminates is a pod that may still run: no yield, so
   # the other site does not start.
   for _ in 1 2 3 4 5; do
-    [[ $(running "$o") == 0 ]] || fail "${o} started while ${h}'s pod was still terminating" || return
+    runs "$o" 0 || fail "${o} started while ${h}'s pod was still terminating" || return
     sleep 1
   done
-  [[ $(paused "$h") == 0 ]] || fail "the restarted scalers lifted the pause during the handover" || return
+  pause_is "$h" 0 || fail "the restarted scalers lifted the pause during the handover" || return
   finalizer "$h" remove
   t0=$(date +%s)
   t=$(wait_running "$o" "$want" "$TAKEOVER") || return
   echo "   ${o} took over ${t}s after ${h}'s last pod went, $(( t0 - begun ))s after the standby began (takeover delay ${TAKEOVER_DELAY}s)"
   wait_unpaused "$h" || return
-  watch_exclusive $(( 2 * TTL ))
+  watch_exclusive
   ./deploy.sh "$h" >/dev/null
   [[ -z $(paused "$h") && $(holder) == "$o" ]] || fail "${h} out of standby: paused '$(paused "$h")', holder $(holder)" || return
   heartbeats "$since"
@@ -571,7 +593,7 @@ fi
 current=""
 on_exit() {
   local rc=$?
-  [[ -z $current ]] || echo "FAILED: scenario ${current} did not finish (exit ${rc})" >&2
+  [[ -z $current ]] || fail "scenario ${current} did not finish (exit ${rc})" || true
 }
 trap on_exit EXIT
 for s in "$@"; do

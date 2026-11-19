@@ -19,6 +19,14 @@
   TAKEOVER_MARGIN=5
   TAKEOVER_DELAY=$(( 5 + COOLDOWN + TAKEOVER_MARGIN ))
   COMPOSE_PROJECT=kfklease-e2e  # the name: in compose.yaml
+  POLL=1            # seconds between two tries of wait_until
+}
+
+# fail <message...> prints the failure and returns 1:
+#   [[ it is fine ]] || fail "why it is not" || return
+fail() {
+  echo "FAILED: $*" >&2
+  return 1
 }
 
 # kc <cluster> <kubectl args...> runs kubectl against one cluster.
@@ -31,4 +39,19 @@ kc() {
 # other <cluster> prints the other cluster.
 other() {
   if [[ $1 == k3s-a ]]; then echo k3s-b; else echo k3s-a; fi
+}
+
+# wait_until <timeout seconds> <what> <command...> runs the command every
+# POLL seconds until it succeeds. When <timeout> has passed and it still
+# fails, so does the wait, with <what>: the words for what did not happen.
+# The command runs in this shell, so a function can leave what it saw in a
+# variable of its caller.
+wait_until() {
+  local timeout=$1 what=$2 t0
+  shift 2
+  t0=$(date +%s)
+  until "$@"; do
+    (( $(date +%s) - t0 < timeout )) || fail "$what" || return
+    sleep "$POLL"
+  done
 }
