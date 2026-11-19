@@ -119,7 +119,10 @@ ways of handing secrets to the scaler.
   required checks and the branch must be up to date with `main`. Each job
   calls make (`lint` and `test`, `integration`, `image`, `chart-test`,
   `e2e`): a command line belongs in the Makefile or a script, not in the
-  workflow, so that what CI runs is what runs here. Stacked
+  workflow, so that what CI runs is what runs here. A pull request that
+  touches only documents (`test/changes.sh` says which paths those are)
+  skips integration, image, chart and e2e, which pass as skipped; unit
+  always runs. Stacked
   PRs that touch the same file (the README roadmap, say) conflict after
   the first merges; resolve by hand, `update-branch` cannot.
 - `setup-go` installs exactly the `go` directive's version with
@@ -134,7 +137,9 @@ ways of handing secrets to the scaler.
   "Upgrading from" notes in `README.md` and `docs/install.md`, which name
   the previous version. `release.yml` builds
   the multi-arch image and the chart into GHCR, signs the image with cosign
-  and writes the release. The actions in `release.yml` run only on tags, so
+  and writes the release. After the tag, a `docs:` PR puts the release into
+  `docs/provenance/release-hashes.txt` and stamps it; `docs/provenance/README.md`
+  says how. The actions in `release.yml` run only on tags, so
   a Dependabot bump of them is verified by the next release.
 - GHCR packages are public because the organisation allows public package
   creation; a new package would still start private if that setting were

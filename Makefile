@@ -37,6 +37,7 @@ lint:
 		echo 'lint: shellcheck is not installed, the scripts are NOT checked (CI checks them)' >&2; \
 	fi
 	test/e2e/selftest.sh
+	test/changes-selftest.sh
 
 image:
 	docker build -t $(SCALER_IMAGE) .
