@@ -195,9 +195,9 @@ type simNode struct {
 	trippedAt  time.Time
 
 	standby bool
-	// wasSiteHolding is siteHolding at the node's last step, for the
-	// handover driver, which lifts a pause when it turns true.
-	wasSiteHolding bool
+	// driver is the handover driver of the node's process, as the scaler
+	// runs one next to its participant: it goes with the process.
+	driver *HandoverDriver
 
 	// stopBy is set while the node is being stopped, as Run does it: the
 	// agent was told to stop and is driven on until it has nothing left to
@@ -614,22 +614,33 @@ func checkAgreement(t *testing.T, seed uint64, records []Record, skew time.Durat
 	}
 }
 
-// simHandover is the scaler's handover driver for node n: while its agent
-// reports a handover, pause the site's workload and, once it is down, ask
-// for the yield; lift the pause when the node starts to say its site holds,
-// or when another site holds the latest term.
+// simHandover is a look of node n's handover driver, the rules the scaler
+// runs (HandoverDriver), carried out on the site's workload: while the
+// node's agent reports a handover, pause the workload and, once it is down,
+// ask for the yield; lift the pause when the node starts to say its site
+// holds, or when another site holds the latest term.
 func simHandover(n *simNode, local time.Time, w *simWorkload, now time.Time, rng *rand.Rand) {
+	if n.driver == nil {
+		n.driver = NewHandoverDriver(n.a.cfg.Site)
+	}
 	s, _, _ := n.a.status(local)
-	siteHolding := n.a.siteHolding(local)
-	rising := siteHolding && !n.wasSiteHolding
-	n.wasSiteHolding = siteHolding
-	switch {
-	case rising || (s.Certain && s.Lease.Last != "" && SiteOf(s.Lease.Last) != n.a.cfg.Site):
-		w.paused = false
-	case s.Handover:
-		w.pause(now, rng)
-		if !w.running {
-			n.a.requestYield(local, s.HandoverEpoch)
+	for step := n.driver.Look(s); step.Do != HandoverNothing; {
+		switch step.Do {
+		case HandoverLift:
+			w.paused = false
+			step = n.driver.Lifted(true)
+		case HandoverPause:
+			w.pause(now, rng)
+			step = n.driver.Paused(true)
+		case HandoverCount:
+			remaining := 0
+			if w.running {
+				remaining = 1
+			}
+			step = n.driver.Remaining(remaining)
+		case HandoverYield:
+			n.a.requestYield(local, step.Epoch)
+			return
 		}
 	}
 }
