@@ -162,7 +162,7 @@ func run(args []string) error {
 	c := commonFlags(fs)
 	var (
 		site        = fs.String("site", envParse("KFKLEASE_SITE", "", text), "where this scaler runs, a cluster: the lease belongs to a site; empty for the holder id up to its last slash (KFKLEASE_SITE)")
-		holder      = fs.String("holder", envParse("KFKLEASE_HOLDER", "", text), "holder id <site>/<name>, unique per process; empty for <site>/<hostname>-<random> (KFKLEASE_HOLDER)")
+		holder      = fs.String("holder", envParse("KFKLEASE_HOLDER", "", text), "holder id <site>/<name>, unique among the participants running at one time; empty for <site>/<hostname>-<random> (KFKLEASE_HOLDER)")
 		takeover    = fs.Duration("takeover-delay", envParse("KFKLEASE_TAKEOVER_DELAY", 0, time.ParseDuration), "wait this long after another site's term ended before claiming, so that its workload has stopped; 0 claims at once (KFKLEASE_TAKEOVER_DELAY)")
 		standby     = fs.Bool("standby", envParse("KFKLEASE_STANDBY", false, strconv.ParseBool), "standby mode: follow the leases and never claim them, to take this site out for maintenance or move the workload away (KFKLEASE_STANDBY)")
 		margin      = fs.Duration("margin", envParse("KFKLEASE_MARGIN", 0, time.ParseDuration), "safety margin subtracted from the holder's deadline; 0 for ttl/5 (KFKLEASE_MARGIN)")
