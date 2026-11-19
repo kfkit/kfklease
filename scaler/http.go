@@ -65,6 +65,40 @@ type LeaseResponse struct {
 	Expires time.Time `json:"expires"`
 }
 
+// LogLease is the lease as the log says, as of the last record read, on the
+// broker's clock: a line of `kfklease-scaler status`, and what the
+// kfklease_lease_* metrics say. It is who held the lease then, not a belief
+// to act on now. Where LeaseResponse is the state of the log as it stands,
+// with the holder of a term that ran out still in it, this one says whether
+// the term was live as of AsOf, and names a holder only then.
+type LogLease struct {
+	// Held is whether someone holds the lease as of AsOf.
+	Held bool `json:"held"`
+	// Holder, Site and Epoch name the term, when Held. Site is the holder
+	// id up to its last slash.
+	Holder string `json:"holder,omitempty"`
+	Site   string `json:"site,omitempty"`
+	Epoch  int64  `json:"epoch,omitempty"`
+	// Expires is when the term ends unless renewed, when Held; otherwise
+	// when the latest term ended, as far as the log tells.
+	Expires time.Time `json:"expires,omitzero"`
+	// LastHolder is the holder of the latest term, when the log still
+	// names it.
+	LastHolder string    `json:"last_holder,omitempty"`
+	AsOf       time.Time `json:"as_of,omitzero"`
+}
+
+// NewLogLease reads the lease from s.Lease and s.AsOf, which mean something
+// only while s.Certain.
+func NewLogLease(s lease.Status) LogLease {
+	l := s.Lease
+	out := LogLease{Held: l.HeldAt(s.AsOf), Expires: l.Expires, LastHolder: l.Last, AsOf: s.AsOf}
+	if out.Held {
+		out.Holder, out.Site, out.Epoch = l.Holder, lease.SiteOf(l.Holder), l.Epoch
+	}
+	return out
+}
+
 // HTTP serves /metrics, /status and /healthz over one or more leases.
 type HTTP struct {
 	leases leases
@@ -72,7 +106,7 @@ type HTTP struct {
 	// labels are the variable labels of every lease metric: "topic", or
 	// none for a single lease without a topic.
 	labels []string
-	descs  descs
+	gauges []gauge
 
 	transitions *prometheus.CounterVec
 	// lastHolding is per topic; the map is fixed after construction.
@@ -102,10 +136,7 @@ func NewHTTPLeases(ls []Lease) (*HTTP, error) {
 	if !(len(set.topics) == 1 && set.topics[0] == "") {
 		h.labels = []string{"topic"}
 	}
-	h.descs = newDescs(h.labels)
-	h.descs.holderInfo = prometheus.NewDesc("kfklease_lease_holder_info",
-		"1 for the holder of the lease, as the log says as of the last record seen; no series while nobody holds it or the view is not certain. site is the holder id up to its last slash: the chart's site.",
-		append(slices.Clone(h.labels), "holder", "site"), nil)
+	h.gauges = newGauges(h.labels)
 	h.transitions = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "kfklease_transitions_total",
 		Help: "Times this participant started (to=\"holding\") or stopped (to=\"standby\") holding the lease.",
@@ -183,10 +214,9 @@ func (h *HTTP) status(w http.ResponseWriter, r *http.Request) {
 	}
 	s := l.Source.Status()
 	h.note(l.Topic)
-	resp := StatusResponse{Topic: l.Topic, Holder: l.Holder, Holding: s.Holding, Certain: s.Certain, Ready: s.Ready, AsOf: s.AsOf, CooldownIn: untilNow(s.CooldownUntil), Standby: s.Standby, Handover: s.Handover}
+	resp := StatusResponse{Topic: l.Topic, Holder: l.Holder, Holding: s.Holding, DeadlineIn: beliefRemaining(s), Certain: s.Certain, Ready: s.Ready, AsOf: s.AsOf, CooldownIn: untilNow(s.CooldownUntil), Standby: s.Standby, Handover: s.Handover}
 	if s.Holding {
 		resp.Epoch = s.Epoch
-		resp.DeadlineIn = untilNow(s.Deadline)
 	}
 	if s.SiteHolding {
 		resp.SiteHolding, resp.SiteEpoch = true, s.SiteEpoch
@@ -199,66 +229,103 @@ func (h *HTTP) status(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// descs are the gauges, read from the Sources at scrape time, so they are
-// always current and there is nothing to keep in sync.
-type descs struct {
-	holding, siteHolding, epoch, deadline, certain, leaseHeld, leaseAge, cooldown, standby *prometheus.Desc
-	holderInfo                                                                             *prometheus.Desc
+// gauge is one gauge of a lease. Its value is read from the lease's Source
+// at scrape time, so it is always current and there is nothing to keep in
+// sync.
+type gauge struct {
+	desc  *prometheus.Desc
+	value func(lease.Status) float64
+	// absent, when set, reports that the gauge has no series for a status.
+	absent func(lease.Status) bool
+	// more, when set, returns the values of the labels the gauge has after
+	// the lease's own.
+	more func(lease.Status) []string
 }
 
-func newDescs(labels []string) descs {
-	d := func(name, help string) *prometheus.Desc { return prometheus.NewDesc(name, help, labels, nil) }
-	return descs{
-		holding:     d("kfklease_holding", "1 while this participant believes it holds the lease."),
-		siteHolding: d("kfklease_site_holding", "1 while this participant believes its site holds the lease: what KEDA is told."),
-		epoch:       d("kfklease_epoch", "Fencing token of the held term; -1 when not holding."),
-		deadline:    d("kfklease_belief_remaining_seconds", "Seconds until the belief expires unless renewed; 0 when not holding."),
-		certain:     d("kfklease_certain", "1 when the view of the log can be trusted."),
-		leaseHeld:   d("kfklease_lease_held", "1 when the log says someone holds the lease, as of the last record seen."),
-		leaseAge:    d("kfklease_lease_as_of_seconds", "Unix time of the last record seen, on the broker's clock."),
-		cooldown:    d("kfklease_health_cooldown_seconds", "Seconds until this participant may claim again after the health gate released the lease; 0 otherwise."),
-		standby:     d("kfklease_standby_mode", "1 while this participant is in standby mode: it follows the log and never claims."),
+// newGauges is the one list of the gauges of a lease; labels are the labels
+// every one of them carries.
+func newGauges(labels []string) []gauge {
+	g := func(name, help string, value func(lease.Status) float64) gauge {
+		return gauge{desc: prometheus.NewDesc(name, help, labels, nil), value: value}
+	}
+	whether := func(name, help string, is func(lease.Status) bool) gauge {
+		return g(name, help, func(s lease.Status) float64 { return b2f(is(s)) })
+	}
+	// The log's side is trusted only on a certain view.
+	held := func(s lease.Status) bool { return s.Certain && NewLogLease(s).Held }
+
+	asOf := g("kfklease_lease_as_of_seconds", "Unix time of the last record seen, on the broker's clock.",
+		func(s lease.Status) float64 { return float64(s.AsOf.UnixMilli()) / 1000 })
+	asOf.absent = func(s lease.Status) bool { return s.AsOf.IsZero() }
+
+	holderInfo := gauge{
+		desc: prometheus.NewDesc("kfklease_lease_holder_info",
+			"1 for the holder of the lease, as the log says as of the last record seen; no series while nobody holds it or the view is not certain. site is the holder id up to its last slash: the chart's site.",
+			append(slices.Clone(labels), "holder", "site"), nil),
+		value:  func(lease.Status) float64 { return 1 },
+		absent: func(s lease.Status) bool { return !held(s) },
+		more: func(s lease.Status) []string {
+			l := NewLogLease(s)
+			return []string{l.Holder, l.Site}
+		},
+	}
+
+	return []gauge{
+		whether("kfklease_holding", "1 while this participant believes it holds the lease.",
+			func(s lease.Status) bool { return s.Holding }),
+		whether("kfklease_site_holding", "1 while this participant believes its site holds the lease: what KEDA is told.",
+			func(s lease.Status) bool { return s.SiteHolding }),
+		g("kfklease_epoch", "Fencing token of the held term; -1 when not holding.",
+			func(s lease.Status) float64 {
+				if !s.Holding {
+					return -1
+				}
+				return float64(s.Epoch)
+			}),
+		g("kfklease_belief_remaining_seconds", "Seconds until the belief expires unless renewed; 0 when not holding.", beliefRemaining),
+		whether("kfklease_certain", "1 when the view of the log can be trusted.",
+			func(s lease.Status) bool { return s.Certain }),
+		whether("kfklease_lease_held", "1 when the log says someone holds the lease, as of the last record seen.", held),
+		holderInfo,
+		asOf,
+		g("kfklease_health_cooldown_seconds", "Seconds until this participant may claim again after the health gate released the lease; 0 otherwise.",
+			func(s lease.Status) float64 { return untilNow(s.CooldownUntil) }),
+		whether("kfklease_standby_mode", "1 while this participant is in standby mode: it follows the log and never claims.",
+			func(s lease.Status) bool { return s.Standby }),
 	}
 }
 
 // Describe implements prometheus.Collector.
 func (h *HTTP) Describe(ch chan<- *prometheus.Desc) {
-	d := h.descs
-	for _, x := range []*prometheus.Desc{d.holding, d.siteHolding, d.epoch, d.deadline, d.certain, d.leaseHeld, d.leaseAge, d.cooldown, d.standby, d.holderInfo} {
-		ch <- x
+	for _, g := range h.gauges {
+		ch <- g.desc
 	}
 }
 
 // Collect implements prometheus.Collector.
 func (h *HTTP) Collect(ch chan<- prometheus.Metric) {
-	d := h.descs
 	for _, t := range h.leases.topics {
 		s := h.leases.byTopic[t].Source.Status()
-		lv := h.values(t)
-		gauge := func(desc *prometheus.Desc, v float64) {
-			ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, v, lv...)
-		}
-		epoch, remaining := -1.0, 0.0
-		if s.Holding {
-			epoch = float64(s.Epoch)
-			remaining = untilNow(s.Deadline)
-		}
-		gauge(d.holding, b2f(s.Holding))
-		gauge(d.siteHolding, b2f(s.SiteHolding))
-		gauge(d.epoch, epoch)
-		gauge(d.deadline, remaining)
-		gauge(d.certain, b2f(s.Certain))
-		held := s.Certain && s.Lease.HeldAt(s.AsOf)
-		gauge(d.leaseHeld, b2f(held))
-		if held {
-			ch <- prometheus.MustNewConstMetric(d.holderInfo, prometheus.GaugeValue, 1, h.values(t, s.Lease.Holder, lease.SiteOf(s.Lease.Holder))...)
-		}
-		gauge(d.cooldown, untilNow(s.CooldownUntil))
-		gauge(d.standby, b2f(s.Standby))
-		if !s.AsOf.IsZero() {
-			gauge(d.leaseAge, float64(s.AsOf.UnixMilli())/1000)
+		for _, g := range h.gauges {
+			if g.absent != nil && g.absent(s) {
+				continue
+			}
+			var more []string
+			if g.more != nil {
+				more = g.more(s)
+			}
+			ch <- prometheus.MustNewConstMetric(g.desc, prometheus.GaugeValue, g.value(s), h.values(t, more...)...)
 		}
 	}
+}
+
+// beliefRemaining is how long the participant's belief lasts unless
+// renewed, in seconds; 0 when not holding.
+func beliefRemaining(s lease.Status) float64 {
+	if !s.Holding {
+		return 0
+	}
+	return untilNow(s.Deadline)
 }
 
 // untilNow is the seconds left until t, or 0 when t is zero or past.
