@@ -36,6 +36,16 @@ and this project adheres to
   (the scaler exits and restarts). It used to stay up, ready and holding
   nothing, for good.
 
+- The handover writes its yield only when KEDA has scaled the target to
+  zero and no pod is left. "No pod right now" was enough before, which is
+  also what a rollout or a pod restart looks like for a moment.
+- Boolean `KFKLEASE_*` variables (`KFKLEASE_STANDBY`, `KFKLEASE_TLS`,
+  `KFKLEASE_TLS_INSECURE_SKIP_VERIFY`, `KFKLEASE_CREATE_TOPIC`,
+  `KFKLEASE_FLUSH_EVERY_RECORD`) accept what their flags accept (`1`,
+  `TRUE`, `t`, ...). Anything else, an empty value included, stops the
+  scaler with status 2; it used to be read as false without a word, so
+  `KFKLEASE_STANDBY=1` left a cluster claiming.
+
 ### Added
 
 - `View.AllowSkew`: how far apart two partition leaders' clocks may be.
