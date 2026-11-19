@@ -18,6 +18,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -27,12 +28,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sort"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/kfkit/kfklease/scaler"
@@ -73,10 +75,16 @@ func env(name, def string) string {
 	return def
 }
 
+// topicFlags declares the flags beat and report share: where the heartbeat
+// topic is.
+func topicFlags(fs *flag.FlagSet) (brokers, topic *string) {
+	return fs.String("brokers", env("HEARTBEAT_BROKERS", ""), "bootstrap addresses (HEARTBEAT_BROKERS)"),
+		fs.String("topic", env("HEARTBEAT_TOPIC", "kfklease-heartbeats"), "heartbeat topic (HEARTBEAT_TOPIC)")
+}
+
 func beat(args []string) error {
 	fs := flag.NewFlagSet("beat", flag.ExitOnError)
-	brokers := fs.String("brokers", env("HEARTBEAT_BROKERS", ""), "bootstrap addresses (HEARTBEAT_BROKERS)")
-	topic := fs.String("topic", env("HEARTBEAT_TOPIC", "kfklease-heartbeats"), "heartbeat topic (HEARTBEAT_TOPIC)")
+	brokers, topic := topicFlags(fs)
 	statusURL := fs.String("status-url", env("KFKLEASE_STATUS_URL", "http://kfklease:9091/status"), "the scaler's /status (KFKLEASE_STATUS_URL)")
 	cluster := fs.String("cluster", env("CLUSTER", ""), "name of this cluster, the record key (CLUSTER)")
 	every := fs.Duration("every", 200*time.Millisecond, "heartbeat interval")
@@ -153,11 +161,15 @@ func status(ctx context.Context, client *http.Client, url string) (scaler.Status
 }
 
 // ensureTopic creates the heartbeat topic with broker timestamps, which is
-// what the report measures with.
+// what the report measures with. The key and the value are those of
+// lease/topic.go (timestampTypeKey, timestampTypeValue), which exports
+// neither: what it creates is a lease topic, compacted, and a topic of
+// heartbeats has to keep every record.
 func ensureTopic(ctx context.Context, cl *kgo.Client, topic string) error {
 	lat := "LogAppendTime"
+	// CreateTopic reports the broker's verdict as err.
 	_, err := kadm.NewClient(cl).CreateTopic(ctx, 1, -1, map[string]*string{"message.timestamp.type": &lat}, topic)
-	if err != nil && !strings.Contains(err.Error(), "TOPIC_ALREADY_EXISTS") {
+	if err != nil && !errors.Is(err, kerr.TopicAlreadyExists) {
 		return fmt.Errorf("create topic %q: %w", topic, err)
 	}
 	return nil
@@ -191,8 +203,7 @@ type EpochSpan struct {
 
 func report(args []string) error {
 	fs := flag.NewFlagSet("report", flag.ExitOnError)
-	brokers := fs.String("brokers", env("HEARTBEAT_BROKERS", ""), "bootstrap addresses (HEARTBEAT_BROKERS)")
-	topic := fs.String("topic", env("HEARTBEAT_TOPIC", "kfklease-heartbeats"), "heartbeat topic (HEARTBEAT_TOPIC)")
+	brokers, topic := topicFlags(fs)
 	since := fs.String("since", "", "only heartbeats at or after this RFC 3339 time, by the broker's clock")
 	settle := fs.Duration("settle", 2*time.Second, "how long the end of the topic must stay quiet before the report is final")
 	asJSON := fs.Bool("json", false, "print the report as JSON")
@@ -276,7 +287,7 @@ func summarize(records []*kgo.Record, from time.Time) Report {
 	for _, sp := range spans {
 		rep.Epochs = append(rep.Epochs, *sp)
 	}
-	sort.Slice(rep.Epochs, func(i, j int) bool { return rep.Epochs[i].Epoch < rep.Epochs[j].Epoch })
+	slices.SortFunc(rep.Epochs, func(a, b EpochSpan) int { return cmp.Compare(a.Epoch, b.Epoch) })
 	for i := 1; i < len(rep.Epochs); i++ {
 		prev, cur := rep.Epochs[i-1], rep.Epochs[i]
 		if d := prev.Last.Sub(cur.First); d > 0 {
