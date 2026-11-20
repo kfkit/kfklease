@@ -6,7 +6,7 @@
 # at once and how long nobody wrote.
 #
 #   ./scenarios.sh            # all
-#   ./scenarios.sh crash      # one: coldstart, restart, holder-pod, bad-image, crash, partition, pause, broker, replicas, scaler-down, standby, handover-crash
+#   ./scenarios.sh crash      # one: coldstart, restart, holder-pod, bad-image, crash, partition, pause, broker, replicas, scaler-down, standby, handover-crash, recreate
 #
 # Expects the stand to be up, the images built and the chart deployed to
 # both clusters: ./run.sh (`make e2e`) does all of that and then runs this.
@@ -175,20 +175,23 @@ begin_staying() {
   (( before >= 0 )) || fail "the site ${h} does not hold the lease" || return
 }
 
-# heartbeats <since> reads the heartbeat topic from <since>, prints what
-# the workload actually did, and fails on any fenced (stale) record or any
-# overlap between epochs: the workload-level mutual exclusion check.
+# heartbeats <since> [reset] reads the heartbeat topic from <since>, prints
+# what the workload actually did, and fails on any fenced (stale) record or
+# any overlap between epochs: the workload-level mutual exclusion check.
+# With reset the lease topic was recreated in the meantime and its epochs
+# started from 0 again, below the ones before: the fence cannot hold across
+# that, and only the overlap counts.
 heartbeats() {
-  local since=$1 out
+  local since=$1 reset=${2:-} out
   out=$(docker run --rm --network "$KFK_NETWORK" "$HEARTBEAT_IMAGE" report \
     --brokers "$KAFKA_ADDR:$KAFKA_PORT" --since "$since" --json)
-  python3 - "$out" <<'PY'
+  python3 - "$out" "$reset" <<'PY'
 import sys, json
 r = json.loads(sys.argv[1])
 ms = lambda ns: f"{ns/1e6:.0f}ms"
 spans = ", ".join(f"epoch {e['epoch']}@{e['cluster']} x{e['count']}" for e in r["epochs"])
 print(f"   heartbeats: {r['records']} records, {spans}; stale {r['stale']}, overlap {ms(r['overlap'])}, gap {ms(r['gap'])}")
-sys.exit(0 if r["stale"] == 0 and r["overlap"] == 0 else 1)
+sys.exit(0 if (r["stale"] == 0 or sys.argv[2] == "reset") and r["overlap"] == 0 else 1)
 PY
 }
 
@@ -197,7 +200,9 @@ scenario_coldstart() {
   local t0 h since
   since=$(now_rfc3339)
   t0=$(date +%s)
-  wait_until $(( 3 * TTL )) "nobody took the lease" has_holder || return
+  # The topic is new and empty, which looks the same as one deleted and
+  # created again: nobody claims before the takeover delay has passed.
+  wait_until $(( TAKEOVER_DELAY + 3 * TTL )) "nobody took the lease" has_holder || return
   h=$(holder)
   echo "   holder: ${h} after $(( $(date +%s) - t0 ))s"
   watch_exclusive
@@ -531,6 +536,71 @@ scenario_standby() {
   echo "   ok: ${o} holds, ${h} back out of standby and idle"
 }
 
+# kafka_topics <args...> runs kafka-topics.sh in the broker's container.
+kafka_topics() {
+  docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server "localhost:${KAFKA_PORT}" "$@"
+}
+
+# topic_listed succeeds if the broker lists the lease topic.
+topic_listed() {
+  grep -qx "$TOPIC" <<<"$(kafka_topics --list)"
+}
+
+# scalers <cluster> STOP|CONT freezes the scaler processes of the cluster,
+# or lets them go on. A frozen scaler reads nothing, writes nothing and
+# answers neither KEDA nor its probes; the liveness probe gives it 30 s.
+scalers() {
+  # shellcheck disable=SC2016 # expanded in the node's shell
+  docker compose exec -T "$1" sh -c 'for p in /proc/[0-9]*; do
+    [ "$(cat "$p/comm" 2>/dev/null)" = kfklease-scaler ] && kill -"$0" "${p#/proc/}"; done; true' "$2"
+}
+
+# scaler_restarts <cluster> prints how often the scaler containers of the
+# cluster restarted, all pods together.
+scaler_restarts() {
+  kc "$1" -n "$NS" get pods -l "$SCALER_PODS" \
+    -o jsonpath='{range .items[*]}{.status.containerStatuses[0].restartCount}{"\n"}{end}' | awk '{ n += $1 } END { print n + 0 }'
+}
+
+# restarted_ready <cluster> <restarts> succeeds once the scaler containers
+# of the cluster restarted <restarts> times in all and a scaler is ready.
+restarted_ready() {
+  (( $(scaler_restarts "$1") >= $2 )) && [[ $(status_get "$1" 'r["ready"]') == True ]]
+}
+
+scenario_recreate() {
+  echo "== recreate: the lease topic is deleted and created again; the other cluster's scalers come back first and wait the takeover delay"
+  local h o since restarts pods tr overlap
+  begin || return
+  pods=$(kc "$o" -n "$NS" get pods -l "$SCALER_PODS" -o name | wc -l)
+  restarts=$(( $(scaler_restarts "$o") + pods ))
+  # The holder's scalers are frozen until the other cluster's are back on
+  # the new topic, so that the order is not a race: theirs is the view that
+  # becomes certain first. The holder's workload runs on meanwhile, as it
+  # would while its scalers restart.
+  scalers "$h" STOP
+  kafka_topics --delete --topic "$TOPIC" >/dev/null
+  # The other cluster's scalers stop on the vanished topic and restart; the
+  # first of them creates it again (createTopic), empty. Not a wait for the
+  # topic to be gone: that can be over before a listing sees it.
+  wait_until 30 "${o}'s scalers did not restart onto the new topic" restarted_ready "$o" "$restarts" \
+    || { scalers "$h" CONT; return 1; }
+  topic_listed || { scalers "$h" CONT; fail "the lease topic was not created again"; return 1; }
+  scalers "$h" CONT
+  echo "   ${o}'s scalers are back on the new topic; ${h}'s go on and stop too"
+  # Neither site's term is in the new log: the other cluster may claim only
+  # once the takeover delay since its start has passed, by when the old
+  # holder's workload is gone.
+  tr=$(transition "$h" "$o" "$TAKEOVER") || return
+  echo "   ${h} -> ${o}: ${tr} (takeover delay ${TAKEOVER_DELAY}s)"
+  overlap=$(sed -E 's/.*overlap=([0-9.]+)s.*/\1/' <<<"$tr")
+  [[ $overlap == 0.0 ]] || fail "both clusters ran the workload for ${overlap}s" || return
+  watch_exclusive
+  [[ $(holder) == "$o" && $(running "$h") == 0 ]] || fail "the workload is not in ${o} alone" || return
+  heartbeats "$since" reset
+  echo "   ok: ${o} runs the workload, ${h} idle"
+}
+
 # finalizer <cluster> add|remove holds the workload's pods in Terminating
 # once deleted, or lets them go.
 finalizer() {
@@ -591,7 +661,7 @@ scenario_handover_crash() {
 }
 
 if (( $# == 0 )); then
-  set -- coldstart restart holder-pod bad-image crash partition pause broker replicas scaler-down standby handover-crash
+  set -- coldstart restart holder-pod bad-image crash partition pause broker replicas scaler-down standby handover-crash recreate
 fi
 # A failing command ends the run through set -e. A shell error does not:
 # bash drops the whole command it happens in, here the loop, and goes on
