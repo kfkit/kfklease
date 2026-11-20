@@ -9,6 +9,6 @@ Each line names a signed git tag, the tag object, the commit it points at
 produced by `git archive --format=tar <tag>` with git 2.55.0.
 
 v0.1.0 tag=1d7a64409b88e8ad6dd7d48fa2607ec5ac248b7b commit=b39fa191eec0500822151a7b720efb83b8c43ecd archive_sha256=ee5be87b8f0257ab1ff513d215a12da8e9d0eaf7176ae117ed327f22d5fd45cb
-v0.5.0 tag=48d7baab146a046eb101dfe8740e107415383574 commit=7f33044b93570e42d0601e61b144c0addacd7280 archive_sha256=8d7e1e8f2dd05befa30698be1f1c1a04e524a099843c96966c80324526579f42
+v0.5.1 tag=ec4ecdb2391ee4ef1a0403363d8217a7984fb4d1 commit=d42e361301574fedfdf345c9ade2e57bfab41568 archive_sha256=cf9357b6903125a26eb62553ebcf9426efc6a5cd0c429d89eedaf04b47a993e2
 
 First release v0.1.0: https://github.com/kfkit/kfklease/releases/tag/v0.1.0 (2026-09-24).

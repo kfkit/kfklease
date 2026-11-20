@@ -8,17 +8,19 @@ to. The commit dates, the signatures on the tags and the entries in
 `sum.golang.org` are the earlier evidence; this proof does not depend on any
 of them, nor on GitHub.
 
-The file as it is now, with v0.1.0 and v0.5.0, was stamped on 2026-11-19.
+The file as it is now, with v0.1.0 and v0.5.1, was stamped on 2026-11-20.
 Its proof is pending: the calendars have it, and `ots upgrade` attaches it
 to a Bitcoin block a few hours later (see [Timestamping](#timestamping)).
 
-The file as it was before, with v0.1.0 and v0.3.0, is attested in Bitcoin
-blocks 969313 and 969317 (2026-09-30). That file and its proof are in the
-history, and stay the evidence for the first release:
+The files as they were before are in the history with their proofs. The
+one with v0.1.0 and v0.3.0 is attested in Bitcoin blocks 969313 and 969317
+(2026-09-30) and stays the evidence for the first release; the one with
+v0.1.0 and v0.5.0, in blocks 976616, 976629, 976646 and 976662:
 
 ```bash
-git show 3f775ce:docs/provenance/release-hashes.txt > release-hashes.txt
-git show 3f775ce:docs/provenance/release-hashes.txt.ots > release-hashes.txt.ots
+c=3f775ce   # v0.1.0 and v0.3.0; be5e31c for v0.1.0 and v0.5.0
+git show $c:docs/provenance/release-hashes.txt > release-hashes.txt
+git show $c:docs/provenance/release-hashes.txt.ots > release-hashes.txt.ots
 ```
 
 ## Adding a release
