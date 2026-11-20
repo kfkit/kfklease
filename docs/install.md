@@ -205,8 +205,12 @@ few seconds it costs latency, not throughput: on the one-broker stand a produce 
 An existing topic is never altered. At start the scaler checks it: no
 `LogAppendTime` stops it, as before; fewer replicas than
 `replicationFactor`, `min.insync.replicas` below the value above,
-`unclean.leader.election.enable=true` or a `cleanup.policy` without
-`compact` are logged as warnings (`existing lease topic falls short`).
+`unclean.leader.election.enable=true`, a `cleanup.policy` without
+`compact` or more than one partition are logged as warnings (`existing
+lease topic falls short`). The scaler uses partition 0 and leaves the
+others empty; a program that uses `lease.Candidate` with `Partition` set
+must give every participant of one lease the same partition, or each
+partition gets a holder of its own.
 Fix them with `kafka-configs.sh --alter` or a partition reassignment; the
 checks need `DescribeConfigs` and `Describe` on the topic. Change
 `min.insync.replicas` on a topic with Eligible Leader Replicas only if you
