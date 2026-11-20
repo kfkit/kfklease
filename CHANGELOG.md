@@ -7,6 +7,8 @@ and this project adheres to
 
 ## Unreleased
 
+## [0.5.1] - 2026-11-20
+
 ### Added
 
 - An existing lease topic with more than one partition is logged as a

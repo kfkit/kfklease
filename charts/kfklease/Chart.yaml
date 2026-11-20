@@ -2,8 +2,8 @@ apiVersion: v2
 name: kfklease
 description: The lease participants of this cluster, served to KEDA as an external scaler
 type: application
-version: 0.5.0
-appVersion: "0.5.0"
+version: 0.5.1
+appVersion: "0.5.1"
 home: https://github.com/kfkit/kfklease
 sources:
   - https://github.com/kfkit/kfklease
