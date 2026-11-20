@@ -738,8 +738,20 @@ func TestAgentHealthGateReleaseWaitsForTheRecordInFlight(t *testing.T) {
 func newSiteHarness(t *testing.T, start int64, delay time.Duration) *agentHarness {
 	t.Helper()
 	h := newHarness(t, start)
-	h.a.cfg.Site, h.a.cfg.Holder, h.a.cfg.TakeoverDelay = "eu", "eu/me", delay
+	cfg := h.a.cfg
+	cfg.Site, cfg.Holder, cfg.TakeoverDelay = "eu", "eu/me", delay
+	h.a = newAgent(cfg, slog.New(slog.DiscardHandler), start, start, at(0))
 	return h
+}
+
+// ownSiteReleased puts a term of another participant of the agent's site
+// into the log before at(0), released, and reads it: the agent may claim at
+// once.
+func (h *agentHarness) ownSiteReleased() {
+	h.t.Helper()
+	epoch := h.land(at(-1), recordOf(Claim, "eu/old", 0))
+	h.land(at(-0.5), recordOf(Release, "eu/old", epoch))
+	h.read(at(-0.4))
 }
 
 func TestAgentTakeoverDelay(t *testing.T) {
@@ -804,6 +816,47 @@ func TestAgentTakeoverDelay(t *testing.T) {
 	release(h, 1, "us/x")
 	h.read(at(1.2))
 	h.wantSend(at(1.3), Claim)
+}
+
+// An empty log read from its start may be a topic deleted and created
+// again, whose holder on the old one still runs its workload: a term of an
+// unknown holder, as after silence. The delay counts from the moment the
+// view became certain, on the agent's own clock, whatever the agent's site.
+func TestAgentTakeoverDelayOnAnEmptyLog(t *testing.T) {
+	const delay = 30 * time.Second
+	h := newSiteHarness(t, 0, delay)
+	for s := 0.0; s <= 30; s += 0.5 {
+		h.read(at(s))
+		h.wantSilent(at(s))
+	}
+	h.wantSend(at(30.1), Claim)
+
+	// Certain from the start, though created later: the delay counts from
+	// then.
+	h = newSiteHarness(t, 0, delay)
+	h.a = newAgent(h.a.cfg, slog.New(slog.DiscardHandler), 0, 0, at(5))
+	h.wantSilent(at(35))
+	h.wantSend(at(35.1), Claim)
+
+	// A term in the log is judged by the rules for it: here its own site's,
+	// released, which it takes over at once.
+	h = newSiteHarness(t, 0, delay)
+	h.land(at(1), recordOf(Claim, "eu/old", 0))
+	h.land(at(2), recordOf(Release, "eu/old", 0))
+	h.read(at(2.2))
+	h.wantSend(at(2.3), Claim)
+
+	// A log with records in it, read from its start, is no empty log.
+	h = newSiteHarness(t, 0, delay)
+	h.land(at(0), recordOf(Claim, "eu/old", 0))
+	h.land(at(1), recordOf(Release, "eu/old", 0))
+	h.a = newAgent(h.a.cfg, slog.New(slog.DiscardHandler), 0, int64(len(h.log)), at(1.1))
+	h.read(at(1.2))
+	h.wantSend(at(1.3), Claim)
+
+	// Without a delay, an empty log is claimed at once.
+	h = newSiteHarness(t, 0, 0)
+	h.wantSend(at(0), Claim)
 }
 
 func TestAgentReadyOnceCertain(t *testing.T) {
@@ -1046,6 +1099,7 @@ func TestAgentSiteBelief(t *testing.T) {
 
 	t.Run("the own term is the site's", func(t *testing.T) {
 		h := newSiteHarness(t, 0, delay)
+		h.ownSiteReleased()
 		epoch := h.acquire(at(0))
 		if !h.a.siteHolding(at(0.2)) {
 			t.Fatal("the holder does not count its own term as its site's")
@@ -1235,6 +1289,7 @@ func TestAgentHandover(t *testing.T) {
 	}
 	standbyAfterTerm := func(t *testing.T) (*agentHarness, int64) {
 		h := newSiteHarness(t, 0, delay)
+		h.ownSiteReleased()
 		epoch := h.acquire(at(0))
 		if _, ok := handover(h, at(1)); ok {
 			t.Fatal("handover while holding")

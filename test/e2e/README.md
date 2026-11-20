@@ -72,7 +72,7 @@ with TTL 10 s, `pollingInterval: 5`, `cooldownPeriod: 30`, `takeoverDelay`
 
 | Scenario    | What happens                                   | Result                                   |
 |-------------|------------------------------------------------|------------------------------------------|
-| `coldstart` | both clusters start                            | one holder within 1 s, standby idle      |
+| `coldstart` | both clusters start on a new, empty topic      | one holder once the takeover delay has passed (an empty topic may be a recreated one), standby idle |
 | `restart`   | every scaler pod of the holder's cluster is deleted | a new pod holds a new epoch for the same site within seconds; the workload's pod UIDs are the same 40 s later and the other cluster never starts |
 | `holder-pod` | the scaler pod that holds the lease is deleted, the other scaler pod of its cluster stays | the other pod holds a new epoch for the same site within seconds; the workload's pod UIDs are the same 40 s later and the other cluster never starts |
 | `bad-image` | the holder's cluster is upgraded to a scaler image tag that does not pull (`IMAGE_TAG=does-not-exist`) | the new pod waits in `ErrImageNeverPull`, the two old pods stay ready and keep the site; the workload's pod UIDs are the same 40 s later and the other cluster never starts; then rolled back |
@@ -83,6 +83,7 @@ with TTL 10 s, `pollingInterval: 5`, `cooldownPeriod: 30`, `takeoverDelay`
 | `replicas`  | both clusters redeployed with `REPLICAS=3`, then the holder cut off from Kafka | holder at 3, standby at 0; after the cut the holder's pods all go before the standby's three run; back to 1 at the end |
 | `scaler-down` | the holder's scaler Service loses its endpoint, the holder is cut off from Kafka and the scaler is killed (`crictl stop --timeout 0`, no release) | KEDA's fallback (`replicas: 0`) scales the holder's workload to zero on the scaler error once the cooldown has passed; the standby takes over after the term runs out and the delay |
 | `standby` | the holder's cluster is redeployed with `STANDBY=true` | the handover pauses its ScaledObject, its pod goes and it yields: the other cluster runs the workload well within the delay after the rollout, no overlap; the pause is lifted, `status` names the new site, and nothing moves back once the cluster leaves standby |
+| `recreate` | the lease topic is deleted and created again; the holder's scalers are frozen until the other cluster's are back on the new, empty topic | nobody claims the empty topic before the takeover delay: the holder's workload goes before the other cluster's starts, no overlap (the heartbeat fence is left out: epochs start from 0 again), and the workload ends up in the other cluster alone |
 | `handover-crash` | as `standby`, but a finalizer keeps the workload pod in `Terminating`, and the scaler pods are force-deleted after the pause | the other cluster does not start while the pod terminates; the restarted scalers keep the pause, yield once the finalizer goes, and the pause is gone after the takeover |
 
 Takeover timing is TTL plus the takeover delay plus KEDA's reaction and pod

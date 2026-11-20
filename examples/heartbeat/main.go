@@ -18,7 +18,6 @@
 package main
 
 import (
-	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -186,9 +185,11 @@ type Report struct {
 	Epochs []EpochSpan `json:"epochs"`
 	// Overlap is the longest time two epochs both wrote, by the broker's
 	// clock; the fence rejects the older epoch's records in that window.
+	// It compares every two epochs, not only neighbours: on a lease topic
+	// that was recreated the epochs start again from 0.
 	Overlap time.Duration `json:"overlap"`
 	// Gap is the longest silence between one epoch's last heartbeat and
-	// the next epoch's first.
+	// the next epoch's first, in order of first appearance.
 	Gap time.Duration `json:"gap"`
 }
 
@@ -287,14 +288,24 @@ func summarize(records []*kgo.Record, from time.Time) Report {
 	for _, sp := range spans {
 		rep.Epochs = append(rep.Epochs, *sp)
 	}
-	slices.SortFunc(rep.Epochs, func(a, b EpochSpan) int { return cmp.Compare(a.Epoch, b.Epoch) })
-	for i := 1; i < len(rep.Epochs); i++ {
-		prev, cur := rep.Epochs[i-1], rep.Epochs[i]
-		if d := prev.Last.Sub(cur.First); d > 0 {
-			rep.Overlap = max(rep.Overlap, d)
-		} else {
-			rep.Gap = max(rep.Gap, -d)
+	slices.SortFunc(rep.Epochs, func(a, b EpochSpan) int { return a.First.Compare(b.First) })
+	for i, cur := range rep.Epochs {
+		if i == 0 {
+			continue
 		}
+		var lastBefore time.Time
+		for _, prev := range rep.Epochs[:i] {
+			// prev began first: they overlap from cur.First on.
+			end := prev.Last
+			if cur.Last.Before(end) {
+				end = cur.Last
+			}
+			rep.Overlap = max(rep.Overlap, end.Sub(cur.First))
+			if prev.Last.After(lastBefore) {
+				lastBefore = prev.Last
+			}
+		}
+		rep.Gap = max(rep.Gap, cur.First.Sub(lastBefore))
 	}
 	return rep
 }

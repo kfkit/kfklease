@@ -267,9 +267,11 @@ func TestIntegrationInspect(t *testing.T) {
 // belief carries on into its own term.
 func TestIntegrationSiteReplicas(t *testing.T) {
 	topic := randomTopic(t)
-	delay := func(c *Config) { c.TakeoverDelay = 5 * itTTL }
+	const takeover = 5 * itTTL
+	delay := func(c *Config) { c.TakeoverDelay = takeover }
 	a := startWith(t, topic, "eu/a", delay)
-	waitFor(t, itTTL, "a holds", func() bool { return a.Status().Holding })
+	// On a new, empty topic the first claim waits the delay.
+	waitFor(t, takeover+itTTL, "a holds", func() bool { return a.Status().Holding })
 	b := startWith(t, topic, "eu/b", delay)
 	x := startWith(t, topic, "us/x", delay)
 	// b's first site belief needs a renewal read at the end of the log.
@@ -308,7 +310,7 @@ func TestIntegrationYield(t *testing.T) {
 	const delay = 5 * itTTL
 	withDelay := func(c *Config) { c.TakeoverDelay = delay }
 	a := startWith(t, topic, "eu/a", withDelay)
-	waitFor(t, itTTL, "a holds", func() bool { return a.Status().Holding })
+	waitFor(t, delay+itTTL, "a holds", func() bool { return a.Status().Holding })
 	epoch := a.Status().Epoch
 	x := startWith(t, topic, "us/x", withDelay)
 	waitFor(t, itTTL, "x is ready", func() bool { return x.Status().Ready })

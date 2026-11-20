@@ -47,6 +47,36 @@ func TestSummarizeFencesAndMeasures(t *testing.T) {
 	}
 }
 
+// On a lease topic deleted and created again the epochs start from 0: the
+// spans are measured in the order they came, whatever their epochs.
+func TestSummarizeAcrossARecreatedTopic(t *testing.T) {
+	ms := time.Millisecond
+	cases := []struct {
+		name         string
+		records      []*kgo.Record
+		overlap, gap time.Duration
+	}{
+		{"one after the other", []*kgo.Record{
+			hb(t, 0, "a", 40), hb(t, 1000*ms, "a", 40),
+			hb(t, 1500*ms, "b", 0), hb(t, 2000*ms, "b", 0),
+		}, 0, 500 * ms},
+		{"both at once", []*kgo.Record{
+			hb(t, 0, "a", 40), hb(t, 800*ms, "b", 0), hb(t, 1000*ms, "a", 40), hb(t, 2000*ms, "b", 0),
+		}, 200 * ms, 0},
+		{"an old epoch inside a later pair", []*kgo.Record{
+			hb(t, 0, "a", 40), hb(t, 3000*ms, "a", 40),
+			hb(t, 1000*ms, "b", 0), hb(t, 1200*ms, "b", 0),
+			hb(t, 1500*ms, "b", 2), hb(t, 2000*ms, "b", 2),
+		}, 500 * ms, 0},
+	}
+	for _, tc := range cases {
+		rep := summarize(tc.records, time.Time{})
+		if rep.Overlap != tc.overlap || rep.Gap != tc.gap {
+			t.Errorf("%s: overlap %v, gap %v; want %v, %v", tc.name, rep.Overlap, rep.Gap, tc.overlap, tc.gap)
+		}
+	}
+}
+
 func TestSummarizeEmpty(t *testing.T) {
 	rep := summarize(nil, time.Time{})
 	if rep.Records != 0 || rep.Overlap != 0 || rep.Gap != 0 || len(rep.Epochs) != 0 {
