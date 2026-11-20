@@ -541,18 +541,30 @@ kafka_topics() {
   docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server "localhost:${KAFKA_PORT}" "$@"
 }
 
-# topic_listed succeeds if the broker lists the lease topic.
-topic_listed() {
-  grep -qx "$TOPIC" <<<"$(kafka_topics --list)"
+# topic_configs prints the lease topic's own settings as --config
+# arguments, one per line, for a topic created again just the same.
+topic_configs() {
+  docker compose exec -T kafka /opt/kafka/bin/kafka-configs.sh --bootstrap-server "localhost:${KAFKA_PORT}" \
+    --describe --entity-type topics --entity-name "$TOPIC" | awk '/^  [a-z.]+=/ { print "--config"; print $1 }'
+}
+
+# create_topic <args...> creates the lease topic with the arguments
+# topic_configs printed. It fails while the deletion is still under way.
+create_topic() {
+  kafka_topics --create --topic "$TOPIC" --partitions 1 --replication-factor 1 "$@" >/dev/null 2>&1
 }
 
 # scalers <cluster> STOP|CONT freezes the scaler processes of the cluster,
 # or lets them go on. A frozen scaler reads nothing, writes nothing and
 # answers neither KEDA nor its probes; the liveness probe gives it 30 s.
 scalers() {
-  # shellcheck disable=SC2016 # expanded in the node's shell
-  docker compose exec -T "$1" sh -c 'for p in /proc/[0-9]*; do
-    [ "$(cat "$p/comm" 2>/dev/null)" = kfklease-scaler ] && kill -"$0" "${p#/proc/}"; done; true' "$2"
+  # The binary is /app in the scaler image and in the workload's: find the
+  # scaler containers by name. shellcheck: expanded in the node's shell.
+  # shellcheck disable=SC2016
+  # Fails if there was none to signal.
+  docker compose exec -T "$1" sh -c 'n=0; for c in $(crictl ps -q --name "^scaler$"); do
+    kill -"$0" "$(crictl inspect --output go-template --template "{{.info.pid}}" "$c")" && n=$((n + 1)); done
+    [ "$n" -gt 0 ]' "$2"
 }
 
 # scaler_restarts <cluster> prints how often the scaler containers of the
@@ -570,22 +582,25 @@ restarted_ready() {
 
 scenario_recreate() {
   echo "== recreate: the lease topic is deleted and created again; the other cluster's scalers come back first and wait the takeover delay"
-  local h o since restarts pods tr overlap
+  local h o since restarts pods tr overlap configs
   begin || return
+  mapfile -t configs < <(topic_configs)
+  (( ${#configs[@]} > 0 )) || fail "no settings read from the lease topic" || return
   pods=$(kc "$o" -n "$NS" get pods -l "$SCALER_PODS" -o name | wc -l)
   restarts=$(( $(scaler_restarts "$o") + pods ))
   # The holder's scalers are frozen until the other cluster's are back on
   # the new topic, so that the order is not a race: theirs is the view that
   # becomes certain first. The holder's workload runs on meanwhile, as it
   # would while its scalers restart.
-  scalers "$h" STOP
+  scalers "$h" STOP || fail "no scaler of ${h} to freeze" || return
   kafka_topics --delete --topic "$TOPIC" >/dev/null
-  # The other cluster's scalers stop on the vanished topic and restart; the
-  # first of them creates it again (createTopic), empty. Not a wait for the
-  # topic to be gone: that can be over before a listing sees it.
+  # Deleted alone, the topic leaves the scalers retrying: created again, it
+  # has another topic id, and the other cluster's scalers stop on it and
+  # restart onto the new, empty log.
+  wait_until 30 "the lease topic was not created again" create_topic "${configs[@]}" \
+    || { scalers "$h" CONT; return 1; }
   wait_until 30 "${o}'s scalers did not restart onto the new topic" restarted_ready "$o" "$restarts" \
     || { scalers "$h" CONT; return 1; }
-  topic_listed || { scalers "$h" CONT; fail "the lease topic was not created again"; return 1; }
   scalers "$h" CONT
   echo "   ${o}'s scalers are back on the new topic; ${h}'s go on and stop too"
   # Neither site's term is in the new log: the other cluster may claim only
