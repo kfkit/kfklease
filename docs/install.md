@@ -49,7 +49,7 @@ One Helm release per cluster, the same lease everywhere, a different
 `site` in each cluster:
 
 ```bash
-helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.5.0 \
+helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.5.1 \
   -n kfklease --create-namespace \
   --set brokers=kafka-1:9092,kafka-2:9092 \
   --set topic=orders-singleton \

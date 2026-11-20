@@ -93,7 +93,7 @@ release name and namespace, so the same command works in every cluster with
 a different `site`:
 
 ```bash
-helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.5.0 \
+helm install kfklease oci://ghcr.io/kfkit/charts/kfklease --version 0.5.1 \
   -n kfklease --create-namespace \
   --set brokers=kafka:9092 --set topic=my-lease --set site=eu-west \
   --set scaledObject.targetRef.name=my-singleton
