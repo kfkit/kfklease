@@ -102,21 +102,26 @@ func TestTopicCheckExisting(t *testing.T) {
 		"min.insync.replicas":            "2",
 		"unclean.leader.election.enable": "false",
 	}
+	one := func(replicas int) partitionLayout { return partitionLayout{partitions: 1, fewestReplicas: replicas} }
 	for _, tc := range []struct {
 		name     string
 		configs  map[string]string
-		replicas int
+		layout   partitionLayout
 		wantErr  string
 		warnings []string // substrings, one per warning, in order
 	}{
-		{name: "as created", configs: good, replicas: 3},
-		{name: "more than asked", configs: with(good, map[string]string{"min.insync.replicas": "3"}), replicas: 5},
-		{name: "compact,delete is compact", configs: with(good, map[string]string{"cleanup.policy": "compact,delete"}), replicas: 3},
-		{name: "CreateTime", configs: with(good, map[string]string{"message.timestamp.type": "CreateTime"}), replicas: 3, wantErr: "message.timestamp.type=CreateTime, need LogAppendTime"},
-		{name: "timestamp type not reported", configs: map[string]string{}, replicas: 3, wantErr: "not reported"},
+		{name: "as created", configs: good, layout: one(3)},
+		{name: "more than asked", configs: with(good, map[string]string{"min.insync.replicas": "3"}), layout: one(5)},
+		{name: "compact,delete is compact", configs: with(good, map[string]string{"cleanup.policy": "compact,delete"}), layout: one(3)},
+		{name: "CreateTime", configs: with(good, map[string]string{"message.timestamp.type": "CreateTime"}), layout: one(3), wantErr: "message.timestamp.type=CreateTime, need LogAppendTime"},
+		{name: "timestamp type not reported", configs: map[string]string{}, layout: one(3), wantErr: "not reported"},
+		{name: "several partitions", configs: good, layout: partitionLayout{partitions: 6, fewestReplicas: 3}, warnings: []string{
+			"6 partitions: a lease uses one of them",
+		}},
 		{name: "broker defaults", configs: map[string]string{
 			"message.timestamp.type": "LogAppendTime", "cleanup.policy": "delete", "min.insync.replicas": "1", "unclean.leader.election.enable": "true",
-		}, replicas: 1, warnings: []string{
+		}, layout: partitionLayout{partitions: 3, fewestReplicas: 1}, warnings: []string{
+			"3 partitions",
 			"1 replicas, fewer than replicationFactor 3",
 			"min.insync.replicas=1, below the 2 expected",
 			"unclean.leader.election.enable=true",
@@ -125,7 +130,7 @@ func TestTopicCheckExisting(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, _ := TopicSettings{}.withDefaults()
-			warnings, err := s.checkExisting("t", tc.configs, tc.replicas)
+			warnings, err := s.checkExisting("t", tc.configs, tc.layout)
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("err = %v, want %q", err, tc.wantErr)

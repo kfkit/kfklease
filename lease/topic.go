@@ -94,11 +94,12 @@ func (s TopicSettings) createConfigs(ttl time.Duration) map[string]*string {
 	return configs
 }
 
-// checkExisting looks at an existing topic: its configuration and the
-// fewest replicas any of its partitions has. It returns an error for what
-// the protocol cannot do without and a warning for what makes the lease
-// less durable than s asks for. It never changes the topic.
-func (s TopicSettings) checkExisting(topic string, configs map[string]string, replicas int) (warnings []string, err error) {
+// checkExisting looks at an existing topic: its configuration, how many
+// partitions it has and the fewest replicas any of them has. It returns an
+// error for what the protocol cannot do without and a warning for what
+// makes the lease less durable than s asks for or easy to misconfigure. It
+// never changes the topic.
+func (s TopicSettings) checkExisting(topic string, configs map[string]string, layout partitionLayout) (warnings []string, err error) {
 	if v := configs[timestampTypeKey]; v != timestampTypeValue {
 		if v == "" {
 			return nil, fmt.Errorf("lease: topic %q: %s not reported by the broker", topic, timestampTypeKey)
@@ -108,8 +109,14 @@ func (s TopicSettings) checkExisting(topic string, configs map[string]string, re
 	warn := func(format string, args ...any) {
 		warnings = append(warnings, fmt.Sprintf("topic %q: ", topic)+fmt.Sprintf(format, args...))
 	}
-	if replicas < int(s.ReplicationFactor) {
-		warn("%d replicas, fewer than replicationFactor %d", replicas, s.ReplicationFactor)
+	if layout.partitions > 1 {
+		// A lease lives in one partition. Participants that name different
+		// partitions of one topic take part in different leases, and each
+		// gets a holder of its own.
+		warn("%d partitions: a lease uses one of them, and every participant of the lease must name the same one (the scaler uses partition 0)", layout.partitions)
+	}
+	if layout.fewestReplicas < int(s.ReplicationFactor) {
+		warn("%d replicas, fewer than replicationFactor %d", layout.fewestReplicas, s.ReplicationFactor)
 	}
 	if n, err := strconv.Atoi(configs[minInsyncKey]); err != nil || n < s.MinInsyncReplicas {
 		warn("%s=%s, below the %d expected", minInsyncKey, configs[minInsyncKey], s.MinInsyncReplicas)
@@ -156,17 +163,17 @@ func EnsureTopic(ctx context.Context, cl *kgo.Client, topic string, ttl time.Dur
 	// A topic another participant created a moment ago may not be known to
 	// every broker yet.
 	var (
-		configs  map[string]string
-		replicas int
+		configs map[string]string
+		layout  partitionLayout
 	)
 	err = untilReady(ctx, topicReadyWait, func() (err error) {
-		configs, replicas, err = inspectTopic(ctx, adm, topic)
+		configs, layout, err = inspectTopic(ctx, adm, topic)
 		return err
 	}, func(err error) bool { return errors.Is(err, kerr.UnknownTopicOrPartition) })
 	if err != nil {
 		return nil, err
 	}
-	return s.checkExisting(topic, configs, replicas)
+	return s.checkExisting(topic, configs, layout)
 }
 
 // A topic created a moment ago has no leader for a few hundred milliseconds
@@ -197,15 +204,22 @@ func untilReady(ctx context.Context, wait time.Duration, try func() error, retry
 	}
 }
 
-// inspectTopic returns an existing topic's configuration and the fewest
-// replicas any of its partitions has.
-func inspectTopic(ctx context.Context, adm *kadm.Client, topic string) (map[string]string, int, error) {
+// partitionLayout is what checkExisting needs to know about a topic's
+// partitions.
+type partitionLayout struct {
+	partitions     int
+	fewestReplicas int // the fewest replicas any partition has
+}
+
+// inspectTopic returns an existing topic's configuration and its partition
+// layout.
+func inspectTopic(ctx context.Context, adm *kadm.Client, topic string) (map[string]string, partitionLayout, error) {
 	configs, err := describeTopicConfigs(ctx, adm, topic)
 	if err != nil {
-		return nil, 0, err
+		return nil, partitionLayout{}, err
 	}
-	replicas, err := fewestReplicas(ctx, adm, topic)
-	return configs, replicas, err
+	layout, err := describePartitions(ctx, adm, topic)
+	return configs, layout, err
 }
 
 func describeTopicConfigs(ctx context.Context, adm *kadm.Client, topic string) (map[string]string, error) {
@@ -227,25 +241,25 @@ func describeTopicConfigs(ctx context.Context, adm *kadm.Client, topic string) (
 	return configs, nil
 }
 
-func fewestReplicas(ctx context.Context, adm *kadm.Client, topic string) (int, error) {
+func describePartitions(ctx context.Context, adm *kadm.Client, topic string) (partitionLayout, error) {
 	tds, err := adm.ListTopics(ctx, topic)
 	if err != nil {
-		return 0, fmt.Errorf("lease: describe topic %q: %w", topic, err)
+		return partitionLayout{}, fmt.Errorf("lease: describe topic %q: %w", topic, err)
 	}
 	td, ok := tds[topic]
 	switch {
 	case !ok || len(td.Partitions) == 0 && td.Err == nil:
-		return 0, fmt.Errorf("lease: describe topic %q: no partitions reported", topic)
+		return partitionLayout{}, fmt.Errorf("lease: describe topic %q: no partitions reported", topic)
 	case td.Err != nil:
-		return 0, fmt.Errorf("lease: describe topic %q: %w", topic, td.Err)
+		return partitionLayout{}, fmt.Errorf("lease: describe topic %q: %w", topic, td.Err)
 	}
-	fewest := -1
+	layout := partitionLayout{partitions: len(td.Partitions), fewestReplicas: -1}
 	for _, p := range td.Partitions {
-		if fewest < 0 || len(p.Replicas) < fewest {
-			fewest = len(p.Replicas)
+		if layout.fewestReplicas < 0 || len(p.Replicas) < layout.fewestReplicas {
+			layout.fewestReplicas = len(p.Replicas)
 		}
 	}
-	return fewest, nil
+	return layout, nil
 }
 
 func ptr(s string) *string { return &s }

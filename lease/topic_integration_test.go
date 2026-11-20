@@ -79,13 +79,13 @@ func TestIntegrationTopicMoreReplicasThanBrokers(t *testing.T) {
 	}
 }
 
-// An existing topic made with the broker's defaults is reported, not
-// altered.
+// An existing topic made with the broker's defaults, and more than one
+// partition, is reported, not altered.
 func TestIntegrationTopicExistingReported(t *testing.T) {
 	cl, adm := adminClient(t)
 	ctx := context.Background()
 	topic := randomTopic(t)
-	if _, err := adm.CreateTopic(ctx, 1, 1, map[string]*string{"message.timestamp.type": ptr("LogAppendTime")}, topic); err != nil {
+	if _, err := adm.CreateTopic(ctx, 3, 1, map[string]*string{"message.timestamp.type": ptr("LogAppendTime")}, topic); err != nil {
 		t.Fatal(err)
 	}
 	warnings, err := EnsureTopic(ctx, cl, topic, 10*time.Second, TopicSettings{})
@@ -93,7 +93,7 @@ func TestIntegrationTopicExistingReported(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("warnings: %q", warnings)
-	for i, w := range []string{"1 replicas, fewer than replicationFactor 3", "min.insync.replicas=1, below the 2 expected", "cleanup.policy=delete"} {
+	for i, w := range []string{"3 partitions", "1 replicas, fewer than replicationFactor 3", "min.insync.replicas=1, below the 2 expected", "cleanup.policy=delete"} {
 		if i >= len(warnings) || !strings.Contains(warnings[i], w) {
 			t.Errorf("warning %d: want %q in %q", i, w, warnings)
 		}

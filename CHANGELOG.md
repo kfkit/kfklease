@@ -7,6 +7,13 @@ and this project adheres to
 
 ## Unreleased
 
+### Added
+
+- An existing lease topic with more than one partition is logged as a
+  warning at start. A lease lives in one partition (the scaler uses 0);
+  participants of one lease that name different partitions each get a
+  holder of their own.
+
 ### Fixed
 
 - With a takeover delay, a scaler that starts on an empty lease topic no
