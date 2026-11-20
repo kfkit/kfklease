@@ -8,9 +8,9 @@ to. The commit dates, the signatures on the tags and the entries in
 `sum.golang.org` are the earlier evidence; this proof does not depend on any
 of them, nor on GitHub.
 
-The file as it is now, with v0.1.0 and v0.5.0, was stamped on 2026-11-19.
-Its proof is pending: the calendars have it, and `ots upgrade` attaches it
-to a Bitcoin block a few hours later (see [Timestamping](#timestamping)).
+The file as it is now, with v0.1.0 and v0.5.0, was stamped on 2026-11-19
+and is attested in Bitcoin blocks 976616, 976629, 976646 and 976662; the
+proof that was pending in f29b6c7 is upgraded with them.
 
 The file as it was before, with v0.1.0 and v0.3.0, is attested in Bitcoin
 blocks 969313 and 969317 (2026-09-30). That file and its proof are in the
