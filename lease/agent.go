@@ -49,6 +49,12 @@ type agent struct {
 	inflight    *inflight
 	lastSend    time.Time
 	nextClaimAt time.Time
+	// unknownTermAt is when, on the monotonic clock, the view became
+	// certain holding no term although a term it cannot know of may have
+	// run until then: the log was empty when read from its start (a brand
+	// new topic cannot be told from a recreated one) or not one record was
+	// left of a history that existed. Zero for neither. See mayClaim.
+	unknownTermAt time.Time
 
 	// The health gate, on the monotonic clock. heldSince is when this
 	// site's current run of terms began, as far as this participant saw
@@ -162,6 +168,12 @@ func newAgent(cfg Config, log *slog.Logger, start, end int64, now time.Time) *ag
 		// left by compaction are caught record by record.
 		a.view = NewViewFromStart(cfg.TTL)
 		a.noteReady()
+		if end == 0 {
+			// Empty: the topic may have been deleted and created again,
+			// and the holder of the lease on the old one may still run
+			// its workload.
+			a.unknownTermAt = now
+		}
 	}
 	// The margin covers the skew between the brokers' clocks, among other
 	// things; see docs/protocol.md.
@@ -641,11 +653,11 @@ func (a *agent) tick(now time.Time) (Record, bool) {
 		if now.Sub(since) >= a.cfg.TTL+a.cfg.Margin && a.view.Quiet(a.cfg.TTL) {
 			a.log.Info("lease is free: nothing written for a ttl")
 			a.ready = true
-			if a.view.State().Expires.IsZero() && a.cfg.TakeoverDelay > 0 {
+			if a.view.State().Expires.IsZero() {
 				// Not one record left of a history that existed: whoever
 				// held the lease last, its term ended during this silence
-				// at the latest. Count the takeover delay from now.
-				a.nextClaimAt = later(now.Add(a.cfg.TakeoverDelay), a.nextClaimAt)
+				// at the latest.
+				a.unknownTermAt = now
 			}
 		}
 	}
@@ -687,11 +699,18 @@ func (a *agent) tick(now time.Time) (Record, bool) {
 // stop. A reader that is behind knows an old state of the lease: it may
 // have missed a new term, of that site or of any other, and a view of the
 // whole history that has read nothing yet has missed all of them. A term
-// the view does not know the holder of (silence) counts as another site's.
+// the view does not know the holder of counts as another site's: after
+// silence the view knows when it ended at the latest, and with no term in
+// the view at all (unknownTermAt) the delay counts on the local clock from
+// the moment the view became certain, whatever this participant's site.
 func (a *agent) mayClaim(now time.Time) bool {
 	s := a.view.State()
 	brokerNow := a.brokerNow(now)
 	if !a.caughtUp() || s.HeldAt(brokerNow) {
+		return false
+	}
+	if s.Expires.IsZero() && a.cfg.TakeoverDelay > 0 && !a.unknownTermAt.IsZero() &&
+		!now.After(a.unknownTermAt.Add(a.cfg.TakeoverDelay)) {
 		return false
 	}
 	from := a.takeoverFrom(s)
@@ -700,7 +719,8 @@ func (a *agent) mayClaim(now time.Time) bool {
 
 // takeoverFrom is the broker time from which this participant may take the
 // lease over after the term s describes: zero, at once, after a term of its
-// own site, on a log with no term yet, or without a delay; otherwise
+// own site, on a log with no term yet (mayClaim waits for a term it cannot
+// know of), or without a delay; otherwise
 // TakeoverDelay after the end of the term and not while a replica of that
 // site may still answer for it (answeredUntil), or earlier with a yield,
 // see yieldFrom.

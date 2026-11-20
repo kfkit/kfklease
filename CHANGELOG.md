@@ -7,6 +7,15 @@ and this project adheres to
 
 ## Unreleased
 
+### Fixed
+
+- With a takeover delay, a scaler that starts on an empty lease topic no
+  longer claims at once: a topic deleted and created again looks the same
+  as a new one, and the cluster that held the lease on the old topic may
+  still run its workload. Every scaler waits `takeoverDelay` from its
+  start, whatever its site, as after a log whose history is gone. The
+  first start of a new install waits the delay once.
+
 ## [0.5.0] - 2026-11-19
 
 ### Breaking

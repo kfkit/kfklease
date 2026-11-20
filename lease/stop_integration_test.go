@@ -148,28 +148,96 @@ func readAll(t *testing.T, topic string) []Record {
 // is gone: both stop with ErrLogReplaced rather than stay up and useless.
 func TestIntegrationTopicRecreated(t *testing.T) {
 	topic := randomTopic(t)
-	type running struct {
-		c   *Candidate
-		err chan error
-	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	run := func(holder string) running {
-		c, err := NewCandidate(Config{
-			Brokers: brokers(t), Topic: topic, CreateTopic: true, TopicSettings: itTopic,
-			Holder: holder, TTL: itTTL, Margin: itMargin,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		r := running{c, make(chan error, 1)}
-		go func() { r.err <- c.Run(ctx) }()
-		return r
-	}
-	ps := []running{run("s/a"), run("s/b")}
+	ps := []replaceable{runReplaceable(ctx, t, topic, "s/a", 0), runReplaceable(ctx, t, topic, "s/b", 0)}
 	waitFor(t, 10*time.Second, "a holder", func() bool { return ps[0].c.Status().Holding != ps[1].c.Status().Holding })
 	time.Sleep(3 * itTTL) // some offsets to have passed
+	recreateTopic(ctx, t, topic)
+	for _, p := range ps {
+		p.wantReplaced(t)
+	}
+}
 
+// The same with two sites and a takeover delay, and then new participants
+// on the recreated, empty topic, the one of the site that did not hold
+// first. That site's workload may start only once the old holder's has had
+// the delay to stop: an empty log is a term of an unknown holder.
+func TestIntegrationTopicRecreatedTakeoverDelay(t *testing.T) {
+	topic := randomTopic(t)
+	const delay = 3 * itTTL
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := runReplaceable(ctx, t, topic, "a/x", delay)
+	// A new topic is empty too: the first claim waits the delay.
+	waitFor(t, delay+2*itTTL, "a holds", func() bool { return a.c.Status().Holding })
+	b := runReplaceable(ctx, t, topic, "b/x", delay)
+	waitFor(t, itTTL, "b is ready", func() bool { return b.c.Status().Ready })
+	time.Sleep(itTTL)
+	if !a.c.Status().Holding || b.c.Status().Holding {
+		t.Fatalf("a: %+v; b: %+v; want a holding", a.c.Status(), b.c.Status())
+	}
+	recreateTopic(ctx, t, topic)
+	a.wantReplaced(t)
+	b.wantReplaced(t)
+
+	b = runReplaceable(ctx, t, topic, "b/y", delay)
+	bStarted := time.Now()
+	waitFor(t, itTTL, "the new b is ready", func() bool { return b.c.Status().Ready })
+	a = runReplaceable(ctx, t, topic, "a/y", delay)
+	// b's view became certain after bStarted.
+	throughout(time.Until(bStarted.Add(delay)), 20*time.Millisecond, func() {
+		if s := b.c.Status(); s.Holding {
+			t.Fatalf("b holds epoch %d %v after it started on the recreated topic, within the takeover delay %v", s.Epoch, time.Since(bStarted), delay)
+		}
+	})
+	waitFor(t, 2*itTTL, "a holder", func() bool { return a.c.Status().Holding || b.c.Status().Holding })
+	throughout(2*itTTL, 20*time.Millisecond, func() {
+		if a.c.Status().Holding == b.c.Status().Holding {
+			t.Fatalf("a: %+v; b: %+v; want exactly one holding", a.c.Status(), b.c.Status())
+		}
+	})
+	t.Logf("after the recreation, b took %v to hold: %v, a: %v", time.Since(bStarted), b.c.Status().Holding, a.c.Status().Holding)
+}
+
+// replaceable is a Candidate running in its own goroutine whose Run may end
+// with an error: the participant of a topic about to be recreated.
+type replaceable struct {
+	c   *Candidate
+	err chan error
+}
+
+func runReplaceable(ctx context.Context, t *testing.T, topic, holder string, delay time.Duration) replaceable {
+	t.Helper()
+	c, err := NewCandidate(Config{
+		Brokers: brokers(t), Topic: topic, CreateTopic: true, TopicSettings: itTopic,
+		Holder: holder, TTL: itTTL, Margin: itMargin, TakeoverDelay: delay,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := replaceable{c, make(chan error, 1)}
+	go func() { r.err <- c.Run(ctx) }()
+	return r
+}
+
+// wantReplaced fails the test unless Run returns ErrLogReplaced soon.
+func (r replaceable) wantReplaced(t *testing.T) {
+	t.Helper()
+	select {
+	case err := <-r.err:
+		if !errors.Is(err, ErrLogReplaced) {
+			t.Errorf("%s: Run returned %v, want ErrLogReplaced", r.c.Holder(), err)
+		}
+	case <-time.After(30 * itTTL):
+		s := r.c.Status()
+		t.Errorf("%s still runs a minute after the topic was recreated: holding=%v certain=%v ready=%v", r.c.Holder(), s.Holding, s.Certain, s.Ready)
+	}
+}
+
+// recreateTopic deletes the topic and creates it again.
+func recreateTopic(ctx context.Context, t *testing.T, topic string) {
+	t.Helper()
 	cl, adm := adminClient(t)
 	if _, err := adm.DeleteTopics(ctx, topic); err != nil {
 		t.Fatal(err)
@@ -178,16 +246,4 @@ func TestIntegrationTopicRecreated(t *testing.T) {
 		_, err := EnsureTopic(ctx, cl, topic, itTTL, itTopic)
 		return err == nil
 	})
-
-	for _, p := range ps {
-		select {
-		case err := <-p.err:
-			if !errors.Is(err, ErrLogReplaced) {
-				t.Errorf("%s: Run returned %v, want ErrLogReplaced", p.c.Holder(), err)
-			}
-		case <-time.After(30 * itTTL):
-			s := p.c.Status()
-			t.Errorf("%s still runs a minute after the topic was recreated: holding=%v certain=%v ready=%v", p.c.Holder(), s.Holding, s.Certain, s.Ready)
-		}
-	}
 }

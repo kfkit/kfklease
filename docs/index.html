@@ -212,6 +212,8 @@
     <li><strong>Own site</strong>: takes over at once. A scaler restart, an upgrade, a node drain move nothing.</li>
     <li><strong>Another site</strong>: waits the <strong>takeover delay</strong> after the term
         ended, the time the old workload gets to stop, and never less than the term's natural end.</li>
+    <li><strong>Empty topic</strong>: everyone waits the delay from its start. A recreated topic looks
+        new, and its last holder may still run.</li>
   </ul>
   <canvas class="px" data-scene="sites" width="192" height="48" style="--w:48rem" role="img"
     aria-label="Pixel art: inside one cluster the crown passes between two scaler pods at once; the other cluster watches an hourglass."></canvas>
@@ -552,6 +554,10 @@ function reset() {
   S = { t: 0, log: [], lease: { holder: null, site: null, epoch: -1, expires: -1e9, natural: -1e9, yieldAt: null },
         sites: { eu: newSite("eu"), us: newSite("us") }, overlap: 0, feed: [] };
   S.sites.us.lastSend = 0.4;                         // eu speaks first
+  // An empty log may be a recreated topic: nobody claims before the delay
+  // since its start. The scalers started that long ago, so the scene opens
+  // as the one-time wait of a new install ends.
+  S.startedAt = -DELAY;
 }
 const held = () => S.lease.holder !== null && S.t < S.lease.expires;
 function say(msg) { S.feed.unshift("t=" + S.t.toFixed(0) + " s  " + msg); S.feed.length = Math.min(S.feed.length, 5); }
@@ -588,8 +594,9 @@ function participant(s) {
     return;
   }
   if (held() || t - s.lastSend < 1) return;
-  let from = -1e9;                                    // own site, or no term yet: at once
-  if (L.epoch >= 0 && L.site !== s.name) {
+  let from = -1e9;                                    // own site: at once
+  if (L.epoch < 0) from = S.startedAt + DELAY;        // no term yet: the delay since the start
+  else if (L.site !== s.name) {
     from = Math.max(L.expires + DELAY, L.natural + LAG);
     if (L.yieldAt !== null) from = Math.min(from, Math.max(L.yieldAt, L.natural + LAG));
   }

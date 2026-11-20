@@ -89,7 +89,11 @@ the last record it saw plus a TTL.
 Using the claim's offset as the epoch makes it a fencing token that is unique,
 grows with every term, and is known to anyone who sees the record, without
 any history. (Deleting and recreating the topic resets it. Don't. The
-participants notice and stop; see [The client](#the-client).)
+participants notice and stop; see [The client](#the-client). The new
+processes find an empty log, which a reader from offset 0 cannot tell from a
+brand-new topic: with a takeover delay, nobody claims it before the delay has
+passed, so that the holder on the old topic has time to stop its workload;
+see rule 7.)
 
 ## Writer rules
 
@@ -160,7 +164,13 @@ a takeover delay `D` (`lease.Config.TakeoverDelay`):
    takes a TTL after the release for the natural end. A term whose holder
    the view does not know counts as another site's; if not a single record
    of an existing history is left, the delay counts from the silence that
-   made the view certain, on the local clock.
+   made the view certain, on the local clock. An empty log read from its
+   start is the same: the topic may have been deleted and created again
+   while a site still ran its workload, so the delay counts from the moment
+   the view became certain, on the local clock, for every candidate,
+   whatever its site. The price is that the first start of a new install
+   waits `D` once before anyone claims. A log read from its start that
+   holds a term is judged by the rules for that term.
 8. A claim of another site that lands within `D` of the end of the previous
    term is not believed and is released at once. It was sent in time, but
    landed late, after a short term of that site. The fold accepted it, so
@@ -387,8 +397,10 @@ the end of a term, by the broker's clock, unless it is given up without a
 single renewal (rule 8); and many takeovers by the same site within the
 delay, after releases and after terms that ran out. `agent_test.go` pins
 rules 6 to 8 down one case at a time: a release and an expiry by either
-site, a holder known only through silence, a log whose history is gone, a
-reader behind the end offset, a claim that landed early.
+site, a holder known only through silence, a log whose history is gone, an
+empty log (the delay counts from the start, whatever the site, and not at
+all without a delay), a reader behind the end offset, a claim that landed
+early.
 
 A fifth run, with sites, switches nodes in and out of standby every twenty
 TTLs or so: no overlap, no node in standby believing or claiming, and
@@ -470,7 +482,8 @@ among two candidates, handover after a release (tens of milliseconds) and
 after a crash (about one TTL, never before the crashed holder's deadline),
 a holder stopped with a renew stalled on its way, whose release does not
 land behind the next holder's claim, two participants that stop when their
-topic is recreated,
+topic is recreated, and new participants on the recreated topic that wait
+the takeover delay before another site claims,
 a late reader agreeing with the holder, epochs growing across terms, a
 holder switched to standby handing over from its release, a handover
 through a yield well within the takeover delay, and `Inspect` reading a

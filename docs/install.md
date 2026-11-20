@@ -123,6 +123,11 @@ Two rules, both on the writer's side of the protocol
   term.
 - A scaler of another site waits `takeoverDelay` after that term ended, by
   expiry or by release, before it claims.
+- On an empty lease topic every scaler waits `takeoverDelay` from its
+  start, whatever its site: a reader cannot tell a new topic from one
+  deleted and created again, whose last holder may still run the workload.
+  So the first start of a new install waits the delay once, about 1 min
+  35 s with the defaults, before any cluster claims.
 
 What keeps the workload in place through a scaler restart is KEDA's
 `cooldownPeriod`: the old pod says "not holding" as it releases, the new
@@ -648,7 +653,11 @@ in the topic are harmless: the fold reads each record's own TTL, and only
 rejects ones asking for more than the configured value.
 
 **Deleting the topic.** Don't, while anyone runs: the epoch is the offset,
-and a recreated topic starts from zero. Stop all scalers first.
+and a recreated topic starts from zero. Stop all scalers first. If it
+happens anyway, every scaler exits and restarts on the new, empty topic,
+and none claims before `takeoverDelay` has passed since it started, so the
+cluster that held the lease has its workload down before another starts
+one.
 
 **Taking a cluster out, moving the workload on purpose.** Set `standby`
 on that cluster's release; see [Standby and the status
